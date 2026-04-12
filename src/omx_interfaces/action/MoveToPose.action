@@ -1,0 +1,11 @@
+# Goal
+geometry_msgs/PoseStamped target_pose
+float32 velocity_scale   # 0.0 ~ 1.0, default 0.5
+---
+# Result
+bool success
+string message
+---
+# Feedback
+float32 progress         # 0.0 ~ 1.0
+string status

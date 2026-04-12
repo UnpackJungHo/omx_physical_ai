@@ -1,0 +1,30 @@
+# moveit_controllers.yaml (omx_bringup 로컬 오버라이드)
+#
+# 업스트림 open_manipulator_moveit_config 의 기본값은 gripper 를
+# GripperCommand 타입으로 설정한다. 이 타입은 MoveIt trajectory 의
+# 마지막 waypoint 만 전달하므로 velocity profile 이 무시된다.
+# gripper_traj_controller (JointTrajectoryController) + FollowJointTrajectory
+# 로 교체하여 부드러운 모션을 보장한다.
+
+moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControllerManager
+
+moveit_simple_controller_manager:
+  controller_names:
+    - arm_controller
+    - gripper_traj_controller
+
+  arm_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    joints:
+      - joint1
+      - joint2
+      - joint3
+      - joint4
+      - joint5
+
+  gripper_traj_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    joints:
+      - gripper_joint_1

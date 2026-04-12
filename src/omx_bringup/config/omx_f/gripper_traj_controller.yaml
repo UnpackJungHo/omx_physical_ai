@@ -1,0 +1,27 @@
+# gripper_traj_controller
+#
+# GripperActionController 대신 JointTrajectoryController 를 사용한다.
+# GripperActionController (+ MoveIt GripperCommand handle) 는 trajectory
+# 의 마지막 waypoint 만 전달하여 velocity profile 없이 순간 이동한다.
+# JointTrajectoryController 는 MoveIt 이 생성한 전체 trajectory 를 그대로
+# 실행하므로 velocity/acceleration scaling 이 적용된다.
+
+# [1] controller_manager 에 타입 등록 (spawner 실행 전 필수)
+/**:
+  controller_manager:
+    ros__parameters:
+      gripper_traj_controller:
+        type: joint_trajectory_controller/JointTrajectoryController
+
+# [2] 컨트롤러 파라미터
+/**:
+  gripper_traj_controller:
+    ros__parameters:
+      joints:
+        - gripper_joint_1
+      command_interfaces:
+        - position
+      state_interfaces:
+        - position
+        - velocity
+      allow_partial_joints_goal: true

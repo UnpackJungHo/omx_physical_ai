@@ -1,0 +1,18 @@
+# U2D2 (ROBOTIS USB-to-Dynamixel) udev rule
+# /dev/u2d2 심볼릭 링크를 생성하고 dialout 그룹 접근을 허용한다.
+#
+# 설치:
+#   sudo cp 99-u2d2.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#   sudo usermod -aG dialout $USER   # 로그아웃 후 재로그인 필요
+#
+# 확인:
+#   ls -la /dev/u2d2
+
+# FTDI FT232 기반 U2D2 (VID:PID = 0403:6014)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6014", \
+    GROUP="dialout", MODE="0666", SYMLINK+="u2d2"
+
+# Silicon Labs CP2102 기반 U2D2 (VID:PID = 10c4:ea60)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", \
+    GROUP="dialout", MODE="0666", SYMLINK+="u2d2"

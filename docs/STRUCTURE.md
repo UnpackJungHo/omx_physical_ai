@@ -1,0 +1,36 @@
+# OMX 패키지 구조와 개발 순서
+
+## 패키지 구조
+
+```text
+omx_ws/src/
+├── omx_bringup          # 1단계: 로봇 기동 (ros2_control + MoveIt2)
+├── omx_interfaces       # 2단계: 커스텀 ROS2 msg/srv/action 정의
+├── omx_motion_server    # 3단계: MoveIt2 + Servo + 그리퍼 API
+├── omx_perception       # 4단계: 카메라 + 컬러 기반 블록 인식
+├── omx_skill_executor   # 5단계: pick/place/align/stack 스킬
+├── omx_task_planner     # 6단계: 태스크 시퀀서
+├── omx_recovery_manager # 6단계: 상태 머신, 재시도 로직
+└── omx_llm_interface    # 7단계: LLM 연동
+```
+
+## 개발 순서
+1. `omx_bringup`
+   로봇 모델, ros2_control, MoveIt2, launch 통합을 먼저 안정화한다.
+2. `omx_interfaces`
+   이후 패키지가 공유할 msg, srv, action 계약을 고정한다.
+3. `omx_motion_server`
+   안전한 모션 실행 API를 제공한다.
+4. `omx_perception`
+   블록과 상자 위치를 안정적으로 추정한다.
+5. `omx_skill_executor`
+   하위 모듈을 조합해 실제 스킬을 구현한다.
+6. `omx_task_planner` + `omx_recovery_manager`
+   시퀀싱과 실패 복구를 규칙 기반으로 완성한다.
+7. `omx_llm_interface`
+   마지막에 자연어 계층을 붙인다.
+
+## 개발 철학
+- bringup이 불안정한 상태에서 상위 계층으로 올라가지 않는다.
+- motion API가 완성되기 전에는 skill 레이어를 확장하지 않는다.
+- LLM은 마지막에 붙인다. LLM 없이도 태스크가 동작해야 한다.

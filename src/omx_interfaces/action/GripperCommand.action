@@ -1,0 +1,11 @@
+# Goal
+float32 position         # 0.0 = fully closed, 1.0 = fully open
+float32 max_effort       # N, 0 = use controller default
+---
+# Result
+bool success
+float32 position         # actual position reached
+string message
+---
+# Feedback
+float32 position

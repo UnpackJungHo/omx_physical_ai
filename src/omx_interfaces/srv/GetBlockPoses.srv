@@ -1,0 +1,3 @@
+string color             # empty string returns all colors
+---
+omx_interfaces/BlockPose[] blocks

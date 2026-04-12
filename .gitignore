@@ -1,0 +1,41 @@
+# ROS 2 / colcon
+/build/
+/install/
+/log/
+
+# Python
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# C / C++
+*.o
+*.obj
+*.so
+*.a
+*.out
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local environments
+.env
+.venv/
+venv/
+
+# Local agent state
+.claude/state/
+.claude/settings.local.json
+.claude/hooks/__pycache__/
+
+# User-local scratch files
+/1.mp4
+/next.md
+/CLAUDE.md
+*.tmp
+*.bak
