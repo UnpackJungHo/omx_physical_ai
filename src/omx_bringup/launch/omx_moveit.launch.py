@@ -38,7 +38,7 @@ def generate_launch_description():
     declared_arguments = [
         DeclareLaunchArgument(
             'start_rviz',
-            default_value='true',
+            default_value='false',
             description='RViz2 시작 여부',
         ),
         DeclareLaunchArgument(

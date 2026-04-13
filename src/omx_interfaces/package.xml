@@ -14,9 +14,9 @@
   <depend>geometry_msgs</depend>
   <depend>action_msgs</depend>
 
-  <member_of_group>rosidl_interface_packages</member_of_group>
+  <member_of_group>rosidl_interface_packages</member_of_group> <!-- 인터페이스 전용 패키지-->
 
-  <exec_depend>rosidl_default_runtime</exec_depend>
+  <exec_depend>rosidl_default_runtime</exec_depend> <!-- 생성된 인터페이스를 런타임에 사용하기 위한 의존성-->
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
