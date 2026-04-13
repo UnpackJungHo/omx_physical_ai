@@ -1,0 +1,12 @@
+block_detection_node:
+  ros__parameters:
+    # TF frame of the camera optical axis
+    camera_frame: "camera_optical_frame"
+
+    # Distance (metres) from the camera to the table surface.
+    # Used for back-projecting pixel coordinates to 3D when no depth camera is present.
+    # Measure and set this before running on hardware.
+    table_z_in_camera: 0.30
+
+    # Publish /omx/perception/debug_image (BGR image with detected blocks drawn)
+    publish_debug_image: true
