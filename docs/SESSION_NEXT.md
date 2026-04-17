@@ -9,11 +9,59 @@
 - `E` 롤백 — 통합 launch 파일 (의미 없다고 판단, 삭제)
 
 ## 현재 작업 단계
-- `omx_motion_server` 완료. 다음은 `omx_perception` (4단계)
+- `omx_perception` 완료 (4단계), `omx_skill_executor` 구현 완료 (5단계)
+- 다음: 실기기에서 end-to-end 테스트 및 파라미터 튜닝
 
 ## 승인 대기
 - 없음
 <!-- AUTO_PHASE_SUMMARY_END -->
+
+---
+
+## 내일 바로 볼 핵심 메모
+
+### 현재 판단
+- 지금은 로컬 단일 머신 기능을 전부 끝내는 단계가 아니다.
+- `대표 시나리오 1개를 안정적으로 닫고 바로 edge-cloud 구조로 넘어가는 것`이 포트폴리오 가치가 가장 높다.
+
+### 당장 닫아야 할 최소 범위
+1. `omx_perception` 안정화
+2. `omx_skill_executor`에서 `빨간 블록을 왼쪽 상자에 넣기` 구현
+3. 최소 `retry` 또는 `safe stop` 동작 추가
+4. 반복 실행으로 성공률 확인
+
+### 여기서 멈추고 다음으로 넘어가는 기준
+- perception -> skill -> motion이 end-to-end로 연결된다.
+- 실기기에서 대표 시나리오가 반복 가능하게 성공한다.
+- 실패 시 최소한의 설명 가능한 복구 동작이 있다.
+- 영상, 로그, 성공률 중 최소 두 가지로 증명 가능하다.
+
+### 그 다음 바로 할 일
+1. `Pi 5 + 노트북 서버` 역할 분리
+2. edge에 `perception`, `motion_server`, 최소 `recovery`
+3. server에 `task_planner`, `mission_control`, `telemetry`
+4. QoS 프로파일 설계
+5. network degradation 실험 추가
+
+### 하지 말아야 할 것
+- 로컬 머신에서 `align`, `stack`, `LLM`까지 다 끝내고 넘어가려는 것
+- QoS/DDS를 말만 하고 실험 없이 문서에만 적는 것
+- 실시간 제어 경로에 서버 또는 LLM 의존성을 넣는 것
+
+---
+
+## 포트폴리오 전환 메모
+
+### 새 기준 문서
+- `docs/PORTFOLIO_STRATEGY.md`를 먼저 본다.
+
+### 프로젝트 한 줄 정의
+- `ROS2/DDS 기반으로 OMX 매니퓰레이터를 엣지 제어 노드와 서버 관제 노드로 분리하고, 네트워크 장애와 QoS까지 다루는 network-adaptive manipulation system`
+
+### 왜 이 방향인가
+- 현재 구조는 이미 괜찮은 로보틱스 프로젝트다.
+- 그러나 취업 포트폴리오에서 차이를 만드는 것은 기능 개수보다 `시스템 설계 판단`이다.
+- 따라서 `단일 로봇 데모`에서 `edge-cloud 분산 시스템`으로 축을 옮긴다.
 
 ---
 
@@ -52,6 +100,11 @@ Python (`ament_python`). OpenCV 컬러 감지는 Python이 적합하다.
 ros2 service call /omx/get_block_poses omx_interfaces/srv/GetBlockPoses "{color: ''}"
 # 기대: 감지된 블록 목록 반환
 ```
+
+### 완료 후 바로 이어질 작업
+- `omx_skill_executor`를 생성한다.
+- 최초 목표는 `PickPlace.action` 전체 구현이 아니라 대표 시나리오 1개를 rule-based로 끝까지 연결하는 것이다.
+- 이 단계에서 필요한 recovery는 최소한의 retry / safe stop 수준으로 제한한다.
 
 ---
 
