@@ -58,22 +58,26 @@ def generate_launch_description():
         get_package_share_directory('omx_bringup'),
         'config', 'omx_f', 'moveit_controllers.yaml'
     )
+    local_srdf = os.path.join(
+        get_package_share_directory('omx_bringup'),
+        'config', 'omx_f', 'omx_f.srdf'
+    )
+    local_kinematics = os.path.join(
+        get_package_share_directory('omx_bringup'),
+        'config', 'omx_f', 'kinematics.yaml'
+    )
 
     moveit_config = (
         MoveItConfigsBuilder(
             robot_name='omx_f',
             package_name='open_manipulator_moveit_config',
         )
-        .robot_description_semantic(
-            str(Path('config') / 'omx_f' / 'omx_f.srdf')
-        )
+        .robot_description_semantic(local_srdf)
         .joint_limits(
             str(Path('config') / 'omx_f' / 'joint_limits.yaml')
         )
         .trajectory_execution(local_moveit_controllers)
-        .robot_description_kinematics(
-            str(Path('config') / 'omx_f' / 'kinematics.yaml')
-        )
+        .robot_description_kinematics(local_kinematics)
         .to_moveit_configs()
     )
 

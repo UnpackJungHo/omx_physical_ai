@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<robot name="omx_f">
+    <group name="arm">
+        <chain base_link="link0" tip_link="end_effector_link"/>
+    </group>
+    <group name="gripper">
+        <joint name="gripper_joint_1"/>
+        <joint name="gripper_joint_2"/>
+    </group>
+
+    <group_state name="init" group="arm">
+        <joint name="joint1" value="0"/>
+        <joint name="joint2" value="0"/>
+        <joint name="joint3" value="0"/>
+        <joint name="joint4" value="0"/>
+        <joint name="joint5" value="0"/>
+    </group_state>
+    <group_state name="home" group="arm">
+        <joint name="joint1" value="0"/>
+        <joint name="joint2" value="-1.57"/>
+        <joint name="joint3" value="1.57"/>
+        <joint name="joint4" value="1.57"/>
+        <joint name="joint5" value="0"/>
+    </group_state>
+    <group_state name="close" group="gripper">
+        <joint name="gripper_joint_1" value="0"/>
+    </group_state>
+    <group_state name="open" group="gripper">
+        <joint name="gripper_joint_1" value="1"/>
+    </group_state>
+
+    <virtual_joint name="world_fixed" type="fixed" parent_frame="world" child_link="link0"/>
+
+    <passive_joint name="gripper_joint_2"/>
+
+    <disable_collisions link1="link0" link2="link1" reason="Adjacent"/>
+    <disable_collisions link1="link1" link2="link2" reason="Adjacent"/>
+    <disable_collisions link1="link2" link2="link3" reason="Adjacent"/>
+    <disable_collisions link1="link2" link2="link4" reason="Never"/>
+    <disable_collisions link1="link3" link2="link4" reason="Adjacent"/>
+    <disable_collisions link1="link4" link2="link5" reason="Adjacent"/>
+    <disable_collisions link1="link5" link2="link6" reason="Adjacent"/>
+    <disable_collisions link1="link5" link2="link7" reason="Adjacent"/>
+</robot>
