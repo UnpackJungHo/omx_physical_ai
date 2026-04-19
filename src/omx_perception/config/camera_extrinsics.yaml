@@ -1,0 +1,38 @@
+# Step 0 calibration baseline for omx_perception.
+# Keep only static context here.
+# Do not store world -> default_cam here because the wrist camera pose changes
+# whenever the manipulator moves.
+
+frames:
+  camera_frame: default_cam
+  reference_frame: world
+  robot_root_frame: link0
+  camera_parent_frame: link5
+
+table_plane:
+  frame_id: world
+  # Table plane model expressed in the reference frame.
+  normal_xyz: [0.0, 0.0, 1.0]
+  # One point on the plane in meters. Replace with a measured point.
+  point_xyz: [0.20, 0.00, 0.00]
+  # Convenience scalar for downstream pose estimation.
+  table_z_m: 0.0
+
+validation:
+  # Pixels to probe after camera calibration is loaded.
+  sample_pixels:
+    - [320, 240]
+    - [240, 240]
+    - [400, 240]
+  # Known points on the real table used for sanity checks.
+  test_points_reference_m:
+    - [0.20, 0.00, 0.00]
+    - [0.24, 0.06, 0.00]
+    - [0.24, -0.06, 0.00]
+
+notes:
+  calibration_date: ""
+  calibrated_by: ""
+  camera_info_source: "/camera_info or /camera/camera_info"
+  tf_source: "Query TF at runtime: world -> default_cam"
+  remarks: "The camera is wrist-mounted, so world -> default_cam is dynamic and must not be persisted here."

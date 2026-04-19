@@ -34,7 +34,7 @@
 | 레이어 | 기술 |
 |--------|------|
 | 로봇 제어 | ROS2, ros2_control, MoveIt2, MoveIt Servo |
-| 비전 | OpenCV, depth camera |
+| 비전 | OpenCV, usb camera |
 | 분산 통신 | DDS, QoS, ROS2 action/service/topic |
 | 관제 / 운영 | telemetry, dashboard, logging, fault injection |
 | LLM | 선택적 로컬 instruct 모델 + 양자화 |

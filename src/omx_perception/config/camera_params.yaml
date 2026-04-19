@@ -1,0 +1,20 @@
+/**:
+  ros__parameters:
+    video_device: "/dev/video0"
+    image_width: 640
+    image_height: 480
+    pixel_format: "yuyv"
+    camera_frame_id: "default_cam"
+    io_method: "mmap"
+    framerate: 30.0
+    camera_name: "default_cam"
+    topic_name: "image_raw"
+    autoexposure: false
+    exposure: 120
+    auto_white_balance: false
+    white_balance: 4500
+    gain: 4
+    brightness: 128
+    contrast: 32
+    saturation: 32
+    sharpness: 24
