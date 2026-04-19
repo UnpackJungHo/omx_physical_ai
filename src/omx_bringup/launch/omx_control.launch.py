@@ -60,8 +60,8 @@ def generate_launch_description():
         FindExecutable(name='xacro'),
         ' ',
         PathJoinSubstitution([
-            FindPackageShare('open_manipulator_description'),
-            'urdf', 'omx_f', 'omx_f.urdf.xacro',
+            FindPackageShare('omx_bringup'),
+            'config', 'omx_f', 'omx_f_with_camera.urdf.xacro',
         ]),
         ' prefix:=', prefix,
         ' use_mock_hardware:=', use_mock_hardware,

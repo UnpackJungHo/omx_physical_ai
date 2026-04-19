@@ -28,7 +28,6 @@ setup(
     maintainer_email='user@example.com',
     description='OMX Physical AI 데모 bringup 패키지',
     license='Apache-2.0',
-    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'workspace_guard = omx_bringup.workspace_guard:main',

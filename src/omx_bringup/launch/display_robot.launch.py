@@ -55,10 +55,10 @@ def generate_launch_description():
         FindExecutable(name='xacro'), # # 결과: '/opt/ros/jazzy/bin/xacro' (which xacro 와 동일)
         ' ',
         PathJoinSubstitution([
-            FindPackageShare('open_manipulator_description'),
-            'urdf', 'omx_f', 'omx_f.urdf.xacro',
+            FindPackageShare('omx_bringup'),
+            'config', 'omx_f', 'omx_f_with_camera.urdf.xacro',
         ]),
-        # # 결과: '/opt/ros/jazzy/share/open_manipulator_description/urdf/omx_f/omx_f.urdf.xacro'
+        # # 결과: '/.../share/omx_bringup/config/omx_f/omx_f_with_camera.urdf.xacro'
         ' prefix:=',        prefix,
         ' use_mock_hardware:=true',
     ])
