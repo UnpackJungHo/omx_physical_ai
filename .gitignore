@@ -39,3 +39,4 @@ venv/
 /CLAUDE.md
 *.tmp
 *.bak
+/datasets/
