@@ -18,9 +18,6 @@
 - `6` 대기 — `omx_task_planner` + `omx_recovery_manager`
 - `7` 대기 — `omx_llm_interface`
 
-## 현재 작업 단계
-- `4단계 omx_perception`
-
 ## 승인 대기
 - 없음
 

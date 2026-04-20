@@ -6,9 +6,9 @@
 omx_ws/src/
 ├── omx_bringup          # 1단계: 로봇 기동 (ros2_control + MoveIt2)
 ├── omx_interfaces       # 2단계: 커스텀 ROS2 msg/srv/action 정의
-├── omx_motion_server    # 3단계: MoveIt2 + Servo + 그리퍼 API
+├── omx_motion_server    # 3단계: MoveIt2 + Servo + 그리퍼 API (MoveToNamed/MoveToPose/MoveToJoints/GripperCommand)
 ├── omx_perception       # 4단계: 카메라 + 컬러 기반 블록 인식
-├── omx_skill_executor   # 5단계: 대표 시나리오 스킬 실행
+├── omx_skill_executor   # 5단계: 대표 시나리오 스킬 실행 (Python prototype → C++ 승격)
 ├── omx_recovery_manager # 6단계: retry / fallback / safe stop
 ├── omx_task_planner     # 7단계: 서버 측 태스크 시퀀서
 ├── omx_mission_control  # 8단계: 원격 조작 / 관제 / 명령 라우팅
@@ -27,6 +27,11 @@ omx_ws/src/
    블록과 상자 위치를 안정적으로 추정한다.
 5. `omx_skill_executor`
    하위 모듈을 조합해 대표 시나리오 1개를 end-to-end로 완성한다.
+   - 첫 스킬: `PickDetected` (색상 감지 → 탐지 스윕 → 사용자 색 선택 CLI → hover/descent/grasp → scan pose 복귀 → release → 그리퍼 close → home 복귀).
+   - 구현 언어: Python 프로토타입으로 시작. 안정화 후 C++ 로 승격.
+   - 스캔 포즈(arm): joint1~5 = [0, -25, -63, 107, 0] deg.
+   - 스윕: joint1 절대각 기준 0 → -10°...-90° → 0 → +10°...+90° → home → fail.
+   - Hover z = 0.15 m, grasp z = 0.07 m, velocity_scale = 0.2, frame_id = `world`.
 6. `omx_recovery_manager`
    최소 retry / safe stop / stale data 대응을 규칙 기반으로 완성한다.
 7. `omx_task_planner`
@@ -48,8 +53,9 @@ omx_ws/src/
 
 ## 현재 기준 우선순위
 1. `omx_perception` 안정화
-2. `omx_skill_executor`로 `빨간 블록 -> 왼쪽 상자` 시나리오 구현
-3. `omx_recovery_manager` 최소 기능 추가
-4. edge/server 역할 분리
-5. QoS, telemetry, fault injection 추가
-6. 이후 `align`, `stack`, `LLM` 확장
+2. `omx_skill_executor` 1차: `PickDetected` 스킬 (pick-only, 색상 선택 CLI)
+3. `omx_skill_executor` 2차: `PickPlace` (`빨간 블록 -> 왼쪽 상자`)
+4. `omx_recovery_manager` 최소 기능 추가
+5. edge/server 역할 분리
+6. QoS, telemetry, fault injection 추가
+7. 이후 `align`, `stack`, `LLM` 확장

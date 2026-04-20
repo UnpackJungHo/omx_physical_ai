@@ -11,11 +11,11 @@
 
 ```text
 operator / test script
-    ↓
-[omx_skill_executor]   대표 시나리오 실행 (pick/place)
-    ↓
+    ↓ PickDetected.action (object_color, retry_on_fail)
+[omx_skill_executor]   대표 시나리오 실행 (pick → pick_place)
+    ↓ MoveToJoints / MoveToPose / MoveToNamed / GripperCommand
 [omx_motion_server]    MoveIt2 계획 + Servo 실행 + 그리퍼 제어
-    ↕
+    ↕ GetBlockPoses.srv (BlockPose[] with grasp_pose)
 [omx_perception]       컬러 감지 -> 블록 위치 추정
     ↕
 [omx_recovery_manager] 최소 retry / safe stop
@@ -44,7 +44,9 @@ remote operator / mission UI
 ## 레이어 책임
 - `omx_perception`: 카메라 입력에서 블록 위치를 추정한다. 실시간성이 높으므로 엣지에 둔다.
 - `omx_motion_server`: MoveIt2와 Servo를 통해 실제 모션 계획과 실행을 담당한다. safety critical 경로이므로 엣지에 둔다.
+  공개 액션: `MoveToNamed` (SRDF group_state), `MoveToPose` (Cartesian, 5-DOF 안정화를 위해 `setJointValueTarget(pose, link)` 사용), `MoveToJoints` (조인트 맵 기반, 스캔/스윕/비정형 포즈용), `GripperCommand`.
 - `omx_skill_executor`: 대표 시나리오 단위의 실행 순서를 담당한다. 초기에는 로컬, 최종적으로는 엣지에 둔다.
+  1차 스킬: `PickDetected` — 색 감지 → joint1 스윕 → 색 선택(CLI) → hover(z=0.15) → descent(z=0.07) → grasp → scan 복귀 → release → 그리퍼 close → home 복귀. 재시도 정책은 갖지 않고, 실패 시 safe stop 후 실패를 반환한다.
 - `omx_recovery_manager`: timeout, stale data, grasp 실패, server disconnect에 대한 retry / fallback / safe stop을 담당한다.
 - `omx_task_planner`: 서버에서 고수준 작업 시퀀스를 생성한다. 실시간 제어권은 갖지 않는다.
 - `omx_llm_interface`: 자연어를 구조화된 태스크 JSON으로 변환한다. 선택적 계층이며 비실시간 서버 경로에만 둔다.

@@ -35,8 +35,10 @@ ROBOTIS OMX 매니퓰레이터를 `ROS2/DDS 기반 edge-cloud robotic system`으
    블록 3개를 수직으로 쌓고, 낙하 감지 시 자동 재시도한다.
 
 ## 대표 시나리오 우선순위
-- 가장 먼저 닫아야 할 시나리오는 `빨간 블록을 왼쪽 상자에 넣기`다.
-- 이 시나리오 하나로 perception, target filtering, motion, gripper, placement, retry, telemetry까지 드러낼 수 있다.
+- 0차(스킬 skeleton): `PickDetected` — 지정된 색 블록을 감지→집어올려 스캔 포즈에서 release.
+  perception → skill → motion → gripper 경로의 end-to-end 구조와 실패 경로(탐지 실패 시 스윕, 최종 fail 시 home 복귀)를 먼저 닫는다.
+- 1차(대표 시나리오): `PickPlace` — `빨간 블록을 왼쪽 상자에 넣기`.
+  이 시나리오 하나로 perception, target filtering, motion, gripper, placement, retry, telemetry까지 드러낼 수 있다.
 - `align`, `stack`, `LLM`은 edge-cloud 전환 이후 확장 항목으로 둔다.
 
 ## 최종 데모에서 보여줄 것
