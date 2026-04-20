@@ -46,7 +46,7 @@ _DEFAULT_RANGES: dict = {
         {"h": [0, 15], "s": [50, 255], "v": [40, 255]},
         {"h": [160, 180], "s": [50, 255], "v": [40, 255]},
     ],
-    "green": [{"h": [40, 95], "s": [40, 255], "v": [40, 255]}],
+    "green": [{"h": [42, 95], "s": [16, 255], "v": [50, 255]}],
     "blue": [{"h": [95, 135], "s": [60, 255], "v": [40, 255]}],
 }
 
@@ -298,6 +298,221 @@ def _build_mask(
     return _stabilize_mask(combined)
 
 
+def _contour_to_mask(
+    image_shape: tuple[int, int],
+    contour: np.ndarray,
+) -> np.ndarray:
+    mask = np.zeros(image_shape, dtype=np.uint8)
+    cv2.drawContours(mask, [contour], -1, 255, thickness=-1)
+    return mask
+
+
+def _largest_contour(mask: np.ndarray) -> np.ndarray | None:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    return max(contours, key=cv2.contourArea)
+
+
+def _extract_candidate_core(
+    contour: np.ndarray,
+    strict_mask: np.ndarray,
+    hsv: np.ndarray,
+) -> tuple[np.ndarray | None, np.ndarray, float]:
+    contour_mask = _contour_to_mask(strict_mask.shape, contour)
+    strict_inside = cv2.bitwise_and(strict_mask, contour_mask)
+    strict_px = np.count_nonzero(strict_inside)
+    if strict_px < 25:
+        return None, np.zeros_like(strict_mask), 0.0
+
+    values = hsv[:, :, 2][strict_inside > 0]
+    high_v_thresh = float(np.percentile(values, 65.0))
+    core_mask = np.zeros_like(strict_mask)
+    core_mask[(strict_inside > 0) & (hsv[:, :, 2] >= high_v_thresh)] = 255
+    core_mask = cv2.morphologyEx(
+        core_mask,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+    core_mask = cv2.morphologyEx(
+        core_mask,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1,
+    )
+
+    if np.count_nonzero(core_mask) < 20:
+        fallback = cv2.erode(
+            strict_inside,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+            iterations=1,
+        )
+        core_mask = fallback if np.count_nonzero(fallback) >= 20 else strict_inside
+
+    core_contour = _largest_contour(core_mask)
+    if core_contour is None:
+        return None, np.zeros_like(strict_mask), 0.0
+
+    refined = _contour_to_mask(strict_mask.shape, core_contour)
+    core_area = float(np.count_nonzero(refined))
+    return core_contour, refined, core_area
+
+
+def _classify_core_color(
+    core_mask: np.ndarray,
+    strict_masks: dict[str, np.ndarray],
+    dominance_masks: dict[str, np.ndarray],
+) -> tuple[str, float, float, dict[str, float]]:
+    core_px = float(np.count_nonzero(core_mask))
+    if core_px < 1.0:
+        return "unknown", 0.0, 0.0, {}
+
+    scores: dict[str, float] = {}
+    for color in strict_masks:
+        strict_ratio = float(np.count_nonzero(cv2.bitwise_and(strict_masks[color], core_mask)) / core_px)
+        dominance_ratio = float(np.count_nonzero(cv2.bitwise_and(dominance_masks[color], core_mask)) / core_px)
+        scores[color] = 0.72 * strict_ratio + 0.28 * dominance_ratio
+
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    best_color, best_score = ranked[0]
+    second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+    return best_color, float(best_score), float(best_score - second_score), scores
+
+
+def _compute_side_support_metrics(
+    contour_mask: np.ndarray,
+    core_mask: np.ndarray,
+    hsv: np.ndarray,
+) -> dict[str, float]:
+    contour_px = float(np.count_nonzero(contour_mask))
+    core_px = float(np.count_nonzero(core_mask))
+    if contour_px < 1.0 or core_px < 1.0:
+        return {
+            "support_ratio": 0.0,
+            "side_area_ratio": 0.0,
+            "side_value_drop": 0.0,
+        }
+
+    dilated_core = cv2.dilate(
+        core_mask,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1,
+    )
+    side_mask = cv2.bitwise_and(contour_mask, cv2.bitwise_not(dilated_core))
+    side_px = float(np.count_nonzero(side_mask))
+
+    value_plane = hsv[:, :, 2].astype(np.float32)
+    core_v = float(value_plane[core_mask > 0].mean()) if core_px > 0.0 else 0.0
+    side_v = float(value_plane[side_mask > 0].mean()) if side_px > 0.0 else core_v
+    value_drop = max(0.0, core_v - side_v)
+
+    return {
+        "support_ratio": contour_px / core_px,
+        "side_area_ratio": side_px / core_px,
+        "side_value_drop": value_drop,
+    }
+
+
+def _component_needs_split(
+    contour: np.ndarray,
+    rect: tuple,
+    min_area: int,
+    max_area: int,
+    max_aspect_ratio: float,
+) -> bool:
+    area = float(cv2.contourArea(contour))
+    rect_w, rect_h = rect[1]
+    if rect_w < 1e-6 or rect_h < 1e-6:
+        return False
+    aspect = float(max(rect_w, rect_h) / max(min(rect_w, rect_h), 1e-6))
+    return area > max_area * 1.15 or aspect > max(max_aspect_ratio * 1.15, 2.4) or area > min_area * 8.0
+
+
+def _split_component_contour(
+    combined_mask: np.ndarray,
+    strict_mask: np.ndarray,
+    contour: np.ndarray,
+    min_area: int,
+) -> list[np.ndarray]:
+    x, y, w, h = cv2.boundingRect(contour)
+    pad = 4
+    x0 = max(0, x - pad)
+    y0 = max(0, y - pad)
+    x1 = min(combined_mask.shape[1], x + w + pad)
+    y1 = min(combined_mask.shape[0], y + h + pad)
+
+    contour_local = contour.copy()
+    contour_local[:, 0, 0] -= x0
+    contour_local[:, 0, 1] -= y0
+
+    component_mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+    cv2.drawContours(component_mask, [contour_local], -1, 255, thickness=-1)
+    component_mask = cv2.bitwise_and(component_mask, combined_mask[y0:y1, x0:x1])
+    strict_crop = cv2.bitwise_and(strict_mask[y0:y1, x0:x1], component_mask)
+    if np.count_nonzero(strict_crop) < max(30, int(min_area * 0.12)):
+        return [contour]
+
+    seed_mask = cv2.morphologyEx(
+        strict_crop,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+    seed_mask = cv2.erode(
+        seed_mask,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+    if np.count_nonzero(seed_mask) < 25:
+        seed_mask = strict_crop
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(seed_mask)
+    seeds: list[np.ndarray] = []
+    min_seed_area = max(20, int(min_area * 0.08))
+    for label in range(1, num_labels):
+        if int(stats[label, cv2.CC_STAT_AREA]) < min_seed_area:
+            continue
+        seed = np.zeros_like(seed_mask)
+        seed[labels == label] = 255
+        seeds.append(seed)
+
+    if len(seeds) < 2:
+        return [contour]
+
+    seeds = sorted(seeds, key=lambda seed: int(np.count_nonzero(seed)), reverse=True)[:4]
+    component_pixels = component_mask > 0
+    dist_stack: list[np.ndarray] = []
+    for seed in seeds:
+        distance_input = np.full_like(seed, 255)
+        distance_input[seed > 0] = 0
+        dist_stack.append(cv2.distanceTransform(distance_input, cv2.DIST_L2, 5))
+
+    distances = np.stack(dist_stack, axis=0)
+    nearest = np.argmin(distances, axis=0) + 1
+    nearest[~component_pixels] = 0
+
+    split_contours: list[np.ndarray] = []
+    min_split_area = max(int(min_area * 0.55), 120)
+    for label in range(1, len(seeds) + 1):
+        submask = np.zeros_like(component_mask)
+        submask[nearest == label] = 255
+        submask = cv2.morphologyEx(
+            submask,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+            iterations=1,
+        )
+        sub_contour = _largest_contour(submask)
+        if sub_contour is None or cv2.contourArea(sub_contour) < min_split_area:
+            continue
+        sub_contour[:, 0, 0] += x0
+        sub_contour[:, 0, 1] += y0
+        split_contours.append(sub_contour)
+
+    return split_contours if len(split_contours) >= 2 else [contour]
+
+
 def _order_quad(pts: np.ndarray) -> np.ndarray:
     rect = np.zeros((4, 2), dtype=np.float64)
     s = pts.sum(axis=1)
@@ -465,11 +680,13 @@ def _passes_box_geometry(
     contour: np.ndarray,
     rect: tuple,
     box: np.ndarray,
-    strict_mask: np.ndarray,
     intrinsics: CameraIntrinsics,
     transform: TransformSnapshot | None,
     center_plane_z: float,
     verifier: dict[str, float],
+    color_purity: float,
+    color_margin: float,
+    side_metrics: dict[str, float],
 ) -> tuple[bool, dict[str, float], str]:
     rect_w, rect_h = rect[1]
     long_px = float(max(rect_w, rect_h))
@@ -477,12 +694,15 @@ def _passes_box_geometry(
     aspect = long_px / short_px
 
     vertices, circularity = _contour_shape_metrics(contour)
-    color_purity = _contour_color_purity(contour, strict_mask)
     diagnostics = {
         "aspect": aspect,
         "vertices": float(vertices),
         "circularity": circularity,
         "color_purity": color_purity,
+        "color_margin": color_margin,
+        "support_ratio": float(side_metrics["support_ratio"]),
+        "side_area_ratio": float(side_metrics["side_area_ratio"]),
+        "side_value_drop": float(side_metrics["side_value_drop"]),
         "world_long": -1.0,
         "world_short": -1.0,
     }
@@ -495,6 +715,12 @@ def _passes_box_geometry(
         return False, diagnostics, "reject:circ"
     if color_purity < verifier["min_color_purity"]:
         return False, diagnostics, "reject:purity"
+    if color_margin < verifier["min_color_margin"]:
+        return False, diagnostics, "reject:color_margin"
+    if side_metrics["side_area_ratio"] < verifier["min_side_area_ratio"]:
+        return False, diagnostics, "reject:flat"
+    if side_metrics["side_value_drop"] < verifier["min_side_value_drop"]:
+        return False, diagnostics, "reject:flat"
 
     if transform is None:
         return True, diagnostics, ""
@@ -543,6 +769,9 @@ class HSVBlockDetector:
         debug = _draw_roi_overlay(enhanced.copy(), roi_rect)
         results: list[dict] = []
         mask_debug: np.ndarray | None = None
+        strict_masks: dict[str, np.ndarray] = {}
+        dominance_masks: dict[str, np.ndarray] = {}
+        combined_masks: dict[str, np.ndarray] = {}
 
         K = intrinsics.camera_matrix()
         D = intrinsics.dist_array()
@@ -556,25 +785,46 @@ class HSVBlockDetector:
         )
 
         for color, ranges in self._ranges.items():
-            strict_mask = _build_hsv_mask(hsv, ranges)
-            dominance_mask = _build_dominance_mask(enhanced, hsv, lab, color)
+            strict_raw = _build_hsv_mask(hsv, ranges)
+            dominance_raw = _build_dominance_mask(enhanced, hsv, lab, color)
             mask = _build_mask(
-                strict_mask,
-                dominance_mask,
+                strict_raw,
+                dominance_raw,
                 expand_kernel_size=mask_policy["dominance_expand_kernel_size"],
                 expand_iterations=mask_policy["dominance_expand_iterations"],
                 min_strict_pixels=mask_policy["min_strict_pixels_for_expansion"],
             )
-            strict_mask = _stabilize_mask(strict_mask)
-            dominance_mask = _stabilize_mask(dominance_mask)
+            strict_mask = _apply_roi_to_mask(_stabilize_mask(strict_raw), roi_rect)
+            dominance_mask = _apply_roi_to_mask(_stabilize_mask(dominance_raw), roi_rect)
             mask = _apply_roi_to_mask(mask, roi_rect)
-            strict_mask = _apply_roi_to_mask(strict_mask, roi_rect)
-            dominance_mask = _apply_roi_to_mask(dominance_mask, roi_rect)
+            strict_masks[color] = strict_mask
+            dominance_masks[color] = dominance_mask
+            combined_masks[color] = mask
             if color == debug_mask_color:
                 mask_debug = _make_mask_debug_image(enhanced, strict_mask, dominance_mask, mask, color)
+
+        for color in self._ranges:
+            strict_mask = strict_masks[color]
+            mask = combined_masks[color]
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            candidate_contours: list[np.ndarray] = []
 
             for cnt in contours:
+                box, rect = _extract_oriented_box(cnt)
+                if _component_needs_split(
+                    cnt,
+                    rect,
+                    self._min_area,
+                    self._max_area,
+                    verifier["max_aspect_ratio"],
+                ):
+                    candidate_contours.extend(
+                        _split_component_contour(mask, strict_mask, cnt, self._min_area)
+                    )
+                else:
+                    candidate_contours.append(cnt)
+
+            for cnt in candidate_contours:
                 box, rect = _extract_oriented_box(cnt)
                 area, solidity, fill = _rect_metrics(cnt, rect)
                 if area < self._min_area or area > self._max_area:
@@ -590,15 +840,32 @@ class HSVBlockDetector:
                     _draw_reject(debug, cnt, "reject:roi")
                     continue
 
+                core_contour, core_mask, core_area = _extract_candidate_core(cnt, strict_mask, hsv)
+                if core_contour is None or core_area < 20.0:
+                    _draw_reject(debug, cnt, "reject:core")
+                    continue
+                classified_color, color_purity, color_margin, _ = _classify_core_color(
+                    core_mask,
+                    strict_masks,
+                    dominance_masks,
+                )
+                if classified_color != color:
+                    _draw_reject(debug, cnt, "reject:class")
+                    continue
+                contour_mask = _contour_to_mask(strict_mask.shape, cnt)
+                side_metrics = _compute_side_support_metrics(contour_mask, core_mask, hsv)
+
                 geometry_ok, geometry_diag, reject_reason = _passes_box_geometry(
                     cnt,
                     rect,
                     box,
-                    strict_mask,
                     intrinsics,
                     transform,
                     center_plane_z,
                     verifier,
+                    color_purity,
+                    color_margin,
+                    side_metrics,
                 )
                 if not geometry_ok:
                     _draw_reject(debug, cnt, reject_reason)
@@ -606,11 +873,22 @@ class HSVBlockDetector:
 
                 center_w: np.ndarray | None = None
                 yaw = 0.0
-                conf = float(np.clip(0.25 + 0.45 * min(solidity, 1.0) + 0.2 * min(fill, 1.0), 0.1, 0.85))
+                conf = float(
+                    np.clip(
+                        0.15
+                        + 0.30 * min(solidity, 1.0)
+                        + 0.15 * min(fill, 1.0)
+                        + 0.20 * min(color_purity, 1.0)
+                        + 0.10 * min(max(color_margin, 0.0) * 4.0, 1.0)
+                        + 0.10 * min(geometry_diag["side_area_ratio"], 1.0),
+                        0.1,
+                        0.90,
+                    )
+                )
                 source = "rect_center"
                 reproj_err = float("inf")
 
-                top_face_quad = _extract_top_face_quad(cnt)
+                top_face_quad = _extract_top_face_quad(core_contour)
                 if top_face_quad is not None and transform is not None and R_c2w is not None:
                     rvec, tvec, reproj_err = _solve_pnp(top_face_quad, K, D)
                     if rvec is not None and reproj_err <= max_reproj_err:
@@ -635,7 +913,7 @@ class HSVBlockDetector:
                     continue
 
                 candidate = {
-                    "color": color,
+                    "color": classified_color,
                     "x": float(center_w[0]),
                     "y": float(center_w[1]),
                     "z": float(center_w[2]),
@@ -649,12 +927,15 @@ class HSVBlockDetector:
                     "fill_ratio": round(fill, 3),
                     "aspect_ratio": round(float(geometry_diag["aspect"]), 3),
                     "color_purity": round(float(geometry_diag["color_purity"]), 3),
+                    "color_margin": round(float(geometry_diag["color_margin"]), 3),
+                    "side_area_ratio": round(float(geometry_diag["side_area_ratio"]), 3),
+                    "side_value_drop": round(float(geometry_diag["side_value_drop"]), 2),
                     "world_long_edge_m": round(float(geometry_diag["world_long"]), 4),
                     "world_short_edge_m": round(float(geometry_diag["world_short"]), 4),
                 }
                 results.append(candidate)
 
-                c = _DEBUG_BGR.get(color, (200, 200, 200))
+                c = _DEBUG_BGR.get(classified_color, (200, 200, 200))
                 hull = cv2.convexHull(cnt)
                 cv2.drawContours(debug, [hull], -1, c, 2)
                 cv2.polylines(debug, [box.astype(int)], True, (255, 255, 255), 1)
@@ -663,11 +944,12 @@ class HSVBlockDetector:
                     for corner in top_face_quad.astype(int):
                         cv2.circle(debug, tuple(corner), 4, c, -1)
 
-                label = f"{color}|{source} {conf:.2f}"
+                label = f"{classified_color}|{source} {conf:.2f}"
                 if np.isfinite(reproj_err):
                     label += f" e={reproj_err:.1f}"
                 label += f" s={solidity:.2f}"
                 label += f" p={geometry_diag['color_purity']:.2f}"
+                label += f" d={geometry_diag['side_value_drop']:.0f}"
                 cv2.putText(
                     debug,
                     label,
@@ -693,21 +975,24 @@ class DetectorNode(Node):
         self.declare_parameter("max_contour_area", 30000)
         self.declare_parameter("max_reproj_error_px", 5.0)
         self.declare_parameter("color_ranges_path", "")
-        self.declare_parameter("roi_x_min", 0.06)
-        self.declare_parameter("roi_y_min", 0.04)
-        self.declare_parameter("roi_x_max", 0.94)
-        self.declare_parameter("roi_y_max", 0.64)
+        self.declare_parameter("roi_x_min", 0.05)
+        self.declare_parameter("roi_y_min", 0.05)
+        self.declare_parameter("roi_x_max", 0.95)
+        self.declare_parameter("roi_y_max", 0.95)
         self.declare_parameter("max_box_aspect_ratio", 1.9)
         self.declare_parameter("min_polygon_vertices", 4)
         self.declare_parameter("max_polygon_vertices", 8)
-        self.declare_parameter("max_circularity", 0.84)
+        self.declare_parameter("max_circularity", 0.94)
         self.declare_parameter("min_color_purity", 0.32)
+        self.declare_parameter("min_color_margin", 0.08)
+        self.declare_parameter("min_side_area_ratio", 0.18)
+        self.declare_parameter("min_side_value_drop", 8.0)
         self.declare_parameter("min_world_edge_m", 0.018)
-        self.declare_parameter("max_world_edge_m", 0.060)
+        self.declare_parameter("max_world_edge_m", 0.12)
         self.declare_parameter("debug_mask_color", "green")
-        self.declare_parameter("dominance_expand_kernel_size", 25)
-        self.declare_parameter("dominance_expand_iterations", 1)
-        self.declare_parameter("min_strict_pixels_for_expansion", 40)
+        self.declare_parameter("dominance_expand_kernel_size", 35)
+        self.declare_parameter("dominance_expand_iterations", 3)
+        self.declare_parameter("min_strict_pixels_for_expansion", 25)
 
         ranges_path = self.get_parameter("color_ranges_path").value
         color_ranges = _load_color_ranges(ranges_path)
@@ -851,6 +1136,9 @@ class DetectorNode(Node):
             "max_vertices": int(self.get_parameter("max_polygon_vertices").value),
             "max_circularity": float(self.get_parameter("max_circularity").value),
             "min_color_purity": float(self.get_parameter("min_color_purity").value),
+            "min_color_margin": float(self.get_parameter("min_color_margin").value),
+            "min_side_area_ratio": float(self.get_parameter("min_side_area_ratio").value),
+            "min_side_value_drop": float(self.get_parameter("min_side_value_drop").value),
             "min_world_edge_m": float(self.get_parameter("min_world_edge_m").value),
             "max_world_edge_m": float(self.get_parameter("max_world_edge_m").value),
         }

@@ -20,11 +20,11 @@ detector_node:
     red_s2_max: 255
     red_v2_min: 20
     red_v2_max: 255
-    green_h_min: 35
+    green_h_min: 42
     green_h_max: 95
-    green_s_min: 55
+    green_s_min: 16
     green_s_max: 255
-    green_v_min: 60
+    green_v_min: 50
     green_v_max: 255
     blue_h_min: 106
     blue_h_max: 173
@@ -41,12 +41,15 @@ detector_node:
     max_polygon_vertices: 8
     max_circularity: 0.94
     min_color_purity: 0.32
+    min_color_margin: 0.08
+    min_side_area_ratio: 0.18
+    min_side_value_drop: 8.0
     min_world_edge_m: 0.018
-    max_world_edge_m: 0.9
+    max_world_edge_m: 0.12
     debug_mask_color: green
-    dominance_expand_kernel_size: 25
-    dominance_expand_iterations: 1
-    min_strict_pixels_for_expansion: 40
+    dominance_expand_kernel_size: 35
+    dominance_expand_iterations: 3
+    min_strict_pixels_for_expansion: 25
 
 tracker_node:
   ros__parameters:
