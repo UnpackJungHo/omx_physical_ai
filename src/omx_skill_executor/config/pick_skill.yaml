@@ -1,0 +1,35 @@
+pick_detected_server:
+  ros__parameters:
+    # 스캔 포즈 (joint1~5, deg) — 초기 탐지 자세
+    scan_joint_positions_deg: [0.0, -25.0, -63.0, 107.0, 0.0]
+    arm_joint_names: ["joint1", "joint2", "joint3", "joint4", "joint5"]
+
+    # joint1 스윕 (절대각 기준)
+    sweep_joint_index: 0
+    sweep_step_deg: 10.0
+    sweep_positive_max_deg: 90.0
+    sweep_negative_min_deg: -90.0
+
+    # 탐지 안정화 / 타임아웃
+    detect_wait_after_motion_sec: 0.8
+    get_block_poses_timeout_sec: 2.0
+
+    # 접근 / 그립 Cartesian
+    approach_frame_id: "world"
+    hover_z: 0.15
+    grasp_z: 0.055
+    move_velocity_scale: 0.2
+
+    # hover 도착 후 descent 시작 전 settle 시간(초).
+    # controller current state 가 plan 의 start state 와 drift 하면
+    # MoveIt 이 CONTROL_FAILED 로 abort 하므로 짧게 휴식을 준다.
+    hover_settle_sec: 0.5
+
+    # 그리퍼
+    gripper_open_position: 1.0
+    gripper_closed_position: 0.1
+    gripper_max_effort: 0.0
+
+    # 액션 응답 타임아웃 (초)
+    action_goal_timeout_sec: 5.0
+    action_result_timeout_sec: 60.0
