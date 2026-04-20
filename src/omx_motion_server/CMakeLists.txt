@@ -12,6 +12,7 @@ find_package(omx_interfaces REQUIRED)
 find_package(moveit_ros_planning_interface REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(control_msgs REQUIRED)
+find_package(trajectory_msgs REQUIRED)
 
 # miniconda libcurl/libssl 충돌 방지: 시스템 curl/ssl 명시 링크
 find_library(SYSTEM_CURL curl HINTS /usr/lib/x86_64-linux-gnu NO_DEFAULT_PATH)
@@ -33,7 +34,8 @@ ament_target_dependencies(motion_server
   omx_interfaces
   moveit_ros_planning_interface
   geometry_msgs
-  control_msgs)
+  control_msgs
+  trajectory_msgs)
 
 # 시스템 curl/ssl 명시 링크 (miniconda 라이브러리 오염 방지)
 if(SYSTEM_CURL)

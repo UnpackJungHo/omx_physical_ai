@@ -22,17 +22,25 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <fstream>
 #include <functional>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <vector>
+#include <filesystem>
+#include <signal.h>
 
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
 
 #include <moveit/move_group_interface/move_group_interface.hpp>
 
+#include <builtin_interfaces/msg/duration.hpp>
+#include <trajectory_msgs/msg/joint_trajectory.hpp>
 #include <omx_interfaces/action/move_to_named.hpp>
 #include <omx_interfaces/action/move_to_pose.hpp>
 #include <omx_interfaces/action/gripper_command.hpp>
@@ -49,6 +57,11 @@ static constexpr double GRIPPER_OPEN_POS  = 1.0;
 // ── 기본 velocity / acceleration scaling ─────────────────────────────────
 static constexpr double DEFAULT_VEL_SCALE = 0.3;
 static constexpr double DEFAULT_ACC_SCALE = 0.1;
+static constexpr double PREVIEW_SYNC_TIME_SEC = 1.0;
+static constexpr int PREVIEW_DOMAIN_ID = 90;
+static constexpr double PREVIEW_READY_TIMEOUT_SEC = 45.0;
+static constexpr double PREVIEW_ACCEPT_TIMEOUT_SEC = 20.0;
+static constexpr const char * PREVIEW_RUNTIME_DIR = "/tmp/omx_preview_runtime";
 
 // ── quaternion 정규화 허용 오차 ───────────────────────────────────────────
 static constexpr double QUAT_NORM_TOL = 0.01;
@@ -238,6 +251,216 @@ private:
     }
   };
 
+  static double duration_to_sec(const builtin_interfaces::msg::Duration & duration)
+  {
+    return static_cast<double>(duration.sec)
+      + (static_cast<double>(duration.nanosec) * 1e-9);
+  }
+
+  static builtin_interfaces::msg::Duration sec_to_duration(double seconds)
+  {
+    builtin_interfaces::msg::Duration duration;
+    if (seconds < 0.0) {
+      seconds = 0.0;
+    }
+
+    duration.sec = static_cast<int32_t>(std::floor(seconds));
+    duration.nanosec = static_cast<uint32_t>(
+      std::llround((seconds - static_cast<double>(duration.sec)) * 1e9));
+
+    if (duration.nanosec >= 1000000000u) {
+      duration.sec += 1;
+      duration.nanosec -= 1000000000u;
+    }
+    return duration;
+  }
+
+  trajectory_msgs::msg::JointTrajectory build_preview_trajectory(
+    const moveit::planning_interface::MoveGroupInterface::Plan & plan) const
+  {
+    auto preview = plan.trajectory.joint_trajectory;
+    if (preview.joint_names.empty()) {
+      preview.joint_names = arm_group_->getActiveJoints();
+    }
+
+    auto current_state = arm_group_->getCurrentState(1.0);
+    if (!current_state) {
+      return preview;
+    }
+
+    std::vector<double> current_positions;
+    current_state->copyJointGroupPositions("arm", current_positions);
+    if (!current_positions.empty() && current_positions.size() == preview.joint_names.size()) {
+      trajectory_msgs::msg::JointTrajectoryPoint start_point;
+      start_point.positions = current_positions;
+      start_point.velocities.assign(current_positions.size(), 0.0);
+      start_point.accelerations.assign(current_positions.size(), 0.0);
+      start_point.time_from_start = sec_to_duration(0.0);
+
+      for (auto & point : preview.points) {
+        point.time_from_start = sec_to_duration(
+          duration_to_sec(point.time_from_start) + PREVIEW_SYNC_TIME_SEC);
+      }
+      preview.points.insert(preview.points.begin(), start_point);
+    }
+
+    return preview;
+  }
+
+  std::string write_preview_trajectory_file(
+    const trajectory_msgs::msg::JointTrajectory & trajectory) const
+  {
+    const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+    const std::string path = "/tmp/omx_preview_trajectory_" + std::to_string(now_ns) + ".json";
+
+    std::ofstream out(path, std::ios::trunc);
+    if (!out.is_open()) {
+      return "";
+    }
+
+    out << "{\n";
+    out << "  \"joint_names\": [";
+    for (std::size_t i = 0; i < trajectory.joint_names.size(); ++i) {
+      if (i > 0) out << ", ";
+      out << '"' << trajectory.joint_names[i] << '"';
+    }
+    out << "],\n";
+    out << "  \"points\": [\n";
+    for (std::size_t i = 0; i < trajectory.points.size(); ++i) {
+      const auto & point = trajectory.points[i];
+      out << "    {\n";
+
+      auto dump_vector = [&out](const char * key, const std::vector<double> & values) {
+        out << "      \"" << key << "\": [";
+        for (std::size_t j = 0; j < values.size(); ++j) {
+          if (j > 0) out << ", ";
+          out << values[j];
+        }
+        out << "]";
+      };
+
+      dump_vector("positions", point.positions);
+      out << ",\n";
+      dump_vector("velocities", point.velocities);
+      out << ",\n";
+      dump_vector("accelerations", point.accelerations);
+      out << ",\n";
+      out << "      \"time_from_start_sec\": " << duration_to_sec(point.time_from_start) << '\n';
+      out << "    }";
+      if (i + 1 < trajectory.points.size()) {
+        out << ',';
+      }
+      out << '\n';
+    }
+    out << "  ]\n";
+    out << "}\n";
+    return path;
+  }
+
+  long long next_preview_request_id() const
+  {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+  }
+
+  static std::filesystem::path preview_runtime_path(const std::string & filename)
+  {
+    return std::filesystem::path(PREVIEW_RUNTIME_DIR) / filename;
+  }
+
+  static std::string read_file_trimmed(const std::filesystem::path & path)
+  {
+    std::ifstream in(path);
+    if (!in.is_open()) {
+      return "";
+    }
+    std::ostringstream buffer;
+    buffer << in.rdbuf();
+    std::string text = buffer.str();
+    while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' ')) {
+      text.pop_back();
+    }
+    return text;
+  }
+
+  static bool process_exists(pid_t pid)
+  {
+    if (pid <= 0) {
+      return false;
+    }
+    return ::kill(pid, 0) == 0;
+  }
+
+  bool preview_instance_alive() const
+  {
+    const std::string pid_text = read_file_trimmed(preview_runtime_path("player.pid"));
+    if (pid_text.empty()) {
+      return false;
+    }
+    try {
+      const pid_t pid = static_cast<pid_t>(std::stol(pid_text));
+      return process_exists(pid);
+    } catch (const std::exception &) {
+      return false;
+    }
+  }
+
+  bool wait_for_preview_ready() const
+  {
+    const auto ready_path = preview_runtime_path("ready.flag");
+    const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::duration<double>(PREVIEW_READY_TIMEOUT_SEC);
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (std::filesystem::exists(ready_path)) {
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    return false;
+  }
+
+  bool wait_for_preview_accept(long long request_id) const
+  {
+    const auto accepted_path = preview_runtime_path("accepted.txt");
+    const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::duration<double>(PREVIEW_ACCEPT_TIMEOUT_SEC);
+    while (std::chrono::steady_clock::now() < deadline) {
+      const std::string text = read_file_trimmed(accepted_path);
+      if (!text.empty()) {
+        try {
+          if (std::stoll(text) == request_id) {
+            return true;
+          }
+        } catch (const std::exception &) {
+          // ignore malformed ack and keep waiting
+        }
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    return false;
+  }
+
+  bool launch_preview_gazebo(std::string * log_path) const
+  {
+    std::error_code ec;
+    std::filesystem::create_directories(PREVIEW_RUNTIME_DIR, ec);
+
+    const std::string resolved_log_path = preview_runtime_path("gazebo.log").string();
+    if (log_path) {
+      *log_path = resolved_log_path;
+    }
+
+    std::ostringstream command;
+    command
+      << "/bin/sh -c \"ros2 launch omx_bringup omx_preview_gazebo.launch.py "
+      << "preview_domain_id:=" << PREVIEW_DOMAIN_ID << ' '
+      << "runtime_dir:=" << PREVIEW_RUNTIME_DIR
+      << " >" << resolved_log_path << " 2>&1 &\"";
+
+    return std::system(command.str().c_str()) == 0;
+  }
+
 
   // ══════════════════════════════════════════════════════════════════════
   // MoveToNamed
@@ -354,8 +577,17 @@ private:
     const auto & ori = ps.pose.orientation;
 
     RCLCPP_INFO(get_logger(),
-      "MoveToPose: target (%.3f, %.3f, %.3f) frame='%s'",
-      pos.x, pos.y, pos.z, ps.header.frame_id.c_str());
+      "MoveToPose: target (%.3f, %.3f, %.3f) frame='%s' plan_only=%s preview_in_sim=%s",
+      pos.x, pos.y, pos.z, ps.header.frame_id.c_str(),
+      goal->plan_only ? "true" : "false",
+      goal->preview_in_sim ? "true" : "false");
+
+    if (goal->preview_in_sim && !goal->plan_only) {
+      RCLCPP_WARN(
+        get_logger(),
+        "MoveToPose: preview_in_sim requires plan_only=true, rejecting goal");
+      return rclcpp_action::GoalResponse::REJECT;
+    }
 
     // frame_id 누락 경고 (비어있어도 MoveIt 기본 planning frame 으로 처리하므로 reject 않음)
     if (ps.header.frame_id.empty()) {
@@ -519,7 +751,96 @@ private:
     }
 
     feedback->progress = 0.5f;
-    feedback->status   = "executing";
+    feedback->status   = "planned";
+    goal_handle->publish_feedback(feedback);
+
+    if (goal->preview_in_sim) {
+      auto preview_trajectory = build_preview_trajectory(plan);
+      const std::string trajectory_file = write_preview_trajectory_file(preview_trajectory);
+      if (trajectory_file.empty()) {
+        result->success = false;
+        result->message = "Failed to write preview trajectory file";
+        goal_handle->abort(result);
+        RCLCPP_WARN(get_logger(), "%s", result->message.c_str());
+        return;
+      }
+
+      if (!preview_instance_alive()) {
+        std::string preview_log_path;
+        const bool launched = launch_preview_gazebo(&preview_log_path);
+        if (!launched) {
+          result->success = false;
+          result->message = "Failed to launch Gazebo preview";
+          goal_handle->abort(result);
+          RCLCPP_WARN(get_logger(), "%s", result->message.c_str());
+          return;
+        }
+        if (!wait_for_preview_ready()) {
+          result->success = false;
+          result->message =
+            "Gazebo preview did not become ready (log=" + preview_log_path + ")";
+          goal_handle->abort(result);
+          RCLCPP_WARN(get_logger(), "%s", result->message.c_str());
+          return;
+        }
+      }
+
+      const long long request_id = next_preview_request_id();
+      const auto request_path = preview_runtime_path("request.json");
+      {
+        std::ofstream request_out(request_path, std::ios::trunc);
+        if (!request_out.is_open()) {
+          result->success = false;
+          result->message = "Failed to write preview request file";
+          goal_handle->abort(result);
+          RCLCPP_WARN(get_logger(), "%s", result->message.c_str());
+          return;
+        }
+        request_out
+          << "{\n"
+          << "  \"request_id\": " << request_id << ",\n"
+          << "  \"trajectory_file\": \"" << trajectory_file << "\"\n"
+          << "}\n";
+      }
+
+      if (!wait_for_preview_accept(request_id)) {
+        result->success = false;
+        result->message = "Preview instance did not accept request in time";
+        goal_handle->abort(result);
+        RCLCPP_WARN(get_logger(), "%s", result->message.c_str());
+        return;
+      }
+
+      std::string preview_log_path;
+      preview_log_path = preview_runtime_path("gazebo.log").string();
+
+      result->success = true;
+      result->message =
+        "Plan valid; Gazebo preview executing (ROS_DOMAIN_ID=" +
+        std::to_string(PREVIEW_DOMAIN_ID) +
+        ", request_id=" + std::to_string(request_id) +
+        ", trajectory=" + trajectory_file +
+        ", log=" + preview_log_path + ")";
+      feedback->progress = 1.0f;
+      feedback->status = "preview_executing";
+      goal_handle->publish_feedback(feedback);
+      goal_handle->succeed(result);
+      RCLCPP_INFO(get_logger(), "%s", result->message.c_str());
+      return;
+    }
+
+    if (goal->plan_only) {
+      result->success = true;
+      result->message = "Plan valid";
+      feedback->progress = 1.0f;
+      feedback->status = "validated";
+      goal_handle->publish_feedback(feedback);
+      goal_handle->succeed(result);
+      RCLCPP_INFO(get_logger(), "MoveToPose: plan-only validation succeeded");
+      return;
+    }
+
+    feedback->status = "executing";
     goal_handle->publish_feedback(feedback);
 
     bool executed = (arm_group_->execute(plan) == moveit::core::MoveItErrorCode::SUCCESS);
