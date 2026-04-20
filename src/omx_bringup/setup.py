@@ -31,6 +31,7 @@ setup(
     entry_points={
         'console_scripts': [
             'workspace_guard = omx_bringup.workspace_guard:main',
+            'trajectory_preview_player = omx_bringup.trajectory_preview_player:main',
         ],
     },
 )
