@@ -1,0 +1,12 @@
+# Goal
+string[]  joint_names      # arm joint 이름 (예: joint1..joint5). 비어있으면 positions 길이 기준으로 joint1..jointN 으로 해석
+float64[] positions        # 각 조인트 목표값 (radian)
+float32   velocity_scale   # 0.0 ~ 1.0, 0 또는 음수면 서버 기본값 사용
+---
+# Result
+bool   success
+string message
+---
+# Feedback
+float32 progress           # 0.0 ~ 1.0
+string  status             # "planning" | "planned" | "executing" | "done"

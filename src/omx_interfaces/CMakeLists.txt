@@ -14,6 +14,7 @@ find_package(action_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/MoveToNamed.action"
   "action/MoveToPose.action"
+  "action/MoveToJoints.action"
   "action/GripperCommand.action"
   "action/PickPlace.action"
   "action/PickDetected.action"
