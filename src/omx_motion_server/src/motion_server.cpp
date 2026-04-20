@@ -3,15 +3,16 @@
 // Action servers:
 //   /omx/move_to_named   (omx_interfaces/action/MoveToNamed)
 //   /omx/move_to_pose    (omx_interfaces/action/MoveToPose)
+//   /omx/move_to_joints  (omx_interfaces/action/MoveToJoints)
 //   /omx/gripper_command (omx_interfaces/action/GripperCommand)
 //
-// 세 액션 모두 MoveGroupInterface 로 제어한다.
-//   arm     그룹: MoveToNamed, MoveToPose
+// 네 액션 모두 MoveGroupInterface 로 제어한다.
+//   arm     그룹: MoveToNamed, MoveToPose, MoveToJoints
 //   gripper 그룹: GripperCommand  ← GripperActionController 직접 호출 대신
 //                                    MoveIt trajectory 로 속도 제한 적용
 //
 // 동시성 정책:
-//   arm_busy_ (atomic<bool>) — MoveToNamed / MoveToPose 가 실행 중이면 true.
+//   arm_busy_ (atomic<bool>) — MoveToNamed / MoveToPose / MoveToJoints 가 실행 중이면 true.
 //     handle_*_goal 에서 CAS 로 선점하고 execute_* 소멸 시 RAII 로 해제한다.
 //     결과적으로 arm_group_ 의 setNamedTarget / setPoseTarget /
 //     setMaxVelocityScalingFactor 호출이 직렬화된다.
@@ -25,6 +26,8 @@
 #include <cstdlib>
 #include <fstream>
 #include <functional>
+#include <iomanip>
+#include <map>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -40,9 +43,11 @@
 #include <moveit/move_group_interface/move_group_interface.hpp>
 
 #include <builtin_interfaces/msg/duration.hpp>
+#include <moveit_msgs/msg/move_it_error_codes.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 #include <omx_interfaces/action/move_to_named.hpp>
 #include <omx_interfaces/action/move_to_pose.hpp>
+#include <omx_interfaces/action/move_to_joints.hpp>
 #include <omx_interfaces/action/gripper_command.hpp>
 
 // ── 워크스페이스 한계 (workspace_guard 와 일치) ───────────────────────────
@@ -66,6 +71,50 @@ static constexpr const char * PREVIEW_RUNTIME_DIR = "/tmp/omx_preview_runtime";
 // ── quaternion 정규화 허용 오차 ───────────────────────────────────────────
 static constexpr double QUAT_NORM_TOL = 0.01;
 
+// ── MoveItErrorCode → 사람이 읽을 수 있는 이름 ───────────────────────────
+// execute() 실패 원인을 action result message 에 담을 때 사용.
+static std::string moveit_error_name(const moveit::core::MoveItErrorCode & code)
+{
+  using C = moveit_msgs::msg::MoveItErrorCodes;
+  switch (code.val) {
+    case C::SUCCESS: return "SUCCESS";
+    case C::FAILURE: return "FAILURE";
+    case C::PLANNING_FAILED: return "PLANNING_FAILED";
+    case C::INVALID_MOTION_PLAN: return "INVALID_MOTION_PLAN";
+    case C::MOTION_PLAN_INVALIDATED_BY_ENVIRONMENT_CHANGE:
+      return "MOTION_PLAN_INVALIDATED_BY_ENVIRONMENT_CHANGE";
+    case C::CONTROL_FAILED: return "CONTROL_FAILED";
+    case C::UNABLE_TO_AQUIRE_SENSOR_DATA: return "UNABLE_TO_AQUIRE_SENSOR_DATA";
+    case C::TIMED_OUT: return "TIMED_OUT";
+    case C::PREEMPTED: return "PREEMPTED";
+    case C::START_STATE_IN_COLLISION: return "START_STATE_IN_COLLISION";
+    case C::START_STATE_VIOLATES_PATH_CONSTRAINTS:
+      return "START_STATE_VIOLATES_PATH_CONSTRAINTS";
+    case C::GOAL_IN_COLLISION: return "GOAL_IN_COLLISION";
+    case C::GOAL_VIOLATES_PATH_CONSTRAINTS: return "GOAL_VIOLATES_PATH_CONSTRAINTS";
+    case C::GOAL_CONSTRAINTS_VIOLATED: return "GOAL_CONSTRAINTS_VIOLATED";
+    case C::INVALID_GROUP_NAME: return "INVALID_GROUP_NAME";
+    case C::INVALID_GOAL_CONSTRAINTS: return "INVALID_GOAL_CONSTRAINTS";
+    case C::INVALID_ROBOT_STATE: return "INVALID_ROBOT_STATE";
+    case C::INVALID_LINK_NAME: return "INVALID_LINK_NAME";
+    case C::INVALID_OBJECT_NAME: return "INVALID_OBJECT_NAME";
+    case C::FRAME_TRANSFORM_FAILURE: return "FRAME_TRANSFORM_FAILURE";
+    case C::COLLISION_CHECKING_UNAVAILABLE: return "COLLISION_CHECKING_UNAVAILABLE";
+    case C::ROBOT_STATE_STALE: return "ROBOT_STATE_STALE";
+    case C::SENSOR_INFO_STALE: return "SENSOR_INFO_STALE";
+    case C::NO_IK_SOLUTION: return "NO_IK_SOLUTION";
+    default: return "UNKNOWN";
+  }
+}
+
+static std::string execute_failure_message(
+  const std::string & prefix,
+  const moveit::core::MoveItErrorCode & code)
+{
+  return prefix + " (code=" + moveit_error_name(code)
+       + ", val=" + std::to_string(code.val) + ")";
+}
+
 // ── named pose → SRDF group_state 매핑 ───────────────────────────────────
 // SRDF(omx_f.srdf) 에 등록된 arm 그룹 named state 목록:
 //   "init" : 모든 조인트 0
@@ -82,9 +131,10 @@ static const std::unordered_map<std::string, std::string> NAMED_POSE_MAP = {
 class MotionServer : public rclcpp::Node
 {
 public:
-  using MoveToNamed = omx_interfaces::action::MoveToNamed;
-  using MoveToPose  = omx_interfaces::action::MoveToPose;
-  using GripperCmd  = omx_interfaces::action::GripperCommand;
+  using MoveToNamed  = omx_interfaces::action::MoveToNamed;
+  using MoveToPose   = omx_interfaces::action::MoveToPose;
+  using MoveToJoints = omx_interfaces::action::MoveToJoints;
+  using GripperCmd   = omx_interfaces::action::GripperCommand;
 
   explicit MotionServer(const rclcpp::NodeOptions & options)
   : Node("motion_server", options), node_options_(options)
@@ -107,6 +157,13 @@ public:
       std::bind(&MotionServer::handle_pose_goal,     this, std::placeholders::_1, std::placeholders::_2),
       std::bind(&MotionServer::handle_pose_cancel,   this, std::placeholders::_1),
       std::bind(&MotionServer::handle_pose_accepted, this, std::placeholders::_1),
+      rcl_action_server_get_default_options(), cb_group_);
+
+    move_to_joints_server_ = rclcpp_action::create_server<MoveToJoints>(
+      this, "/omx/move_to_joints",
+      std::bind(&MotionServer::handle_joints_goal,     this, std::placeholders::_1, std::placeholders::_2),
+      std::bind(&MotionServer::handle_joints_cancel,   this, std::placeholders::_1),
+      std::bind(&MotionServer::handle_joints_accepted, this, std::placeholders::_1),
       rcl_action_server_get_default_options(), cb_group_);
 
     gripper_server_ = rclcpp_action::create_server<GripperCmd>(
@@ -213,6 +270,47 @@ public:
         && gripper_group_ && !gripper_group_->getPlanningFrame().empty();
   }
 
+  // execute 직전/직후 조인트 상태 스냅샷.
+  // plan 의 start state 와 controller current state 가 drift 하면 MoveIt 은
+  // CONTROL_FAILED 로 goal 을 abort 한다. 이 값을 로그에 남겨두면 원인 분석이
+  // 쉬워진다.
+  void log_current_arm_state(const std::string & tag) const
+  {
+    if (!arm_group_) {
+      return;
+    }
+    auto state = arm_group_->getCurrentState(0.5);  // 0.5s wait
+    if (!state) {
+      RCLCPP_WARN(get_logger(),
+        "%s: getCurrentState() returned null — TF/joint_state 누락 가능",
+        tag.c_str());
+      return;
+    }
+    std::vector<double> joints;
+    state->copyJointGroupPositions("arm", joints);
+    std::ostringstream oss;
+    oss << tag << ": joints=[";
+    for (std::size_t i = 0; i < joints.size(); ++i) {
+      if (i > 0) oss << ", ";
+      oss << std::fixed << std::setprecision(4) << joints[i];
+    }
+    oss << "]";
+
+    try {
+      const auto pose = arm_tip_link_.empty()
+        ? arm_group_->getCurrentPose()
+        : arm_group_->getCurrentPose(arm_tip_link_);
+      const auto & p = pose.pose.position;
+      const auto & q = pose.pose.orientation;
+      oss << " pose=(" << std::fixed << std::setprecision(4)
+          << p.x << ", " << p.y << ", " << p.z << ")"
+          << " q=(" << q.x << ", " << q.y << ", " << q.z << ", " << q.w << ")";
+    } catch (const std::exception & e) {
+      oss << " pose=<err: " << e.what() << ">";
+    }
+    RCLCPP_INFO(get_logger(), "%s", oss.str().c_str());
+  }
+
 private:
   // ── 멤버 ───────────────────────────────────────────────────────────────
   rclcpp::CallbackGroup::SharedPtr cb_group_;
@@ -220,9 +318,10 @@ private:
   rclcpp::Node::SharedPtr moveit_node_;
   std::shared_ptr<moveit::planning_interface::MoveGroupInterface> arm_group_;
   std::shared_ptr<moveit::planning_interface::MoveGroupInterface> gripper_group_;
-  rclcpp_action::Server<MoveToNamed>::SharedPtr move_to_named_server_;
-  rclcpp_action::Server<MoveToPose>::SharedPtr  move_to_pose_server_;
-  rclcpp_action::Server<GripperCmd>::SharedPtr  gripper_server_;
+  rclcpp_action::Server<MoveToNamed>::SharedPtr  move_to_named_server_;
+  rclcpp_action::Server<MoveToPose>::SharedPtr   move_to_pose_server_;
+  rclcpp_action::Server<MoveToJoints>::SharedPtr move_to_joints_server_;
+  rclcpp_action::Server<GripperCmd>::SharedPtr   gripper_server_;
 
   // ── 동시성 제어 ────────────────────────────────────────────────────────
   // busy 플래그는 handle_*_goal 에서 CAS 로 설정되고 execute_* 의
@@ -543,7 +642,8 @@ private:
     feedback->status = "executing";
     goal_handle->publish_feedback(feedback);
 
-    bool executed = (arm_group_->execute(plan) == moveit::core::MoveItErrorCode::SUCCESS);
+    const auto exec_code = arm_group_->execute(plan);
+    bool executed = (exec_code == moveit::core::MoveItErrorCode::SUCCESS);
 
     if (goal_handle->is_canceling()) {
       result->success = false;
@@ -553,10 +653,166 @@ private:
     }
 
     result->success = executed;
-    result->message = executed ? "Moved to '" + requested + "'" : "Execution failed";
+    result->message = executed
+      ? "Moved to '" + requested + "'"
+      : execute_failure_message("MoveToNamed execution failed", exec_code);
     if (executed) {
       goal_handle->succeed(result);
       RCLCPP_INFO(get_logger(), "%s", result->message.c_str());
+    } else {
+      goal_handle->abort(result);
+      RCLCPP_WARN(get_logger(), "%s", result->message.c_str());
+    }
+  }
+
+
+  // ══════════════════════════════════════════════════════════════════════
+  // MoveToJoints
+  //   - joint_names[] 이 비어 있으면 arm 그룹의 active joints 를 기본 사용
+  //   - setJointValueTarget(std::map<std::string,double>) 로 joint-space 목표 지정
+  //   - MoveIt 이 joint_limits.yaml 기반으로 범위 검증 → 실패 시 IK/goal invalid
+  //   - plan / execute 는 MoveToNamed 와 동일하게 직렬 실행
+  // ══════════════════════════════════════════════════════════════════════
+
+  rclcpp_action::GoalResponse handle_joints_goal(
+    const rclcpp_action::GoalUUID &,
+    std::shared_ptr<const MoveToJoints::Goal> goal)
+  {
+    if (goal->positions.empty()) {
+      RCLCPP_WARN(get_logger(), "MoveToJoints: positions is empty, rejecting");
+      return rclcpp_action::GoalResponse::REJECT;
+    }
+    if (!goal->joint_names.empty() &&
+        goal->joint_names.size() != goal->positions.size()) {
+      RCLCPP_WARN(get_logger(),
+        "MoveToJoints: joint_names(%zu) and positions(%zu) size mismatch",
+        goal->joint_names.size(), goal->positions.size());
+      return rclcpp_action::GoalResponse::REJECT;
+    }
+
+    RCLCPP_INFO(get_logger(),
+      "MoveToJoints: %zu joints, velocity_scale=%.3f",
+      goal->positions.size(), goal->velocity_scale);
+
+    bool expected = false;
+    if (!arm_busy_.compare_exchange_strong(
+          expected, true, std::memory_order_acquire, std::memory_order_relaxed)) {
+      RCLCPP_WARN(get_logger(), "MoveToJoints: arm is busy, rejecting goal");
+      return rclcpp_action::GoalResponse::REJECT;
+    }
+    return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+  }
+
+  rclcpp_action::CancelResponse handle_joints_cancel(
+    const std::shared_ptr<rclcpp_action::ServerGoalHandle<MoveToJoints>>)
+  {
+    RCLCPP_INFO(get_logger(), "MoveToJoints: cancel requested");
+    if (arm_group_) arm_group_->stop();
+    return rclcpp_action::CancelResponse::ACCEPT;
+  }
+
+  void handle_joints_accepted(
+    const std::shared_ptr<rclcpp_action::ServerGoalHandle<MoveToJoints>> goal_handle)
+  {
+    if (arm_thread_.joinable()) arm_thread_.join();
+    arm_thread_ = std::thread([this, goal_handle]() { execute_joints(goal_handle); });
+  }
+
+  void execute_joints(
+    const std::shared_ptr<rclcpp_action::ServerGoalHandle<MoveToJoints>> goal_handle)
+  {
+    BusyGuard     busy_guard{arm_busy_};
+    VelScaleGuard vel_guard{arm_group_.get()};
+
+    auto result   = std::make_shared<MoveToJoints::Result>();
+    auto feedback = std::make_shared<MoveToJoints::Feedback>();
+    const auto & goal = goal_handle->get_goal();
+
+    if (!arm_group_) {
+      result->success = false;
+      result->message = "MoveGroupInterface not initialized";
+      goal_handle->abort(result);
+      vel_guard.grp = nullptr;
+      return;
+    }
+
+    // velocity_scale 적용 (0 또는 음수는 기본값 유지)
+    if (goal->velocity_scale > 0.0f) {
+      double v_scale = std::clamp(static_cast<double>(goal->velocity_scale), 0.01, 1.0);
+      arm_group_->setMaxVelocityScalingFactor(v_scale);
+    }
+
+    // joint_names 가 비어있으면 arm 그룹의 active joints 사용
+    std::vector<std::string> names = goal->joint_names;
+    if (names.empty()) {
+      names = arm_group_->getActiveJoints();
+      if (names.size() != goal->positions.size()) {
+        result->success = false;
+        result->message = "joint_names empty but positions size("
+          + std::to_string(goal->positions.size())
+          + ") != active joints("
+          + std::to_string(names.size()) + ")";
+        goal_handle->abort(result);
+        RCLCPP_WARN(get_logger(), "%s", result->message.c_str());
+        return;
+      }
+    }
+
+    std::map<std::string, double> target_map;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+      target_map.emplace(names[i], goal->positions[i]);
+    }
+
+    feedback->progress = 0.0f;
+    feedback->status   = "planning";
+    goal_handle->publish_feedback(feedback);
+
+    arm_group_->setStartStateToCurrentState();
+
+    if (!arm_group_->setJointValueTarget(target_map)) {
+      result->success = false;
+      result->message = "Joint target out of limits or unknown joint name";
+      goal_handle->abort(result);
+      RCLCPP_WARN(get_logger(), "MoveToJoints: %s", result->message.c_str());
+      return;
+    }
+
+    moveit::planning_interface::MoveGroupInterface::Plan plan;
+    bool planned = (arm_group_->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
+
+    if (!planned) {
+      result->success = false;
+      result->message = "Planning failed";
+      goal_handle->abort(result);
+      RCLCPP_WARN(get_logger(), "MoveToJoints: planning failed");
+      return;
+    }
+
+    feedback->progress = 0.5f;
+    feedback->status   = "executing";
+    goal_handle->publish_feedback(feedback);
+
+    const auto exec_code = arm_group_->execute(plan);
+    bool executed = (exec_code == moveit::core::MoveItErrorCode::SUCCESS);
+
+    if (goal_handle->is_canceling()) {
+      result->success = false;
+      result->message = "Cancelled";
+      goal_handle->canceled(result);
+      return;
+    }
+
+    result->success = executed;
+    result->message = executed
+      ? "Moved to joint target"
+      : execute_failure_message("MoveToJoints execution failed", exec_code);
+
+    if (executed) {
+      feedback->progress = 1.0f;
+      feedback->status   = "done";
+      goal_handle->publish_feedback(feedback);
+      goal_handle->succeed(result);
+      RCLCPP_INFO(get_logger(), "MoveToJoints: succeeded");
     } else {
       goal_handle->abort(result);
       RCLCPP_WARN(get_logger(), "%s", result->message.c_str());
@@ -843,7 +1099,12 @@ private:
     feedback->status = "executing";
     goal_handle->publish_feedback(feedback);
 
-    bool executed = (arm_group_->execute(plan) == moveit::core::MoveItErrorCode::SUCCESS);
+    // 디버깅 도움: execute 직전 current joint / pose 상태를 남겨 plan 의 start state 와
+    // controller current state 사이의 drift 여부를 추적할 수 있게 한다.
+    log_current_arm_state("MoveToPose pre-execute");
+
+    const auto exec_code = arm_group_->execute(plan);
+    bool executed = (exec_code == moveit::core::MoveItErrorCode::SUCCESS);
 
     if (goal_handle->is_canceling()) {
       result->success = false;
@@ -853,7 +1114,14 @@ private:
     }
 
     result->success = executed;
-    result->message = executed ? "Pose reached" : "Execution failed";
+    result->message = executed
+      ? "Pose reached"
+      : execute_failure_message("MoveToPose execution failed", exec_code);
+
+    if (!executed) {
+      log_current_arm_state("MoveToPose post-execute (failed)");
+    }
+
     if (executed) {
       feedback->progress = 1.0f;
       feedback->status   = "done";
@@ -862,7 +1130,7 @@ private:
       RCLCPP_INFO(get_logger(), "MoveToPose: succeeded");
     } else {
       goal_handle->abort(result);
-      RCLCPP_WARN(get_logger(), "MoveToPose: execution failed");
+      RCLCPP_WARN(get_logger(), "%s", result->message.c_str());
     }
   }
 
@@ -937,21 +1205,30 @@ private:
     feedback->position = static_cast<float>(pos);
     goal_handle->publish_feedback(feedback);
 
-    // gripper_joint_1 에 목표 위치 → MoveIt 이 velocity profile 포함 trajectory 생성
+    // 반드시 현재 joint state 를 start 로 동기화한다.
+    //   MoveGroupInterface 는 내부적으로 "마지막 setJointValueTarget 의 goal"을
+    //   다음 plan 의 start state 로 유지하는 경향이 있어, 연속 호출(예: open→close
+    //   →open)에서 두 번째 open 이 stale start state 로 PLANNING_FAILED 가 된다.
+    gripper_group_->setStartStateToCurrentState();
     gripper_group_->setJointValueTarget("gripper_joint_1", pos);
 
     moveit::planning_interface::MoveGroupInterface::Plan plan;
-    bool planned = (gripper_group_->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
+    const auto plan_code = gripper_group_->plan(plan);
+    bool planned = (plan_code == moveit::core::MoveItErrorCode::SUCCESS);
 
     if (!planned) {
       result->success = false;
-      result->message = "Gripper planning failed";
+      result->message = execute_failure_message(
+        "Gripper planning failed", plan_code);
       goal_handle->abort(result);
-      RCLCPP_WARN(get_logger(), "GripperCommand: planning failed (pos=%.3f)", pos);
+      RCLCPP_WARN(get_logger(),
+        "GripperCommand: %s (pos=%.3f)",
+        result->message.c_str(), pos);
       return;
     }
 
-    bool executed = (gripper_group_->execute(plan) == moveit::core::MoveItErrorCode::SUCCESS);
+    const auto exec_code = gripper_group_->execute(plan);
+    bool executed = (exec_code == moveit::core::MoveItErrorCode::SUCCESS);
 
     if (goal_handle->is_canceling()) {
       result->success = false;
@@ -962,7 +1239,9 @@ private:
 
     result->success  = executed;
     result->position = static_cast<float>(pos);
-    result->message  = executed ? "Gripper command succeeded" : "Gripper execution failed";
+    result->message  = executed
+      ? "Gripper command succeeded"
+      : execute_failure_message("Gripper execution failed", exec_code);
 
     if (executed) {
       goal_handle->succeed(result);
