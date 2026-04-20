@@ -16,6 +16,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/MoveToPose.action"
   "action/GripperCommand.action"
   "action/PickPlace.action"
+  "action/PickDetected.action"
   "msg/BlockPose.msg"
   "srv/GetBlockPoses.srv"
   DEPENDENCIES std_msgs geometry_msgs action_msgs

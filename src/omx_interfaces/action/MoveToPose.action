@@ -1,6 +1,8 @@
 # Goal
 geometry_msgs/PoseStamped target_pose
 float32 velocity_scale   # 0.0 ~ 1.0, default 0.5
+bool plan_only           # true: validate path only, false: plan + execute
+bool preview_in_sim      # true: launch isolated Gazebo preview (requires plan_only=true)
 ---
 # Result
 bool success
