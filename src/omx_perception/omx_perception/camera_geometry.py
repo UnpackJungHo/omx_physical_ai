@@ -57,38 +57,6 @@ class Plane:
     normal_xyz: np.ndarray
     point_xyz: np.ndarray
 
-    @classmethod
-    def from_yaml(cls, path: str | Path) -> "Plane":
-        with Path(path).open("r", encoding="utf-8") as stream:
-            data = yaml.safe_load(stream)
-
-        return cls(
-            frame_id=str(data["table_plane"]["frame_id"]),
-            normal_xyz=normalize(np.asarray(data["table_plane"]["normal_xyz"], dtype=float)),
-            point_xyz=np.asarray(data["table_plane"]["point_xyz"], dtype=float),
-        )
-
-
-@dataclass(frozen=True)
-class FrameConfig:
-    camera_frame: str
-    reference_frame: str
-    robot_root_frame: str
-    camera_parent_frame: str
-
-    @classmethod
-    def from_yaml(cls, path: str | Path) -> "FrameConfig":
-        with Path(path).open("r", encoding="utf-8") as stream:
-            data = yaml.safe_load(stream)
-
-        frames = data["frames"]
-        return cls(
-            camera_frame=str(frames["camera_frame"]),
-            reference_frame=str(frames["reference_frame"]),
-            robot_root_frame=str(frames["robot_root_frame"]),
-            camera_parent_frame=str(frames["camera_parent_frame"]),
-        )
-
 
 def normalize(vector: Iterable[float]) -> np.ndarray:
     array = np.asarray(vector, dtype=float)
@@ -150,3 +118,39 @@ def intersect_ray_with_plane(
         return None
 
     return origin + distance * direction
+
+
+def world_direction_to_image_vanishing_point(
+    intrinsics: CameraIntrinsics,
+    transform: TransformSnapshot,
+    direction_world: Iterable[float],
+) -> np.ndarray | None:
+    """Project a world-frame direction (at infinity) onto the image plane.
+
+    Returns pixel (u, v) where parallel world lines of this direction converge,
+    or None if the direction is perpendicular to the optical axis (ideal point).
+    """
+    rotation_world_to_cam = quaternion_to_rotation_matrix(transform.rotation_xyzw).T
+    direction_camera = rotation_world_to_cam @ np.asarray(direction_world, dtype=float)
+    if abs(direction_camera[2]) < 1e-9:
+        return None
+    u = intrinsics.fx * direction_camera[0] / direction_camera[2] + intrinsics.cx
+    v = intrinsics.fy * direction_camera[1] / direction_camera[2] + intrinsics.cy
+    return np.array([u, v], dtype=float)
+
+
+def project_world_point_to_image(
+    intrinsics: CameraIntrinsics,
+    transform: TransformSnapshot,
+    point_world: Iterable[float],
+) -> np.ndarray | None:
+    """Project a world-frame 3D point onto the image plane (pinhole, no distortion)."""
+    rotation_cam_to_world = quaternion_to_rotation_matrix(transform.rotation_xyzw)
+    rotation_world_to_cam = rotation_cam_to_world.T
+    point = np.asarray(point_world, dtype=float)
+    point_cam = rotation_world_to_cam @ (point - transform.translation_m.astype(float))
+    if point_cam[2] <= 1e-6:
+        return None
+    u = intrinsics.fx * point_cam[0] / point_cam[2] + intrinsics.cx
+    v = intrinsics.fy * point_cam[1] / point_cam[2] + intrinsics.cy
+    return np.array([u, v], dtype=float)

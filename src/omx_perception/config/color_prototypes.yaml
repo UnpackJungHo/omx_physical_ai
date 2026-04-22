@@ -1,0 +1,12 @@
+blue:
+  a_star: 9.0
+  b_star: -20.0
+  samples: 20
+green:
+  a_star: -21.0
+  b_star: 7.0
+  samples: 20
+red:
+  a_star: 35.0
+  b_star: 9.0
+  samples: 20

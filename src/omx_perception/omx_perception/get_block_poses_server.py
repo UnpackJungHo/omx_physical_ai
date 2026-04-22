@@ -8,6 +8,7 @@ import rclpy
 from builtin_interfaces.msg import Time
 from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion
 from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Header, String
 
 from omx_interfaces.msg import BlockPose
@@ -95,8 +96,15 @@ class GetBlockPosesServer(Node):
 
         self._latest: dict | None = None
         self._received_at: float = 0.0
+        stream_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+        )
 
-        self.create_subscription(String, "/omx/perception/tracked_blocks", self._on_blocks, 10)
+        self.create_subscription(
+            String, "/omx/perception/tracked_blocks", self._on_blocks, stream_qos
+        )
         self.create_service(GetBlockPoses, "/omx/get_block_poses", self._handle)
 
     def _on_blocks(self, msg: String) -> None:
@@ -170,4 +178,5 @@ def main(args=None) -> None:
         rclpy.spin(node)
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()

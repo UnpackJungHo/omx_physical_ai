@@ -2,59 +2,33 @@ detector_node:
   ros__parameters:
     reference_frame: world
     camera_frame: default_cam
-    table_z_m: 0.0
-    block_half_height_m: 0.015
-    min_contour_area: 500
-    max_contour_area: 30000
-    max_reproj_error_px: 5.0
-    color_ranges_path: ""  # set by launch file to installed config/color_ranges.yaml
-    red_h1_min: 0
-    red_h1_max: 19
-    red_s1_min: 42
-    red_s1_max: 255
-    red_v1_min: 20
-    red_v1_max: 255
-    red_h2_min: 136
-    red_h2_max: 179
-    red_s2_min: 42
-    red_s2_max: 255
-    red_v2_min: 20
-    red_v2_max: 255
-    green_h_min: 42
-    green_h_max: 95
-    green_s_min: 16
-    green_s_max: 255
-    green_v_min: 50
-    green_v_max: 255
-    blue_h_min: 106
-    blue_h_max: 173
-    blue_s_min: 79
-    blue_s_max: 255
-    blue_v_min: 29
-    blue_v_max: 255
-    roi_x_min: 0.05
-    roi_y_min: 0.05
-    roi_x_max: 0.95
-    roi_y_max: 0.95
-    max_box_aspect_ratio: 1.9
-    min_polygon_vertices: 4
-    max_polygon_vertices: 8
-    max_circularity: 0.94
-    min_color_purity: 0.32
-    min_color_margin: 0.08
-    min_side_area_ratio: 0.18
-    min_side_value_drop: 8.0
-    min_world_edge_m: 0.018
-    max_world_edge_m: 0.12
-    debug_mask_color: green
-    dominance_expand_kernel_size: 35
-    dominance_expand_iterations: 3
-    min_strict_pixels_for_expansion: 25
+    block_size_m: 0.030
+    table_z_m: 0.18
+    workspace_x_min_m: 0.08
+    workspace_x_max_m: 0.35
+    workspace_y_min_m: -0.15
+    workspace_y_max_m: 0.15
+    color_chroma_min: 10.0
+    color_majority_min: 0.40
+    canny_sigma: 0.33
+    min_contour_area_px: 200.0
+    max_contour_area_px: 20000.0
+    saturation_min: 75
+    rect_fill_min: 0.75
+    aspect_ratio_min: 0.60
+    aspect_ratio_max: 1.66
+    use_white_balance: true
+    process_period_sec: 0.02
+    publish_debug_canny: false
+    publish_debug_segmentation: false
+    slow_frame_warn_ms: 80.0
+    color_prototypes_path: ""  # set by launch file to installed config/color_prototypes.yaml
 
 tracker_node:
   ros__parameters:
-    stale_threshold_sec: 1.0
+    stale_threshold_sec: 1.5
     min_confidence: 0.25
+    assoc_threshold_m: 0.025
     position_alpha: 0.35
     yaw_alpha: 0.25
     confidence_alpha: 0.4
@@ -62,3 +36,25 @@ tracker_node:
 get_block_poses_server:
   ros__parameters:
     stale_threshold_sec: 2.0
+    grasp_yaw_offset_deg: 0.0
+
+color_calibrator:
+  ros__parameters:
+    reference_frame: world
+    camera_frame: default_cam
+    block_size_m: 0.030
+    table_z_m: 0.18
+    workspace_x_min_m: 0.08
+    workspace_x_max_m: 0.35
+    workspace_y_min_m: -0.15
+    workspace_y_max_m: 0.15
+    canny_sigma: 0.33
+    min_contour_area_px: 200.0
+    max_contour_area_px: 20000.0
+    saturation_min: 75
+    rect_fill_min: 0.75
+    aspect_ratio_min: 0.60
+    aspect_ratio_max: 1.66
+    use_white_balance: true
+    chroma_min: 10.0
+    samples_per_color: 20

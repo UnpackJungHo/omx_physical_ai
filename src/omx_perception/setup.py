@@ -37,12 +37,11 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "pixel_ray_tool = omx_perception.pixel_ray_tool:main",
+            "camera_control_node = omx_perception.camera_control_node:main",
             "detector_node = omx_perception.detector_node:main",
             "tracker_node = omx_perception.tracker_node:main",
             "get_block_poses_server = omx_perception.get_block_poses_server:main",
-            "depth_node = omx_perception.depth_node:main",
-            "hsv_tuner = omx_perception.hsv_tuner:main",
+            "color_calibrator = omx_perception.color_calibrator:main",
         ],
     },
 )

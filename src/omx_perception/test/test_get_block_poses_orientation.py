@@ -4,6 +4,14 @@ import types
 import unittest
 
 
+def _ensure_module(name: str) -> types.ModuleType:
+    module = sys.modules.get(name)
+    if module is None:
+        module = types.ModuleType(name)
+        sys.modules[name] = module
+    return module
+
+
 if "rclpy" not in sys.modules:
     sys.modules["rclpy"] = types.ModuleType("rclpy")
 
@@ -16,90 +24,90 @@ if "rclpy.node" not in sys.modules:
     rclpy_node_stub.Node = DummyNode
     sys.modules["rclpy.node"] = rclpy_node_stub
 
-if "builtin_interfaces" not in sys.modules:
-    builtin_stub = types.ModuleType("builtin_interfaces")
-    builtin_msg_stub = types.ModuleType("builtin_interfaces.msg")
+builtin_msg_stub = _ensure_module("builtin_interfaces.msg")
 
-    class DummyTime:
-        def __init__(self, sec: int = 0, nanosec: int = 0) -> None:
-            self.sec = sec
-            self.nanosec = nanosec
 
-    builtin_msg_stub.Time = DummyTime
-    sys.modules["builtin_interfaces"] = builtin_stub
-    sys.modules["builtin_interfaces.msg"] = builtin_msg_stub
+class DummyTime:
+    def __init__(self, sec: int = 0, nanosec: int = 0) -> None:
+        self.sec = sec
+        self.nanosec = nanosec
 
-if "geometry_msgs" not in sys.modules:
-    geometry_stub = types.ModuleType("geometry_msgs")
-    geometry_msg_stub = types.ModuleType("geometry_msgs.msg")
 
-    class DummyPoint:
-        def __init__(self, x=0.0, y=0.0, z=0.0) -> None:
-            self.x = x
-            self.y = y
-            self.z = z
+builtin_msg_stub.Time = DummyTime
+_ensure_module("builtin_interfaces")
 
-    class DummyQuaternion:
-        def __init__(self, x=0.0, y=0.0, z=0.0, w=1.0) -> None:
-            self.x = x
-            self.y = y
-            self.z = z
-            self.w = w
+geometry_msg_stub = _ensure_module("geometry_msgs.msg")
 
-    class DummyPose:
-        def __init__(self, position=None, orientation=None) -> None:
-            self.position = position
-            self.orientation = orientation
 
-    class DummyPoseStamped:
-        def __init__(self, header=None, pose=None) -> None:
-            self.header = header
-            self.pose = pose
+class DummyPoint:
+    def __init__(self, x=0.0, y=0.0, z=0.0) -> None:
+        self.x = x
+        self.y = y
+        self.z = z
 
-    geometry_msg_stub.Point = DummyPoint
-    geometry_msg_stub.Quaternion = DummyQuaternion
-    geometry_msg_stub.Pose = DummyPose
-    geometry_msg_stub.PoseStamped = DummyPoseStamped
-    sys.modules["geometry_msgs"] = geometry_stub
-    sys.modules["geometry_msgs.msg"] = geometry_msg_stub
 
-if "std_msgs" not in sys.modules:
-    std_stub = types.ModuleType("std_msgs")
-    std_msg_stub = types.ModuleType("std_msgs.msg")
+class DummyQuaternion:
+    def __init__(self, x=0.0, y=0.0, z=0.0, w=1.0) -> None:
+        self.x = x
+        self.y = y
+        self.z = z
+        self.w = w
 
-    class DummyHeader:
-        def __init__(self, frame_id="", stamp=None) -> None:
-            self.frame_id = frame_id
-            self.stamp = stamp
 
-    class DummyString:
+class DummyPose:
+    def __init__(self, position=None, orientation=None) -> None:
+        self.position = position
+        self.orientation = orientation
+
+
+class DummyPoseStamped:
+    def __init__(self, header=None, pose=None) -> None:
+        self.header = header
+        self.pose = pose
+
+
+geometry_msg_stub.Point = DummyPoint
+geometry_msg_stub.Quaternion = DummyQuaternion
+geometry_msg_stub.Pose = DummyPose
+geometry_msg_stub.PoseStamped = DummyPoseStamped
+_ensure_module("geometry_msgs")
+
+std_msg_stub = _ensure_module("std_msgs.msg")
+
+
+class DummyHeader:
+    def __init__(self, frame_id="", stamp=None) -> None:
+        self.frame_id = frame_id
+        self.stamp = stamp
+
+
+class DummyString:
+    pass
+
+
+std_msg_stub.Header = DummyHeader
+std_msg_stub.String = DummyString
+_ensure_module("std_msgs")
+
+omx_msg_stub = _ensure_module("omx_interfaces.msg")
+omx_srv_stub = _ensure_module("omx_interfaces.srv")
+
+
+class DummyBlockPose:
+    pass
+
+
+class DummyGetBlockPoses:
+    class Request:
         pass
 
-    std_msg_stub.Header = DummyHeader
-    std_msg_stub.String = DummyString
-    sys.modules["std_msgs"] = std_stub
-    sys.modules["std_msgs.msg"] = std_msg_stub
-
-if "omx_interfaces" not in sys.modules:
-    omx_stub = types.ModuleType("omx_interfaces")
-    omx_msg_stub = types.ModuleType("omx_interfaces.msg")
-    omx_srv_stub = types.ModuleType("omx_interfaces.srv")
-
-    class DummyBlockPose:
+    class Response:
         pass
 
-    class DummyGetBlockPoses:
-        class Request:
-            pass
 
-        class Response:
-            pass
-
-    omx_msg_stub.BlockPose = DummyBlockPose
-    omx_srv_stub.GetBlockPoses = DummyGetBlockPoses
-    sys.modules["omx_interfaces"] = omx_stub
-    sys.modules["omx_interfaces.msg"] = omx_msg_stub
-    sys.modules["omx_interfaces.srv"] = omx_srv_stub
+omx_msg_stub.BlockPose = DummyBlockPose
+omx_srv_stub.GetBlockPoses = DummyGetBlockPoses
+_ensure_module("omx_interfaces")
 
 
 from omx_perception.get_block_poses_server import _canonicalize_cube_yaw, _yaw_to_quaternion
