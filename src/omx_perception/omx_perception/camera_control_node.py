@@ -5,6 +5,7 @@ import subprocess
 from dataclasses import dataclass
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
 from rclpy.node import Node
 
@@ -27,7 +28,7 @@ def build_v4l2_command(
     state: CameraControlState,
     executable: str = "v4l2-ctl",
 ) -> list[str]:
-    return [
+    command = [
         executable,
         "-d",
         state.video_device,
@@ -36,11 +37,7 @@ def build_v4l2_command(
         "-c",
         "exposure_dynamic_framerate=0",
         "-c",
-        f"exposure_time_absolute={int(state.exposure)}",
-        "-c",
         f"white_balance_automatic={1 if state.auto_white_balance else 0}",
-        "-c",
-        f"white_balance_temperature={int(state.white_balance)}",
         "-c",
         f"gain={int(state.gain)}",
         "-c",
@@ -52,6 +49,14 @@ def build_v4l2_command(
         "-c",
         f"sharpness={int(state.sharpness)}",
     ]
+
+    if not state.autoexposure:
+        command.extend(["-c", f"exposure_time_absolute={int(state.exposure)}"])
+
+    if not state.auto_white_balance:
+        command.extend(["-c", f"white_balance_temperature={int(state.white_balance)}"])
+
+    return command
 
 
 class CameraControlNode(Node):
@@ -193,6 +198,8 @@ def main(args=None) -> None:
     node = CameraControlNode()
     try:
         rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
     finally:
         node.destroy_node()
         if rclpy.ok():

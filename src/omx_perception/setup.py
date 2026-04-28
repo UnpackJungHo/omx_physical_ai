@@ -5,6 +5,18 @@ from setuptools import find_packages, setup
 
 
 package_name = "omx_perception"
+source_dir = os.path.dirname(os.path.realpath(__file__))
+
+
+def source_glob(pattern: str) -> list[str]:
+    return [
+        os.path.relpath(path, os.getcwd())
+        for path in glob(os.path.join(source_dir, pattern))
+    ]
+
+
+def source_path(*parts: str) -> str:
+    return os.path.relpath(os.path.join(source_dir, *parts), os.getcwd())
 
 
 setup(
@@ -14,16 +26,16 @@ setup(
     data_files=[
         (
             "share/ament_index/resource_index/packages",
-            [f"resource/{package_name}"],
+            [source_path("resource", package_name)],
         ),
-        (f"share/{package_name}", ["package.xml"]),
+        (f"share/{package_name}", [source_path("package.xml")]),
         (
             os.path.join("share", package_name, "config"),
-            glob("config/*.yaml"),
+            source_glob("config/*.yaml"),
         ),
         (
             os.path.join("share", package_name, "launch"),
-            glob("launch/*.launch.py"),
+            source_glob("launch/*.launch.py"),
         ),
     ],
     install_requires=["setuptools"],
@@ -38,10 +50,8 @@ setup(
     entry_points={
         "console_scripts": [
             "camera_control_node = omx_perception.camera_control_node:main",
-            "detector_node = omx_perception.detector_node:main",
-            "tracker_node = omx_perception.tracker_node:main",
-            "get_block_poses_server = omx_perception.get_block_poses_server:main",
-            "color_calibrator = omx_perception.color_calibrator:main",
+            "top4_keypoints_node = omx_perception.top4_keypoints_node:main",
+            "top4_world_pose_node = omx_perception.top4_world_pose_node:main",
         ],
     },
 )
