@@ -29,6 +29,7 @@
 #include <iomanip>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -49,6 +50,9 @@
 #include <omx_interfaces/action/move_to_pose.hpp>
 #include <omx_interfaces/action/move_to_joints.hpp>
 #include <omx_interfaces/action/gripper_command.hpp>
+#include <omx_interfaces/srv/clear_plan.hpp>
+#include <omx_interfaces/srv/execute_plan.hpp>
+#include <omx_interfaces/srv/plan_to_joints.hpp>
 
 // ── 워크스페이스 한계 (workspace_guard 와 일치) ───────────────────────────
 static constexpr double WS_Z_MIN      = 0.01;
@@ -135,6 +139,9 @@ public:
   using MoveToPose   = omx_interfaces::action::MoveToPose;
   using MoveToJoints = omx_interfaces::action::MoveToJoints;
   using GripperCmd   = omx_interfaces::action::GripperCommand;
+  using PlanToJoints = omx_interfaces::srv::PlanToJoints;
+  using ExecutePlan  = omx_interfaces::srv::ExecutePlan;
+  using ClearPlan    = omx_interfaces::srv::ClearPlan;
 
   explicit MotionServer(const rclcpp::NodeOptions & options)
   : Node("motion_server", options), node_options_(options)
@@ -173,7 +180,37 @@ public:
       std::bind(&MotionServer::handle_gripper_accepted, this, std::placeholders::_1),
       rcl_action_server_get_default_options(), cb_group_);
 
-    RCLCPP_INFO(get_logger(), "MotionServer: action servers created, waiting for MoveIt...");
+    plan_to_joints_service_ = create_service<PlanToJoints>(
+      "/omx/plan_to_joints",
+      std::bind(
+        &MotionServer::handle_plan_to_joints,
+        this,
+        std::placeholders::_1,
+        std::placeholders::_2),
+      rmw_qos_profile_services_default,
+      cb_group_);
+
+    execute_plan_service_ = create_service<ExecutePlan>(
+      "/omx/execute_plan",
+      std::bind(
+        &MotionServer::handle_execute_plan,
+        this,
+        std::placeholders::_1,
+        std::placeholders::_2),
+      rmw_qos_profile_services_default,
+      cb_group_);
+
+    clear_plan_service_ = create_service<ClearPlan>(
+      "/omx/clear_plan",
+      std::bind(
+        &MotionServer::handle_clear_plan,
+        this,
+        std::placeholders::_1,
+        std::placeholders::_2),
+      rmw_qos_profile_services_default,
+      cb_group_);
+
+    RCLCPP_INFO(get_logger(), "MotionServer: action servers and plan services created, waiting for MoveIt...");
   }
 
   ~MotionServer()
@@ -322,6 +359,9 @@ private:
   rclcpp_action::Server<MoveToPose>::SharedPtr   move_to_pose_server_;
   rclcpp_action::Server<MoveToJoints>::SharedPtr move_to_joints_server_;
   rclcpp_action::Server<GripperCmd>::SharedPtr   gripper_server_;
+  rclcpp::Service<PlanToJoints>::SharedPtr plan_to_joints_service_;
+  rclcpp::Service<ExecutePlan>::SharedPtr execute_plan_service_;
+  rclcpp::Service<ClearPlan>::SharedPtr clear_plan_service_;
 
   // ── 동시성 제어 ────────────────────────────────────────────────────────
   // busy 플래그는 handle_*_goal 에서 CAS 로 설정되고 execute_* 의
@@ -331,6 +371,10 @@ private:
   std::thread arm_thread_;      // detach 대신 handle_*_accepted 에서 join 후 교체
   std::thread gripper_thread_;
   std::string arm_tip_link_;
+  std::mutex cached_plan_mutex_;
+  moveit::planning_interface::MoveGroupInterface::Plan cached_arm_plan_;
+  std::string cached_plan_id_;
+  bool cached_plan_valid_{false};
 
 
   // ── RAII 헬퍼 ─────────────────────────────────────────────────────────
@@ -558,6 +602,183 @@ private:
       << " >" << resolved_log_path << " 2>&1 &\"";
 
     return std::system(command.str().c_str()) == 0;
+  }
+
+  static double plan_duration_sec(
+    const moveit::planning_interface::MoveGroupInterface::Plan & plan)
+  {
+    const auto & points = plan.trajectory.joint_trajectory.points;
+    if (points.empty()) {
+      return 0.0;
+    }
+    return duration_to_sec(points.back().time_from_start);
+  }
+
+  static std::string make_plan_id()
+  {
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+    return "moveit-plan-" + std::to_string(now_ms);
+  }
+
+  void handle_plan_to_joints(
+    const std::shared_ptr<PlanToJoints::Request> request,
+    std::shared_ptr<PlanToJoints::Response> response)
+  {
+    response->success = false;
+    response->duration = 0.0;
+    response->point_count = 0;
+
+    bool expected = false;
+    if (!arm_busy_.compare_exchange_strong(
+          expected, true, std::memory_order_acquire, std::memory_order_relaxed)) {
+      response->message = "Arm is busy";
+      return;
+    }
+    BusyGuard busy_guard{arm_busy_};
+    VelScaleGuard vel_guard{arm_group_.get()};
+
+    if (!arm_group_) {
+      response->message = "MoveGroupInterface not initialized";
+      return;
+    }
+    if (request->positions.empty()) {
+      response->message = "positions is empty";
+      return;
+    }
+    if (!request->joint_names.empty() &&
+        request->joint_names.size() != request->positions.size()) {
+      response->message = "joint_names and positions size mismatch";
+      return;
+    }
+
+    if (request->velocity_scale > 0.0f) {
+      const double v_scale = std::clamp(static_cast<double>(request->velocity_scale), 0.01, 1.0);
+      arm_group_->setMaxVelocityScalingFactor(v_scale);
+    }
+
+    std::vector<std::string> names = request->joint_names;
+    if (names.empty()) {
+      names = arm_group_->getActiveJoints();
+      if (names.size() != request->positions.size()) {
+        response->message = "positions size does not match active joints";
+        return;
+      }
+    }
+
+    std::map<std::string, double> target_map;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+      target_map.emplace(names[i], request->positions[i]);
+    }
+
+    arm_group_->setStartStateToCurrentState();
+    if (!arm_group_->setJointValueTarget(target_map)) {
+      response->message = "Joint target out of limits or unknown joint name";
+      response->invalid_joints = names;
+      return;
+    }
+
+    moveit::planning_interface::MoveGroupInterface::Plan plan;
+    const auto plan_code = arm_group_->plan(plan);
+    if (plan_code != moveit::core::MoveItErrorCode::SUCCESS) {
+      response->message = execute_failure_message("Planning failed", plan_code);
+      return;
+    }
+
+    const std::string plan_id = make_plan_id();
+    {
+      std::lock_guard<std::mutex> lock(cached_plan_mutex_);
+      cached_arm_plan_ = plan;
+      cached_plan_id_ = plan_id;
+      cached_plan_valid_ = true;
+    }
+
+    response->success = true;
+    response->message = "MoveIt trajectory planned";
+    response->plan_id = plan_id;
+    response->duration = plan_duration_sec(plan);
+    response->point_count = static_cast<uint32_t>(plan.trajectory.joint_trajectory.points.size());
+    response->trajectory_joint_names = plan.trajectory.joint_trajectory.joint_names;
+    response->trajectory_times.reserve(plan.trajectory.joint_trajectory.points.size());
+    response->trajectory_positions.reserve(
+      plan.trajectory.joint_trajectory.points.size()
+      * plan.trajectory.joint_trajectory.joint_names.size());
+    for (const auto & point : plan.trajectory.joint_trajectory.points) {
+      response->trajectory_times.push_back(duration_to_sec(point.time_from_start));
+      for (double position : point.positions) {
+        response->trajectory_positions.push_back(position);
+      }
+    }
+    RCLCPP_INFO(
+      get_logger(),
+      "PlanToJoints: cached %s, points=%u, duration=%.3fs",
+      plan_id.c_str(),
+      response->point_count,
+      response->duration);
+  }
+
+  void handle_execute_plan(
+    const std::shared_ptr<ExecutePlan::Request> request,
+    std::shared_ptr<ExecutePlan::Response> response)
+  {
+    response->success = false;
+
+    bool expected = false;
+    if (!arm_busy_.compare_exchange_strong(
+          expected, true, std::memory_order_acquire, std::memory_order_relaxed)) {
+      response->message = "Arm is busy";
+      return;
+    }
+    BusyGuard busy_guard{arm_busy_};
+
+    if (!arm_group_) {
+      response->message = "MoveGroupInterface not initialized";
+      return;
+    }
+
+    moveit::planning_interface::MoveGroupInterface::Plan plan;
+    std::string plan_id;
+    {
+      std::lock_guard<std::mutex> lock(cached_plan_mutex_);
+      if (!cached_plan_valid_) {
+        response->message = "No cached plan. Run Plan first.";
+        return;
+      }
+      if (!request->plan_id.empty() && request->plan_id != cached_plan_id_) {
+        response->message = "Cached plan id mismatch. Run Plan again.";
+        response->plan_id = cached_plan_id_;
+        return;
+      }
+      plan = cached_arm_plan_;
+      plan_id = cached_plan_id_;
+    }
+
+    log_current_arm_state("ExecutePlan before execute");
+    const auto exec_code = arm_group_->execute(plan);
+    const bool executed = (exec_code == moveit::core::MoveItErrorCode::SUCCESS);
+
+    response->success = executed;
+    response->plan_id = plan_id;
+    response->message = executed
+      ? "Executed cached MoveIt plan"
+      : execute_failure_message("ExecutePlan failed", exec_code);
+
+    if (executed) {
+      std::lock_guard<std::mutex> lock(cached_plan_mutex_);
+      cached_plan_valid_ = false;
+      cached_plan_id_.clear();
+    }
+  }
+
+  void handle_clear_plan(
+    const std::shared_ptr<ClearPlan::Request>,
+    std::shared_ptr<ClearPlan::Response> response)
+  {
+    std::lock_guard<std::mutex> lock(cached_plan_mutex_);
+    cached_plan_valid_ = false;
+    cached_plan_id_.clear();
+    response->success = true;
+    response->message = "Cached plan cleared";
   }
 
 

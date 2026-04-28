@@ -29,6 +29,10 @@ def generate_launch_description():
         get_package_share_directory('omx_bringup'),
         'config', 'omx_f', 'moveit_controllers.yaml'
     )
+    local_robot_description = os.path.join(
+        get_package_share_directory('omx_bringup'),
+        'config', 'omx_f', 'omx_f_with_camera.urdf.xacro'
+    )
     local_srdf = os.path.join(
         get_package_share_directory('omx_bringup'),
         'config', 'omx_f', 'omx_f.srdf'
@@ -43,6 +47,7 @@ def generate_launch_description():
             robot_name='omx_f',
             package_name='open_manipulator_moveit_config',
         )
+        .robot_description(local_robot_description)
         .robot_description_semantic(local_srdf)
         .joint_limits(
             str(Path('config') / 'omx_f' / 'joint_limits.yaml')
