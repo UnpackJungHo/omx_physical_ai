@@ -19,7 +19,12 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/PickPlace.action"
   "action/PickDetected.action"
   "msg/BlockPose.msg"
+  "msg/Top4Box.msg"
   "srv/GetBlockPoses.srv"
+  "srv/GetTop4Keypoints.srv"
+  "srv/PlanToJoints.srv"
+  "srv/ExecutePlan.srv"
+  "srv/ClearPlan.srv"
   DEPENDENCIES std_msgs geometry_msgs action_msgs
 )
 
