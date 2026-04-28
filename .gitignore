@@ -41,3 +41,7 @@ venv/
 *.tmp
 *.bak
 /datasets/
+/dataset2/
+/BoxTopDetector2Yolov8/
+/runs/
+/yolo*
