@@ -1,0 +1,9 @@
+# Request: 즉시 평가 트리거. 인자 없음.
+---
+# Response
+bool is_grasping              # 3-신호 AND + stable window 통과 여부
+float32 current_ma            # 그리퍼 모터 present current (mA, signed)
+float32 position_error        # |goal - present| 그리퍼 조인트 (rad 또는 정규화 단위)
+float32 velocity              # 그리퍼 조인트 속도 (rad/s)
+string reason                 # "grasping" | "no_object" | "moving" | "no_command" | "stale_state" | "no_state"
+builtin_interfaces/Time stamp # 평가에 사용된 가장 최신 joint_states timestamp
