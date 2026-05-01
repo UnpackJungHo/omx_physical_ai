@@ -3,7 +3,11 @@
     video_device: "/dev/video0"
     image_width: 640
     image_height: 480
-    pixel_format: "yuyv"
+    # Use the camera's MJPEG stream instead of uncompressed YUYV. YUYV at
+    # 640x480@30 can intermittently hit usb_cam select timeouts on this UVC
+    # camera, leaving the next launch with "Unable to start stream".
+    pixel_format: "mjpeg2rgb"
+    av_device_format: "YUV422P"
     frame_id: "default_cam"
     camera_frame_id: "default_cam"
     io_method: "mmap"
