@@ -1,0 +1,200 @@
+<?xml version="1.0"?>
+<!--
+  omx_f_grasp.ros2_control.xacro
+  upstream open_manipulator_description/ros2_control/omx_f.ros2_control.xacro
+  copy + grasp detection edits:
+    1. gripper_joint_1 state_interface: add "effort"
+    2. dxl16 (gripper) state_interface: add "Present Current"
+    3. dxl16 Goal Current: 600 -> 40 unit (~108 mA) for soft grasp
+  dynamixel_hardware_interface ros2_to_dxl_state_map maps effort to "Present Current"
+  so /joint_states.effort[gripper] exposes live motor current.
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:macro name="omx_f_system"
+    params="name prefix port_name:=^|/dev/ttyACM1 use_sim:=^|false use_mock_hardware:=^|false mock_sensor_commands:=^|false">
+    <ros2_control name="${name}" type="system" is_async="true">
+      <xacro:if value="$(arg use_sim)">
+        <hardware>
+          <plugin>gz_ros2_control/GazeboSimSystem</plugin>
+        </hardware>
+      </xacro:if>
+      <xacro:unless value="$(arg use_sim)">
+        <hardware>
+          <xacro:if value="${use_mock_hardware}">
+            <plugin>mock_components/GenericSystem</plugin>
+            <param name="mock_sensor_commands">${mock_sensor_commands}</param>
+            <param name="state_following_offset">0.0</param>
+          </xacro:if>
+          <xacro:unless value="${use_mock_hardware}">
+            <plugin>dynamixel_hardware_interface/DynamixelHardware</plugin>
+            <param name="port_name">${port_name}</param>
+            <param name="baud_rate">1000000</param>
+            <param name="error_timeout_ms">500</param>
+            <param name="dynamixel_model_folder">/param/dxl_model</param>
+            <param name="number_of_joints">6</param>
+            <param name="number_of_transmissions">6</param>
+            <param name="disable_torque_at_init">true</param>
+            <param name="dynamixel_state_pub_msg_name">dynamixel_hardware_interface/dxl_state</param>
+            <param name="get_dynamixel_data_srv_name">dynamixel_hardware_interface/get_dxl_data</param>
+            <param name="set_dynamixel_data_srv_name">dynamixel_hardware_interface/set_dxl_data</param>
+            <param name="reboot_dxl_srv_name">dynamixel_hardware_interface/reboot_dxl</param>
+            <param name="set_dxl_torque_srv_name">dynamixel_hardware_interface/set_dxl_torque</param>
+          </xacro:unless>
+        </hardware>
+      </xacro:unless>
+
+      <joint name="${prefix}joint1">
+        <command_interface name="position" />
+        <state_interface name="position" />
+        <state_interface name="velocity" />
+      </joint>
+      <joint name="${prefix}joint2">
+        <command_interface name="position" />
+        <state_interface name="position" />
+        <state_interface name="velocity" />
+      </joint>
+      <joint name="${prefix}joint3">
+        <command_interface name="position" />
+        <state_interface name="position" />
+        <state_interface name="velocity" />
+      </joint>
+      <joint name="${prefix}joint4">
+        <command_interface name="position" />
+        <state_interface name="position" />
+        <state_interface name="velocity" />
+      </joint>
+      <joint name="${prefix}joint5">
+        <command_interface name="position" />
+        <state_interface name="position" />
+        <state_interface name="velocity" />
+      </joint>
+      <joint name="${prefix}gripper_joint_1">
+        <command_interface name="position" />
+        <state_interface name="position" />
+        <state_interface name="velocity" />
+        <!-- 추가된 내용 -->
+        <state_interface name="effort" />
+      </joint>
+      <xacro:if value="$(arg use_sim)">
+        <joint name="${prefix}gripper_joint_2">
+          <param name="mimic">${prefix}gripper_joint_1</param>
+          <param name="multiplier">-1</param>
+          <state_interface name="position" />
+          <state_interface name="velocity" />
+          <state_interface name="effort" />
+        </joint>
+      </xacro:if>
+
+      <gpio name="dxl11">
+        <param name="type">dxl</param>
+        <param name="ID">11</param>
+        <command_interface name="Goal Position" />
+        <state_interface name="Present Position" />
+        <state_interface name="Present Velocity" />
+        <param name="Drive Mode">4</param>
+        <param name="Operating Mode">4</param>
+        <param name="Return Delay Time">0</param>
+        <param name="Position P Gain">1000</param>
+        <param name="Position I Gain">0</param>
+        <param name="Position D Gain">1000</param>
+        <param name="Profile Velocity">50</param>
+        <param name="Profile Acceleration">25</param>
+      </gpio>
+      <gpio name="dxl12">
+        <param name="type">dxl</param>
+        <param name="ID">12</param>
+        <command_interface name="Goal Position" />
+        <state_interface name="Present Position" />
+        <state_interface name="Present Velocity" />
+        <param name="Drive Mode">4</param>
+        <param name="Operating Mode">3</param>
+        <param name="Return Delay Time">0</param>
+        <param name="Min Position Limit">830</param>
+        <param name="Max Position Limit">3129</param>
+        <param name="Position P Gain">1000</param>
+        <param name="Position I Gain">0</param>
+        <param name="Position D Gain">1000</param>
+        <param name="Profile Velocity">50</param>
+        <param name="Profile Acceleration">25</param>
+      </gpio>
+      <gpio name="dxl13">
+        <param name="type">dxl</param>
+        <param name="ID">13</param>
+        <command_interface name="Goal Position" />
+        <state_interface name="Present Position" />
+        <state_interface name="Present Velocity" />
+        <param name="Drive Mode">4</param>
+        <param name="Operating Mode">3</param>
+        <param name="Return Delay Time">0</param>
+        <param name="Min Position Limit">1024</param>
+        <param name="Max Position Limit">3140</param>
+        <param name="Position P Gain">1000</param>
+        <param name="Position I Gain">0</param>
+        <param name="Position D Gain">1000</param>
+        <param name="Profile Velocity">50</param>
+        <param name="Profile Acceleration">25</param>
+      </gpio>
+      <gpio name="dxl14">
+        <param name="type">dxl</param>
+        <param name="ID">14</param>
+        <command_interface name="Goal Position" />
+        <state_interface name="Present Position" />
+        <state_interface name="Present Velocity" />
+        <param name="Drive Mode">4</param>
+        <param name="Operating Mode">3</param>
+        <param name="Return Delay Time">0</param>
+        <param name="Min Position Limit">0</param>
+        <param name="Max Position Limit">4095</param>
+        <param name="Position P Gain">1000</param>
+        <param name="Position I Gain">0</param>
+        <param name="Position D Gain">1000</param>
+        <param name="Profile Velocity">50</param>
+        <param name="Profile Acceleration">25</param>
+      </gpio>
+      <gpio name="dxl15">
+        <param name="type">dxl</param>
+        <param name="ID">15</param>
+        <command_interface name="Goal Position" />
+        <state_interface name="Present Position" />
+        <state_interface name="Present Velocity" />
+        <param name="Drive Mode">4</param>
+        <param name="Operating Mode">3</param>
+        <param name="Return Delay Time">0</param>
+        <param name="Min Position Limit">0</param>
+        <param name="Max Position Limit">4095</param>
+        <param name="Position P Gain">1000</param>
+        <param name="Position I Gain">0</param>
+        <param name="Position D Gain">1000</param>
+        <param name="Profile Velocity">50</param>
+        <param name="Profile Acceleration">25</param>
+      </gpio>
+      <gpio name="dxl16">
+        <param name="type">dxl</param>
+        <param name="ID">16</param>
+        <command_interface name="Goal Position" />
+        <state_interface name="Present Position" />
+        <state_interface name="Present Velocity" />
+        <state_interface name="Present Current" />
+        <param name="Drive Mode">4</param>
+        <param name="Operating Mode">5</param>
+        <param name="Return Delay Time">0</param>
+        <param name="Position P Gain">1000</param>
+        <param name="Position I Gain">0</param>
+        <param name="Position D Gain">1000</param>
+        <param name="Profile Velocity">50</param>
+        <param name="Profile Acceleration">25</param>
+        <!--
+          Goal Current units: 1 unit ~ 2.69 mA (XL430/XM430).
+          Empirical: 400 unit (~1076 mA) is the working set point for a firm
+          grip on the 30mm rigid box; smaller values slip. Still below the
+          Current Limit 600 unit (~1614 mA, upstream default) which is the
+          paper-cup crush ceiling. Re-verify before pressing paper cup.
+        -->
+        <param name="Current Limit">600</param>
+        <param name="Goal Current">400</param>
+        <param name="Shutdown">21</param>
+      </gpio>
+
+    </ros2_control>
+  </xacro:macro>
+</robot>

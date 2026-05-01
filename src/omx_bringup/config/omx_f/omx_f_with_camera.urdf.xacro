@@ -10,7 +10,12 @@
 
   <xacro:include filename="$(find open_manipulator_description)/gazebo/omx_f.gazebo.xacro" />
   <xacro:include filename="$(find open_manipulator_description)/urdf/omx_f/omx_f_arm.urdf.xacro" />
-  <xacro:include filename="$(find open_manipulator_description)/ros2_control/$(arg ros2_control_type).ros2_control.xacro" />
+  <!--
+    grasp detection (effort state + Present Current) 노출용 자체 ros2_control xacro.
+    upstream open_manipulator_description/ros2_control/omx_f.ros2_control.xacro 를
+    omx_bringup/config/omx_f/omx_f_grasp.ros2_control.xacro 로 대체한다.
+  -->
+  <xacro:include filename="$(find omx_bringup)/config/omx_f/omx_f_grasp.ros2_control.xacro" />
 
   <link name="world"/>
 
