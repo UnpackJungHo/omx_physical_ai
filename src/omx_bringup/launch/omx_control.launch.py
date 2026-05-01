@@ -20,6 +20,7 @@ from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessStart
 from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -56,17 +57,23 @@ def generate_launch_description():
     # ── URDF 생성 ──────────────────────────────────────────────────────
     # use_mock_hardware=true  → MirrorCommand (mock) hardware interface
     # use_mock_hardware=false → Dynamixel hardware interface (실제 하드웨어)
-    urdf_file = Command([
-        FindExecutable(name='xacro'),
-        ' ',
-        PathJoinSubstitution([
-            FindPackageShare('omx_bringup'),
-            'config', 'omx_f', 'omx_f_with_camera.urdf.xacro',
+    # ros2_control_node / robot_state_publisher 의 'robot_description' 파라미터는
+    # 최근 launch_ros 가 dict value 를 YAML 로 자동 파싱하려다 XML 의 '<', '?' 등에서
+    # 실패한다. ParameterValue(value_type=str) 로 명시 래핑해 string 으로 강제한다.
+    urdf_file = ParameterValue(
+        Command([
+            FindExecutable(name='xacro'),
+            ' ',
+            PathJoinSubstitution([
+                FindPackageShare('omx_bringup'),
+                'config', 'omx_f', 'omx_f_with_camera.urdf.xacro',
+            ]),
+            ' prefix:=', prefix,
+            ' use_mock_hardware:=', use_mock_hardware,
+            ' port_name:=', port_name,
         ]),
-        ' prefix:=', prefix,
-        ' use_mock_hardware:=', use_mock_hardware,
-        ' port_name:=', port_name,
-    ])
+        value_type=str,
+    )
 
     # ── 설정 파일 경로 ─────────────────────────────────────────────────
     controller_manager_config = PathJoinSubstitution([
