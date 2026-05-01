@@ -13,6 +13,8 @@ find_package(moveit_ros_planning_interface REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(control_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 
 # miniconda libcurl/libssl 충돌 방지: 시스템 curl/ssl 명시 링크
 find_library(SYSTEM_CURL curl HINTS /usr/lib/x86_64-linux-gnu NO_DEFAULT_PATH)
@@ -48,11 +50,29 @@ if(SYSTEM_CRYPTO)
   target_link_libraries(motion_server ${SYSTEM_CRYPTO})
 endif()
 
-install(TARGETS motion_server
+# ── grasp_detector ─────────────────────────────────────────────────
+# Step 1: Dynamixel current 기반 grasp 판단 노드.
+add_executable(grasp_detector src/grasp_detector.cpp)
+target_compile_features(grasp_detector PUBLIC cxx_std_17)
+ament_target_dependencies(grasp_detector
+  rclcpp
+  omx_interfaces
+  sensor_msgs
+  std_msgs
+  control_msgs)
+
+install(TARGETS motion_server grasp_detector
   DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch
   DESTINATION share/${PROJECT_NAME})
+
+# config/grasp_detector.yaml 등 향후 파라미터 파일을 위해 디렉터리 install 준비.
+# 현재 디렉터리가 비어있으면 install 이 실패하므로 존재 시에만 설치.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/config")
+  install(DIRECTORY config
+    DESTINATION share/${PROJECT_NAME})
+endif()
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
