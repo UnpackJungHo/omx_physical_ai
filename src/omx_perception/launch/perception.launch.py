@@ -18,23 +18,23 @@ def generate_launch_description():
         "camera_intrinsics.yaml",
     ])
 
-    top4_model_path_arg = DeclareLaunchArgument(
-        "top4_model_path",
-        default_value="/home/kjhz/omx_ws/runs/pose/cube_top_corners_yolov8n_pose/weights/best.pt",
-        description="Absolute path to the trained YOLOv8-Pose best.pt file.",
+    box_cup_model_path_arg = DeclareLaunchArgument(
+        "box_cup_model_path",
+        default_value="/home/kjhz/omx_ws/runs/pose/box_cup_pose_2class_96/weights/best.pt",
+        description="Absolute path to the trained YOLOv8-Pose 2-class best.pt.",
     )
-    top4_device_arg = DeclareLaunchArgument(
-        "top4_device",
+    box_cup_device_arg = DeclareLaunchArgument(
+        "box_cup_device",
         default_value="0",
-        description="Ultralytics inference device for top4_keypoints_node.",
+        description="Ultralytics inference device for box_cup_pose_node.",
     )
-    top4_conf_arg = DeclareLaunchArgument(
-        "top4_conf",
+    box_cup_conf_arg = DeclareLaunchArgument(
+        "box_cup_conf",
         default_value="0.85",
-        description="YOLO confidence threshold for top4 keypoint service calls.",
+        description="YOLO confidence threshold for box_cup_pose_node.",
     )
-    top4_extra_pythonpath_arg = DeclareLaunchArgument(
-        "top4_extra_pythonpath",
+    box_cup_extra_pythonpath_arg = DeclareLaunchArgument(
+        "box_cup_extra_pythonpath",
         default_value="/home/kjhz/miniconda3/envs/driving/lib/python3.12/site-packages",
         description="Optional site-packages path that contains ultralytics and torch.",
     )
@@ -64,42 +64,45 @@ def generate_launch_description():
         ],
     )
 
-    top4_keypoints = Node(
+    box_cup_pose = Node(
         package="omx_perception",
-        executable="top4_keypoints_node",
-        name="top4_keypoints",
+        executable="box_cup_pose_node",
+        name="box_cup_pose",
         output="screen",
         parameters=[
             {
-                "model_path": LaunchConfiguration("top4_model_path"),
+                "model_path": LaunchConfiguration("box_cup_model_path"),
                 "image_topic": "/image/raw",
-                "annotated_image_topic": "/image/raw/top4_pose",
-                "service_name": "/perception/get_top4_keypoints",
-                "extra_pythonpath": LaunchConfiguration("top4_extra_pythonpath"),
-                "device": ParameterValue(LaunchConfiguration("top4_device"), value_type=str),
-                "conf": ParameterValue(LaunchConfiguration("top4_conf"), value_type=float),
+                "annotated_image_topic": "/image/raw/box_cup_pose",
+                "service_name": "/perception/get_box_cup_keypoints",
+                "extra_pythonpath": LaunchConfiguration("box_cup_extra_pythonpath"),
+                "device": ParameterValue(LaunchConfiguration("box_cup_device"), value_type=str),
+                "conf": ParameterValue(LaunchConfiguration("box_cup_conf"), value_type=float),
                 "imgsz": 640,
                 "max_det": 20,
             }
         ],
     )
 
-    top4_world_pose = Node(
+    box_cup_world_pose = Node(
         package="omx_perception",
-        executable="top4_world_pose_node",
-        name="top4_world_pose",
+        executable="box_cup_world_pose_node",
+        name="box_cup_world_pose",
         output="screen",
         parameters=[
             {
                 "camera_intrinsics_path": camera_intrinsics,
-                "top4_service_name": "/perception/get_top4_keypoints",
-                "world_service_name": "/perception/get_top4_world_poses",
+                "keypoints_service_name": "/perception/get_box_cup_keypoints",
+                "world_service_name": "/perception/get_box_cup_world_poses",
                 "target_frame": "world",
                 "camera_frame": "default_cam",
                 "cube_size_m": 0.030,
-                "output_z_m": 0.015,
+                "box_output_z_m": 0.015,
+                "cup_radius_m": 0.07,
+                "cup_height_m": 0.08,
+                "cup_output_z_m": 0.08,
                 "min_keypoint_confidence": 0.10,
-                "top4_timeout_sec": 2.0,
+                "keypoints_timeout_sec": 2.0,
                 "keypoint_order": [0, 1, 2, 3],
             }
         ],
@@ -107,14 +110,14 @@ def generate_launch_description():
 
     delayed_camera_and_perception = TimerAction(
         period=0.5,
-        actions=[camera_node, top4_keypoints, top4_world_pose],
+        actions=[camera_node, box_cup_pose, box_cup_world_pose],
     )
 
     return LaunchDescription([
-        top4_model_path_arg,
-        top4_device_arg,
-        top4_conf_arg,
-        top4_extra_pythonpath_arg,
+        box_cup_model_path_arg,
+        box_cup_device_arg,
+        box_cup_conf_arg,
+        box_cup_extra_pythonpath_arg,
         camera_control,
         delayed_camera_and_perception,
     ])

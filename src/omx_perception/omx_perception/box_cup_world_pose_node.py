@@ -8,14 +8,20 @@ import numpy as np
 import rclpy
 import yaml
 from geometry_msgs.msg import PoseStamped
-from omx_interfaces.msg import BlockPose, Top4Box
-from omx_interfaces.srv import GetBlockPoses, GetTop4Keypoints
+from omx_interfaces.msg import BlockPose, KeypointDetection
+from omx_interfaces.srv import GetBlockPoses, GetKeypointDetections
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.time import Time
 from tf2_ros import Buffer, TransformException, TransformListener
+
+
+CLASS_COLOR = {
+    KeypointDetection.CLASS_BOX: "box",
+    KeypointDetection.CLASS_CUP: "cup",
+}
 
 
 def quaternion_to_rotation_matrix(x: float, y: float, z: float, w: float) -> np.ndarray:
@@ -34,25 +40,59 @@ def quaternion_to_rotation_matrix(x: float, y: float, z: float, w: float) -> np.
     )
 
 
-class Top4WorldPoseNode(Node):
-    """Convert YOLO top-face keypoints into OMX-F world-frame x/y poses."""
+def object_points_for_class(class_id: int, cube_size_m: float, cup_radius_m: float) -> np.ndarray:
+    """Return the canonical 4x3 object-points matrix used for solvePnP for a class."""
+    if class_id == KeypointDetection.CLASS_BOX:
+        half = cube_size_m / 2.0
+        return np.asarray(
+            [
+                [-half, -half, 0.0],
+                [half, -half, 0.0],
+                [half, half, 0.0],
+                [-half, half, 0.0],
+            ],
+            dtype=np.float64,
+        )
+    if class_id == KeypointDetection.CLASS_CUP:
+        r = cup_radius_m
+        return np.asarray(
+            [
+                [-r, 0.0, 0.0],
+                [0.0, -r, 0.0],
+                [r, 0.0, 0.0],
+                [0.0, r, 0.0],
+            ],
+            dtype=np.float64,
+        )
+    raise ValueError(f"Unsupported class_id for PnP: {class_id}")
+
+
+class BoxCupWorldPoseNode(Node):
+    """Convert YOLO pose keypoints into OMX-F world-frame poses for Box and Cup."""
 
     def __init__(self) -> None:
-        super().__init__("top4_world_pose")
+        super().__init__("box_cup_world_pose")
 
         self.declare_parameter("camera_intrinsics_path", "")
-        self.declare_parameter("top4_service_name", "/perception/get_top4_keypoints")
-        self.declare_parameter("world_service_name", "/perception/get_top4_world_poses")
+        self.declare_parameter(
+            "keypoints_service_name", "/perception/get_box_cup_keypoints"
+        )
+        self.declare_parameter(
+            "world_service_name", "/perception/get_box_cup_world_poses"
+        )
         self.declare_parameter("target_frame", "world")
         self.declare_parameter("camera_frame", "default_cam")
         self.declare_parameter("cube_size_m", 0.030)
-        # 30 mm cube center height is 15 mm = 1.5 cm = 0.015 m.
-        self.declare_parameter("output_z_m", 0.015)
+        self.declare_parameter("box_output_z_m", 0.015)
+        self.declare_parameter("cup_radius_m", 0.07)
+        self.declare_parameter("cup_height_m", 0.08)
+        self.declare_parameter("cup_output_z_m", 0.08)
         self.declare_parameter("min_keypoint_confidence", 0.10)
-        self.declare_parameter("top4_timeout_sec", 2.0)
-        # Image keypoint index that corresponds to each canonical square corner.
-        # Canonical order: top-left, top-right, bottom-right, bottom-left on the
-        # cube top face as labeled in the training dataset.
+        self.declare_parameter("keypoints_timeout_sec", 2.0)
+        # Image keypoint index that corresponds to each canonical model index.
+        # For Box, model indices follow the cube top-face corners (TL, TR, BR, BL).
+        # For Cup, model indices follow rim cardinal points; only the resulting
+        # translation is used, so the rotation around the cup axis is not pinned.
         self.declare_parameter("keypoint_order", [0, 1, 2, 3])
 
         intrinsics_path = Path(
@@ -68,11 +108,15 @@ class Top4WorldPoseNode(Node):
         self._target_frame = str(self.get_parameter("target_frame").value)
         self._camera_frame = str(self.get_parameter("camera_frame").value)
         self._cube_size_m = float(self.get_parameter("cube_size_m").value)
-        self._output_z_m = float(self.get_parameter("output_z_m").value)
+        self._box_output_z_m = float(self.get_parameter("box_output_z_m").value)
+        self._cup_radius_m = float(self.get_parameter("cup_radius_m").value)
+        self._cup_output_z_m = float(self.get_parameter("cup_output_z_m").value)
         self._min_keypoint_confidence = float(
             self.get_parameter("min_keypoint_confidence").value
         )
-        self._top4_timeout_sec = float(self.get_parameter("top4_timeout_sec").value)
+        self._keypoints_timeout_sec = float(
+            self.get_parameter("keypoints_timeout_sec").value
+        )
         self._keypoint_order = [
             int(index) for index in self.get_parameter("keypoint_order").value
         ]
@@ -83,11 +127,11 @@ class Top4WorldPoseNode(Node):
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
 
-        top4_service_name = str(self.get_parameter("top4_service_name").value)
+        keypoints_service_name = str(self.get_parameter("keypoints_service_name").value)
         world_service_name = str(self.get_parameter("world_service_name").value)
-        self._top4_client = self.create_client(
-            GetTop4Keypoints,
-            top4_service_name,
+        self._keypoints_client = self.create_client(
+            GetKeypointDetections,
+            keypoints_service_name,
             callback_group=self._callback_group,
         )
         self._world_service = self.create_service(
@@ -98,9 +142,11 @@ class Top4WorldPoseNode(Node):
         )
 
         self.get_logger().info(
-            "top4 world pose service ready "
-            f"(top4_service={top4_service_name}, world_service={world_service_name}, "
-            f"target_frame={self._target_frame}, output_z_m={self._output_z_m:.3f})"
+            "box_cup world pose service ready "
+            f"(keypoints_service={keypoints_service_name}, world_service={world_service_name}, "
+            f"target_frame={self._target_frame}, "
+            f"box_output_z_m={self._box_output_z_m:.3f}, "
+            f"cup_output_z_m={self._cup_output_z_m:.3f})"
         )
 
     def _load_intrinsics(self, path: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -121,11 +167,11 @@ class Top4WorldPoseNode(Node):
     ) -> GetBlockPoses.Response:
         del request
 
-        top4_response = self._call_top4_service()
-        if top4_response is None or not top4_response.success:
+        keypoints_response = self._call_keypoints_service()
+        if keypoints_response is None or not keypoints_response.success:
             return response
 
-        source_frame = top4_response.header.frame_id or self._camera_frame
+        source_frame = keypoints_response.header.frame_id or self._camera_frame
         try:
             transform = self._tf_buffer.lookup_transform(
                 self._target_frame,
@@ -140,84 +186,89 @@ class Top4WorldPoseNode(Node):
             return response
 
         blocks: list[BlockPose] = []
-        for box in top4_response.boxes:
-            block = self._box_to_block_pose(box, top4_response.header, transform)
+        for det in keypoints_response.detections:
+            block = self._detection_to_block_pose(det, keypoints_response.header, transform)
             if block is not None:
                 blocks.append(block)
 
         response.blocks = blocks
         return response
 
-    def _call_top4_service(self):
-        if not self._top4_client.wait_for_service(timeout_sec=self._top4_timeout_sec):
-            self.get_logger().warning("top4 keypoint service is not available")
+    def _call_keypoints_service(self):
+        if not self._keypoints_client.wait_for_service(
+            timeout_sec=self._keypoints_timeout_sec
+        ):
+            self.get_logger().warning("box_cup keypoint service is not available")
             return None
 
-        request = GetTop4Keypoints.Request()
+        request = GetKeypointDetections.Request()
         request.publish_debug = True
-        future = self._top4_client.call_async(request)
+        future = self._keypoints_client.call_async(request)
         done = Event()
         future.add_done_callback(lambda _: done.set())
 
-        if not done.wait(timeout=self._top4_timeout_sec):
-            self.get_logger().warning("top4 keypoint service call timed out")
+        if not done.wait(timeout=self._keypoints_timeout_sec):
+            self.get_logger().warning("box_cup keypoint service call timed out")
             return None
 
         try:
             return future.result()
         except Exception as exc:
-            self.get_logger().warning(f"top4 keypoint service call failed: {exc}")
+            self.get_logger().warning(f"box_cup keypoint service call failed: {exc}")
             return None
 
-    def _box_to_block_pose(self, box: Top4Box, header, transform) -> BlockPose | None:
+    def _detection_to_block_pose(
+        self, det: KeypointDetection, header, transform
+    ) -> BlockPose | None:
         image_points = []
         for keypoint_index in self._keypoint_order:
             base = keypoint_index * 3
-            confidence = float(box.keypoints[base + 2])
+            confidence = float(det.keypoints[base + 2])
             if confidence < self._min_keypoint_confidence:
                 return None
-            image_points.append([float(box.keypoints[base]), float(box.keypoints[base + 1])])
+            image_points.append([float(det.keypoints[base]), float(det.keypoints[base + 1])])
 
-        half = self._cube_size_m / 2.0
-        object_points = np.asarray(
-            [
-                [-half, -half, 0.0],
-                [half, -half, 0.0],
-                [half, half, 0.0],
-                [-half, half, 0.0],
-            ],
-            dtype=np.float64,
-        )
+        try:
+            object_points = object_points_for_class(
+                det.class_id, self._cube_size_m, self._cup_radius_m
+            )
+        except ValueError as exc:
+            self.get_logger().warning(str(exc))
+            return None
+
         image_points_array = np.asarray(image_points, dtype=np.float64)
 
-        flag = getattr(cv2, "SOLVEPNP_IPPE", cv2.SOLVEPNP_ITERATIVE)
-        ok, _rvec, tvec = cv2.solvePnP(
-            object_points,
-            image_points_array,
-            self._camera_matrix,
-            self._dist_coeffs,
-            flags=flag,
-        )
-        if not ok:
+        _, tvec = self._solve_pnp_with_fallback(object_points, image_points_array)
+        if tvec is None:
             return None
 
         center_camera = tvec.reshape(3)
         center_world = self._transform_point(center_camera, transform)
+
+        if det.class_id == KeypointDetection.CLASS_BOX:
+            output_z = self._box_output_z_m
+        elif det.class_id == KeypointDetection.CLASS_CUP:
+            output_z = self._cup_output_z_m
+        else:
+            self.get_logger().warning(
+                f"unsupported class_id {det.class_id}; dropping detection"
+            )
+            return None
 
         pose = PoseStamped()
         pose.header.stamp = header.stamp
         pose.header.frame_id = self._target_frame
         pose.pose.position.x = float(center_world[0])
         pose.pose.position.y = float(center_world[1])
-        pose.pose.position.z = self._output_z_m
+        pose.pose.position.z = output_z
         pose.pose.orientation.w = 1.0
 
         block = BlockPose()
         block.header = pose.header
-        block.color = "top4"
+        block.color = CLASS_COLOR.get(det.class_id, det.class_name or "unknown")
         block.pose = pose
         block.grasp_pose = pose
-        block.confidence = float(box.detection_confidence)
+        block.confidence = float(det.detection_confidence)
         return block
 
     def _transform_point(self, point_xyz: np.ndarray, transform) -> np.ndarray:
@@ -227,10 +278,32 @@ class Top4WorldPoseNode(Node):
         offset = np.asarray([translation.x, translation.y, translation.z], dtype=np.float64)
         return matrix @ point_xyz + offset
 
+    def _solve_pnp_with_fallback(
+        self,
+        object_points: np.ndarray,
+        image_points: np.ndarray,
+    ) -> tuple[bool, np.ndarray | None]:
+        flags = [getattr(cv2, "SOLVEPNP_IPPE", cv2.SOLVEPNP_ITERATIVE)]
+        if flags[0] != cv2.SOLVEPNP_ITERATIVE:
+            flags.append(cv2.SOLVEPNP_ITERATIVE)
+
+        for flag in flags:
+            ok, _rvec, tvec = cv2.solvePnP(
+                object_points,
+                image_points,
+                self._camera_matrix,
+                self._dist_coeffs,
+                flags=flag,
+            )
+            if ok:
+                return True, tvec
+
+        return False, None
+
 
 def main(args=None) -> None:
     rclpy.init(args=args)
-    node = Top4WorldPoseNode()
+    node = BoxCupWorldPoseNode()
     executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
     try:
