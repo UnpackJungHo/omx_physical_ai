@@ -17,10 +17,15 @@ def generate_launch_description():
         "config",
         "camera_intrinsics.yaml",
     ])
+    box_color_reference = PathJoinSubstitution([
+        FindPackageShare("omx_perception"),
+        "config",
+        "box_color_reference.yaml",
+    ])
 
     box_cup_model_path_arg = DeclareLaunchArgument(
         "box_cup_model_path",
-        default_value="/home/kjhz/omx_ws/runs/pose/box_cup_pose_2class_96/weights/best.pt",
+        default_value="/home/kjhz/omx_ws/runs/pose/box_cup_pose_2class_201/weights/best.pt",
         description="Absolute path to the trained YOLOv8-Pose 2-class best.pt.",
     )
     box_cup_device_arg = DeclareLaunchArgument(
@@ -30,13 +35,18 @@ def generate_launch_description():
     )
     box_cup_conf_arg = DeclareLaunchArgument(
         "box_cup_conf",
-        default_value="0.85",
+        default_value="0.80",
         description="YOLO confidence threshold for box_cup_pose_node.",
     )
     box_cup_extra_pythonpath_arg = DeclareLaunchArgument(
         "box_cup_extra_pythonpath",
         default_value="/home/kjhz/miniconda3/envs/driving/lib/python3.12/site-packages",
         description="Optional site-packages path that contains ultralytics and torch.",
+    )
+    box_color_reference_path_arg = DeclareLaunchArgument(
+        "box_color_reference_path",
+        default_value=box_color_reference,
+        description="Path to box_color_reference.yaml for LAB color classification.",
     )
 
     camera_control = Node(
@@ -53,13 +63,12 @@ def generate_launch_description():
         executable="usb_cam_node_exe",
         name="usb_cam",
         output="both",
-        parameters=[camera_params],
+        parameters=[
+            camera_params,
+            {"image.raw.enable_pub_plugins": ["image_transport/raw"]},
+        ],
         remappings=[
             ("image_raw", "/image/raw"),
-            ("image_raw/compressed", "/image/raw/compressed"),
-            ("image_raw/compressedDepth", "/image/raw/compressedDepth"),
-            ("image_raw/theora", "/image/raw/theora"),
-            ("image_raw/zstd", "/image/raw/zstd"),
             ("camera_info", "/camera/info"),
         ],
     )
@@ -80,6 +89,7 @@ def generate_launch_description():
                 "conf": ParameterValue(LaunchConfiguration("box_cup_conf"), value_type=float),
                 "imgsz": 640,
                 "max_det": 20,
+                "box_color_reference_path": LaunchConfiguration("box_color_reference_path"),
             }
         ],
     )
@@ -98,7 +108,7 @@ def generate_launch_description():
                 "camera_frame": "default_cam",
                 "cube_size_m": 0.030,
                 "box_output_z_m": 0.015,
-                "cup_radius_m": 0.07,
+                "cup_radius_m": 0.035,
                 "cup_height_m": 0.08,
                 "cup_output_z_m": 0.08,
                 "min_keypoint_confidence": 0.10,
@@ -118,6 +128,7 @@ def generate_launch_description():
         box_cup_device_arg,
         box_cup_conf_arg,
         box_cup_extra_pythonpath_arg,
+        box_color_reference_path_arg,
         camera_control,
         delayed_camera_and_perception,
     ])

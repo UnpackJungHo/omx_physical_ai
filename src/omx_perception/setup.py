@@ -52,6 +52,7 @@ setup(
             "camera_control_node = omx_perception.camera_control_node:main",
             "box_cup_pose_node = omx_perception.box_cup_pose_node:main",
             "box_cup_world_pose_node = omx_perception.box_cup_world_pose_node:main",
+            "box_color_calibrate = omx_perception.box_color_calibrate:main",
         ],
     },
 )
