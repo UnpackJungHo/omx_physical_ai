@@ -18,12 +18,6 @@ from rclpy.time import Time
 from tf2_ros import Buffer, TransformException, TransformListener
 
 
-CLASS_COLOR = {
-    KeypointDetection.CLASS_BOX: "box",
-    KeypointDetection.CLASS_CUP: "cup",
-}
-
-
 def quaternion_to_rotation_matrix(x: float, y: float, z: float, w: float) -> np.ndarray:
     norm = float(np.sqrt(x * x + y * y + z * z + w * w))
     if norm == 0.0:
@@ -265,7 +259,10 @@ class BoxCupWorldPoseNode(Node):
 
         block = BlockPose()
         block.header = pose.header
-        block.color = CLASS_COLOR.get(det.class_id, det.class_name or "unknown")
+        if det.class_id == KeypointDetection.CLASS_CUP:
+            block.color = "cup"
+        else:
+            block.color = det.color if det.color else "unknown"
         block.pose = pose
         block.grasp_pose = pose
         block.confidence = float(det.detection_confidence)
