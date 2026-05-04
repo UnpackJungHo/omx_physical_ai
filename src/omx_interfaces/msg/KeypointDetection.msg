@@ -17,3 +17,5 @@ uint8 class_id
 string class_name
 float32 detection_confidence
 float32[12] keypoints
+string color              # "red"|"green"|"blue"|"unknown"|"" (Cup이면 "")
+float32 color_confidence  # 0.0~1.0; color="" 또는 "unknown"이면 0.0
