@@ -15,10 +15,24 @@ from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 
+from omx_perception.color_classifier import (
+    ClassifierParams,
+    ColorRef,
+    classify,
+    load_reference_yaml,
+)
+
 
 CLASS_NAMES = {
     KeypointDetection.CLASS_BOX: "box",
     KeypointDetection.CLASS_CUP: "cup",
+}
+
+_COLOR_BGR = {
+    "red": (0, 0, 220),
+    "green": (0, 200, 0),
+    "blue": (220, 80, 0),
+    "unknown": (160, 160, 160),
 }
 
 
@@ -47,6 +61,7 @@ class BoxCupPoseNode(Node):
         self.declare_parameter("imgsz", 640)
         self.declare_parameter("conf", 0.25)
         self.declare_parameter("max_det", 20)
+        self.declare_parameter("box_color_reference_path", "")
 
         self._bridge = CvBridge()
         self._lock = Lock()
@@ -70,6 +85,9 @@ class BoxCupPoseNode(Node):
         self._imgsz = int(self.get_parameter("imgsz").value)
         self._conf = float(self.get_parameter("conf").value)
         self._max_det = int(self.get_parameter("max_det").value)
+        self._color_refs: list[ColorRef] | None = None
+        self._color_params: ClassifierParams | None = None
+        self._load_color_reference()
 
         image_topic = str(self.get_parameter("image_topic").value)
         annotated_topic = str(self.get_parameter("annotated_image_topic").value)
@@ -86,8 +104,30 @@ class BoxCupPoseNode(Node):
         self.get_logger().info(
             "box_cup pose service ready "
             f"(model={model_path}, image_topic={image_topic}, "
-            f"annotated_image_topic={annotated_topic}, service={service_name})"
+            f"annotated_image_topic={annotated_topic}, service={service_name}, "
+            f"color_classifier={'enabled' if self._color_refs is not None else 'disabled'})"
         )
+
+    def _load_color_reference(self) -> None:
+        ref_path_str = str(self.get_parameter("box_color_reference_path").value).strip()
+        if not ref_path_str:
+            self.get_logger().warning(
+                "box_color_reference_path not set; color classification disabled"
+            )
+            return
+
+        ref_path = Path(ref_path_str).expanduser().resolve()
+        refs, params = load_reference_yaml(ref_path)
+        if refs is None or params is None:
+            self.get_logger().warning(
+                f"failed to load color reference yaml: {ref_path}; "
+                "color classification disabled"
+            )
+            return
+
+        self._color_refs = refs
+        self._color_params = params
+        self.get_logger().info(f"loaded {len(refs)} color references from {ref_path}")
 
     def _load_yolo_class(self):
         extra_pythonpath = Path(
@@ -129,7 +169,7 @@ class BoxCupPoseNode(Node):
             device=self._device,
             verbose=False,
         )[0]
-        detections = self._extract_detections(result)
+        detections = self._extract_detections(result, frame)
         annotated = frame.copy()
         self._draw_detections(annotated, detections)
 
@@ -169,7 +209,7 @@ class BoxCupPoseNode(Node):
 
         return response
 
-    def _extract_detections(self, result) -> list[KeypointDetection]:
+    def _extract_detections(self, result, frame: np.ndarray) -> list[KeypointDetection]:
         if result.boxes is None or len(result.boxes) == 0 or result.keypoints is None:
             return []
 
@@ -197,13 +237,30 @@ class BoxCupPoseNode(Node):
             det.detection_confidence = float(boxes_conf[idx])
 
             values: list[float] = []
+            polygon_pts: list[list[float]] = []
             for keypoint_index in range(4):
                 point = points[keypoint_index]
                 confidence = 1.0
                 if keypoints_conf is not None:
                     confidence = float(keypoints_conf[idx][keypoint_index])
                 values.extend([float(point[0]), float(point[1]), confidence])
+                polygon_pts.append([float(point[0]), float(point[1])])
             det.keypoints = values
+            if (
+                class_id == KeypointDetection.CLASS_BOX
+                and self._color_refs is not None
+                and self._color_params is not None
+            ):
+                polygon_array = np.array(polygon_pts, dtype=float)
+                det.color, det.color_confidence = classify(
+                    frame,
+                    polygon_array,
+                    self._color_refs,
+                    self._color_params,
+                )
+            else:
+                det.color = ""
+                det.color_confidence = 0.0
 
             detections.append(det)
 
@@ -270,13 +327,19 @@ class BoxCupPoseNode(Node):
                     cv2.line(image, points[start], points[end], color, 2, lineType=cv2.LINE_AA)
 
             if points:
+                label = f"{det.class_name} {det_index}: {det.detection_confidence:.2f}"
+                label_color = color
+                if det.class_id == KeypointDetection.CLASS_BOX and det.color:
+                    label += f" [{det.color} {det.color_confidence:.2f}]"
+                    label_color = _COLOR_BGR.get(det.color, color)
+
                 cv2.putText(
                     image,
-                    f"{det.class_name} {det_index}: {det.detection_confidence:.2f}",
+                    label,
                     (points[0][0], max(18, points[0][1] - 24)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.55,
-                    color,
+                    label_color,
                     2,
                     cv2.LINE_AA,
                 )
