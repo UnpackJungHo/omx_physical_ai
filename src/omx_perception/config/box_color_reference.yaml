@@ -1,19 +1,19 @@
-# Color reference values for box LAB classification.
-# All lab_ab values are in OpenCV 8-bit LAB space (0-255, neutral gray = [128, 128]).
-# Conversion from real LAB: a_ocv = a_real + 128, b_ocv = b_real + 128
-# Run: ros2 run omx_perception box_color_calibrate to update references for your lighting.
-
 inset_ratio: 0.7
 saturation_min: 30
 luminance_low_percentile: 10.0
 luminance_high_percentile: 95.0
 min_valid_pixels: 60
 distance_threshold: 25.0
-
 references:
-  - name: red
-    lab_ab: [171, 153]
-  - name: green
-    lab_ab: [98, 146]
-  - name: blue
-    lab_ab: [138, 83]
+- name: red
+  lab_ab:
+  - 170.0
+  - 133.0
+- name: green
+  lab_ab:
+  - 74.0
+  - 155.0
+- name: blue
+  lab_ab:
+  - 158.0
+  - 62.0

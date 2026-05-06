@@ -40,8 +40,10 @@ venv/
 /CLAUDE.md
 *.tmp
 *.bak
-/datasets/
+/dataset/
 /dataset2/
 /BoxTopDetector2Yolov8/
+/BoxTopDetector2Yolov8_merged_dataset/
+/BoxTopDetector2Yolov8_pose2class_dataset/
 /runs/
 /yolo*

@@ -12,7 +12,7 @@ from rclpy.node import Node
 
 @dataclass(frozen=True)
 class CameraControlState:
-    video_device: str = "/dev/video0"
+    video_device: str = "/dev/v4l/by-id/usb-Innomaker_Innomaker-U20CAM-720P_SN0001-video-index0"
     autoexposure: bool = False
     exposure: int = 100
     auto_white_balance: bool = False

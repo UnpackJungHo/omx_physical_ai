@@ -1,3 +1,5 @@
+import os
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, TimerAction
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
@@ -6,7 +8,19 @@ from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
+_BY_ID_CAMERA_PATH = (
+    "/dev/v4l/by-id/usb-Innomaker_Innomaker-U20CAM-720P_SN0001-video-index0"
+)
+
+
+def _resolve_camera_device() -> str:
+    if os.path.exists(_BY_ID_CAMERA_PATH):
+        return os.path.realpath(_BY_ID_CAMERA_PATH)
+    return "/dev/video0"
+
+
 def generate_launch_description():
+    resolved_video_device = _resolve_camera_device()
     camera_params = PathJoinSubstitution([
         FindPackageShare("omx_perception"),
         "config",
@@ -55,7 +69,7 @@ def generate_launch_description():
         name="camera_control",
         namespace="camera",
         output="screen",
-        parameters=[camera_params],
+        parameters=[camera_params, {"video_device": resolved_video_device}],
     )
 
     camera_node = Node(
@@ -63,8 +77,11 @@ def generate_launch_description():
         executable="usb_cam_node_exe",
         name="usb_cam",
         output="both",
+        respawn=True,
+        respawn_delay=2.0,
         parameters=[
             camera_params,
+            {"video_device": resolved_video_device},
             {"image.raw.enable_pub_plugins": ["image_transport/raw"]},
         ],
         remappings=[
