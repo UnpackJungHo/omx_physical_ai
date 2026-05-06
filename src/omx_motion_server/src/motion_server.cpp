@@ -147,6 +147,14 @@ public:
   : Node("motion_server", options), node_options_(options)
   {
     declare_parameter<std::string>("arm_tip_link", "end_effector_link");
+    // Workspace 안전 제한 (world frame 기준).
+    // EE 가 x,y 방향으로 멀리 뻗으면 dxl12 (shoulder) 의 중력 모멘트가 급증해
+    // Overload Hardware Error 로 모터가 차단된다. 그 영역을 사전에 거부한다.
+    declare_parameter<double>("workspace.x_abs_max", 0.26);
+    declare_parameter<double>("workspace.y_abs_max", 0.26);
+    declare_parameter<double>("workspace.z_min",     0.0);
+    declare_parameter<double>("workspace.z_max",     0.45);
+    declare_parameter<std::string>("workspace.frame", "world");
     // 액션 서버들은 Reentrant callback group 에 배치한다.
     // arm_busy_ / gripper_busy_ 로 실제 직렬 실행을 보장하므로
     // MoveGroupInterface 의 공유 상태 경쟁을 방지한다.
@@ -232,17 +240,33 @@ public:
     arm_group_->setMaxVelocityScalingFactor(DEFAULT_VEL_SCALE);
     arm_group_->setMaxAccelerationScalingFactor(DEFAULT_ACC_SCALE);
     arm_group_->setPlanningTime(5.0);
+    // Goal tolerance: hardware encoder resolution(약 0.088°) + TRAC-IK Distance 해상도 고려.
+    // 1 mm / 1 mrad 수준으로 명시화해 default(보통 1cm) 의 느슨한 도착 판정을 차단.
+    arm_group_->setGoalPositionTolerance(0.001);     // 1 mm
+    arm_group_->setGoalOrientationTolerance(0.01);   // ~0.57°, position_only_ik 라 큰 영향 없음
+    arm_group_->setGoalJointTolerance(0.001);        // ~0.057°, encoder 1 step 보다 작음
 
     gripper_group_ = std::make_shared<moveit::planning_interface::MoveGroupInterface>(
       moveit_node_, "gripper");
     gripper_group_->setMaxVelocityScalingFactor(DEFAULT_VEL_SCALE);
     gripper_group_->setMaxAccelerationScalingFactor(DEFAULT_ACC_SCALE);
     gripper_group_->setPlanningTime(3.0);
+    gripper_group_->setGoalJointTolerance(0.001);
 
     arm_tip_link_ = get_parameter("arm_tip_link").as_string();
     if (arm_tip_link_.empty()) {
       arm_tip_link_ = "end_effector_link";
     }
+
+    ws_x_abs_max_ = get_parameter("workspace.x_abs_max").as_double();
+    ws_y_abs_max_ = get_parameter("workspace.y_abs_max").as_double();
+    ws_z_min_     = get_parameter("workspace.z_min").as_double();
+    ws_z_max_     = get_parameter("workspace.z_max").as_double();
+    ws_frame_     = get_parameter("workspace.frame").as_string();
+    RCLCPP_INFO(
+      get_logger(),
+      "Workspace limit (frame='%s'): |x|<=%.3f, |y|<=%.3f, %.3f<=z<=%.3f",
+      ws_frame_.c_str(), ws_x_abs_max_, ws_y_abs_max_, ws_z_min_, ws_z_max_);
 
     const std::string arm_planning_frame = arm_group_->getPlanningFrame();
     const std::string arm_pose_frame = arm_group_->getPoseReferenceFrame();
@@ -371,6 +395,12 @@ private:
   std::thread arm_thread_;      // detach 대신 handle_*_accepted 에서 join 후 교체
   std::thread gripper_thread_;
   std::string arm_tip_link_;
+  // workspace 제한 (world frame 기준)
+  double ws_x_abs_max_{0.26};
+  double ws_y_abs_max_{0.26};
+  double ws_z_min_{0.0};
+  double ws_z_max_{0.45};
+  std::string ws_frame_{"world"};
   std::mutex cached_plan_mutex_;
   moveit::planning_interface::MoveGroupInterface::Plan cached_arm_plan_;
   std::string cached_plan_id_;
@@ -1158,6 +1188,42 @@ private:
       target_pose.orientation.y,
       target_pose.orientation.z,
       target_pose.orientation.w);
+
+    // ── Workspace 안전 제한 ─────────────────────────────────────────────
+    // EE 가 멀리 뻗으면 shoulder(dxl12) 가 Overload 로 차단되어 로봇이 정지한다.
+    // pose frame 이 ws_frame_ 과 일치할 때만 검증 (다른 frame 은 TF 변환 비용 회피).
+    {
+      const std::string & req_frame = goal->target_pose.header.frame_id;
+      if (req_frame.empty() || req_frame == ws_frame_ || req_frame == planning_frame) {
+        const double ax = std::abs(target_pose.position.x);
+        const double ay = std::abs(target_pose.position.y);
+        const double z  = target_pose.position.z;
+        const bool out_of_range =
+          (ax > ws_x_abs_max_) ||
+          (ay > ws_y_abs_max_) ||
+          (z  < ws_z_min_)     ||
+          (z  > ws_z_max_);
+        if (out_of_range) {
+          char msg[256];
+          std::snprintf(
+            msg, sizeof(msg),
+            "Target out of workspace: p=(%.3f,%.3f,%.3f) limit |x|<=%.3f, |y|<=%.3f, %.3f<=z<=%.3f",
+            target_pose.position.x, target_pose.position.y, target_pose.position.z,
+            ws_x_abs_max_, ws_y_abs_max_, ws_z_min_, ws_z_max_);
+          result->success = false;
+          result->message = msg;
+          goal_handle->abort(result);
+          RCLCPP_WARN(get_logger(), "MoveToPose: %s", msg);
+          return;
+        }
+      } else {
+        RCLCPP_WARN(
+          get_logger(),
+          "MoveToPose: target frame_id='%s' differs from workspace frame='%s' / planning_frame='%s'; "
+          "skipping workspace check",
+          req_frame.c_str(), ws_frame_.c_str(), planning_frame.c_str());
+      }
+    }
 
     const auto current_pose = target_link.empty()
       ? arm_group_->getCurrentPose()

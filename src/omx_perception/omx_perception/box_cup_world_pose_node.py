@@ -166,16 +166,23 @@ class BoxCupWorldPoseNode(Node):
             return response
 
         source_frame = keypoints_response.header.frame_id or self._camera_frame
+        # detection 이 캡처된 시점의 TF 를 사용해 카메라가 움직이는 동안에도
+        # 좌표변환과 이미지 좌표가 동일 시점으로 일치하도록 한다.
+        # stamp 가 비어있는 경우 (sec=nanosec=0) 만 latest 로 fallback.
+        header_stamp = keypoints_response.header.stamp
+        use_latest = header_stamp.sec == 0 and header_stamp.nanosec == 0
+        lookup_time = Time() if use_latest else Time.from_msg(header_stamp)
         try:
             transform = self._tf_buffer.lookup_transform(
                 self._target_frame,
                 source_frame,
-                Time(),
+                lookup_time,
                 timeout=Duration(seconds=0.5),
             )
         except TransformException as exc:
             self.get_logger().warning(
-                f"failed to lookup transform {self._target_frame} <- {source_frame}: {exc}"
+                f"failed to lookup transform {self._target_frame} <- {source_frame} "
+                f"at stamp={'latest' if use_latest else f'{header_stamp.sec}.{header_stamp.nanosec:09d}'}: {exc}"
             )
             return response
 
