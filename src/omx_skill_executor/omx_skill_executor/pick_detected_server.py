@@ -392,7 +392,6 @@ class PickDetectedServer(Node):
             target_pose=pose,
             velocity_scale=float(self._config.move_velocity_scale),
             plan_only=False,
-            preview_in_sim=False,
         )
         return self._run_action_goal(self._move_pose_cli, goal, "MoveToPose")
 
