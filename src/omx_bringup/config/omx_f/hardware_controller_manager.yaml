@@ -1,0 +1,55 @@
+# hardware_controller_manager.yaml 변경
+
+# 기존 open_manipulator_bringup의 hardware_controller_manager.yaml 복사 후 GripperActionController 대신 JointTrajectoryController 를 사용
+
+# GripperActionController (+ MoveIt GripperCommand handle) 는 trajectory
+# 의 마지막 waypoint 만 전달하여 velocity profile 없이 순간 이동한다.
+# JointTrajectoryController 는 MoveIt 이 생성한 전체 trajectory 를 그대로
+# 실행하므로 velocity/acceleration scaling 이 적용된다.
+
+/**:
+  controller_manager:
+    ros__parameters:
+      update_rate: 100  # Hz
+
+      joint_state_broadcaster:
+        type: joint_state_broadcaster/JointStateBroadcaster
+
+      arm_controller:
+        type: joint_trajectory_controller/JointTrajectoryController
+
+      gripper_controller:
+        type: position_controllers/JointTrajectoryController
+
+/**:
+  arm_controller:
+    ros__parameters:
+      joints:
+        - joint1
+        - joint2
+        - joint3
+        - joint4
+        - joint5
+
+      interface_name: position
+
+      command_interfaces:
+        - position
+
+      state_interfaces:
+        - position
+        - velocity
+
+      allow_partial_joints_goal: true
+
+/**:
+  gripper_controller:
+    ros__parameters:
+      joints:
+        - gripper_joint_1
+      command_interfaces:
+        - position
+      state_interfaces:
+        - position
+        - velocity
+      allow_partial_joints_goal: true
