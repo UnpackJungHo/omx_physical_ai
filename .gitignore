@@ -47,3 +47,5 @@ venv/
 /BoxTopDetector2Yolov8_pose2class_dataset/
 /runs/
 /yolo*
+/myThinking.md
+/docs/
