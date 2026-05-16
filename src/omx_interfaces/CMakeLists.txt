@@ -23,9 +23,6 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/KeypointDetection.msg"
   "srv/GetBlockPoses.srv"
   "srv/GetKeypointDetections.srv"
-  "srv/PlanToJoints.srv"
-  "srv/ExecutePlan.srv"
-  "srv/ClearPlan.srv"
   "srv/CheckGrasp.srv"
   DEPENDENCIES std_msgs geometry_msgs action_msgs builtin_interfaces
 )

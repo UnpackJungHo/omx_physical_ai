@@ -19,7 +19,7 @@
         type: joint_trajectory_controller/JointTrajectoryController
 
       gripper_controller:
-        type: position_controllers/JointTrajectoryController
+        type: joint_trajectory_controller/JointTrajectoryController
 
 /**:
   arm_controller:

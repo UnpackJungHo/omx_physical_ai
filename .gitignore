@@ -18,6 +18,10 @@
 *.a
 *.out
 
+# clangd / IntelliSense
+/compile_commands.json
+/.cache/
+
 # Editors / OS
 .vscode/
 .idea/

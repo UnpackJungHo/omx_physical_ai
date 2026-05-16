@@ -16,7 +16,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, RegisterEventHandler
 from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessStart
-from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
@@ -40,6 +40,11 @@ def generate_launch_description():
             description='true: mock hardware (하드웨어 없이 테스트), false: 실제 하드웨어',
         ),
         DeclareLaunchArgument(
+            'use_hardware_mock',
+            default_value='false',
+            description='Alias for use_mock_hardware',
+        ),
+        DeclareLaunchArgument(
             'port_name',
             default_value='/dev/ttyACM0',
             description='Dynamixel USB 시리얼 포트 (실제 하드웨어 전용)',
@@ -49,7 +54,15 @@ def generate_launch_description():
     start_rviz = LaunchConfiguration('start_rviz')
     prefix = LaunchConfiguration('prefix')
     use_mock_hardware = LaunchConfiguration('use_mock_hardware')
+    use_hardware_mock = LaunchConfiguration('use_hardware_mock')
     port_name = LaunchConfiguration('port_name')
+    mock_hardware_enabled = PythonExpression([
+        "'true' if '",
+        use_mock_hardware,
+        "'.lower() in ('true', '1', 'yes', 'on') or '",
+        use_hardware_mock,
+        "'.lower() in ('true', '1', 'yes', 'on') else 'false'",
+    ])
 
     # ── URDF 생성 ──────────────────────────────────────────────────────
     urdf_file = ParameterValue(
@@ -61,7 +74,7 @@ def generate_launch_description():
                 'config', 'omx_f', 'omx_f_with_camera.urdf.xacro',
             ]),
             ' prefix:=', prefix,
-            ' use_mock_hardware:=', use_mock_hardware,
+            ' use_mock_hardware:=', mock_hardware_enabled,
             ' port_name:=', port_name,
         ]),
         value_type=str,
