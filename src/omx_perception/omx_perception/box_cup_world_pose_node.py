@@ -240,11 +240,13 @@ class BoxCupWorldPoseNode(Node):
         self, det: KeypointDetection, header, transform
     ) -> BlockPose | None:
         image_points = []
+        confidences = []
         for keypoint_index in self._keypoint_order:
             base = keypoint_index * 3
             confidence = float(det.keypoints[base + 2])
             if confidence < self._min_keypoint_confidence:
                 return None
+            confidences.append(confidence)
             image_points.append([float(det.keypoints[base]), float(det.keypoints[base + 1])])
 
         try:
@@ -257,8 +259,8 @@ class BoxCupWorldPoseNode(Node):
 
         image_points_array = np.asarray(image_points, dtype=np.float64)
 
-        _, tvec = self._solve_pnp_with_fallback(object_points, image_points_array)
-        if tvec is None:
+        ok, rvec, tvec = self._solve_pnp_with_fallback(object_points, image_points_array)
+        if not ok or tvec is None:
             return None
 
         center_camera = tvec.reshape(3)
@@ -280,14 +282,28 @@ class BoxCupWorldPoseNode(Node):
         pose.pose.position.x = float(center_world[0])
         pose.pose.position.y = float(center_world[1])
         pose.pose.position.z = output_z
-        pose.pose.orientation.w = 1.0
 
         block = BlockPose()
         block.header = pose.header
         if det.class_id == KeypointDetection.CLASS_CUP:
+            # 원형 rim 이라 yaw 무의미: identity 유지, yaw_confidence=0.
             block.color = "cup"
+            pose.pose.orientation.w = 1.0
+            block.yaw_confidence = 0.0
         else:
             block.color = det.color if det.color else "unknown"
+            rotation = transform.transform.rotation
+            rotation_world_cam = quaternion_to_rotation_matrix(
+                rotation.x, rotation.y, rotation.z, rotation.w
+            )
+            yaw = box_yaw_world(rvec, rotation_world_cam)
+            qx, qy, qz, qw = quaternion_from_yaw(yaw)
+            pose.pose.orientation.x = qx
+            pose.pose.orientation.y = qy
+            pose.pose.orientation.z = qz
+            pose.pose.orientation.w = qw
+            block.yaw_confidence = float(min(confidences))
+
         block.pose = pose
         block.grasp_pose = pose
         block.confidence = float(det.detection_confidence)
@@ -304,13 +320,13 @@ class BoxCupWorldPoseNode(Node):
         self,
         object_points: np.ndarray,
         image_points: np.ndarray,
-    ) -> tuple[bool, np.ndarray | None]:
+    ) -> tuple[bool, np.ndarray | None, np.ndarray | None]:
         flags = [getattr(cv2, "SOLVEPNP_IPPE", cv2.SOLVEPNP_ITERATIVE)]
         if flags[0] != cv2.SOLVEPNP_ITERATIVE:
             flags.append(cv2.SOLVEPNP_ITERATIVE)
 
         for flag in flags:
-            ok, _rvec, tvec = cv2.solvePnP(
+            ok, rvec, tvec = cv2.solvePnP(
                 object_points,
                 image_points,
                 self._camera_matrix,
@@ -318,9 +334,9 @@ class BoxCupWorldPoseNode(Node):
                 flags=flag,
             )
             if ok:
-                return True, tvec
+                return True, rvec, tvec
 
-        return False, None
+        return False, None, None
 
 
 def main(args=None) -> None:
