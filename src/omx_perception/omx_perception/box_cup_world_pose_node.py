@@ -260,7 +260,7 @@ class BoxCupWorldPoseNode(Node):
         image_points_array = np.asarray(image_points, dtype=np.float64)
 
         ok, rvec, tvec = self._solve_pnp_with_fallback(object_points, image_points_array)
-        if not ok or tvec is None:
+        if not ok or rvec is None or tvec is None:
             return None
 
         center_camera = tvec.reshape(3)
