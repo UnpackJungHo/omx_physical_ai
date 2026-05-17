@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import math
+import select
 import sys
 import threading
 import time
@@ -27,7 +28,7 @@ from typing import Optional
 
 import rclpy
 from geometry_msgs.msg import Point, Pose, PoseStamped
-from rclpy.action import ActionClient, ActionServer, GoalResponse
+from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.action.server import ServerGoalHandle
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
@@ -130,11 +131,14 @@ class PickPlaceServer(Node):
             execute_callback=self._execute_callback,
             callback_group=self._cb_group,
             goal_callback=self._goal_callback,
+            cancel_callback=self._cancel_callback,
         )
 
         self._busy_lock = threading.Lock()
         self._last_action_error = ""
         self._yaw_target_joint5: Optional[float] = None
+        self._canceled = False
+        self._active_goal_handle: Optional[ServerGoalHandle] = None
         self.get_logger().info("PickPlaceServer ready")
 
     # ────────────────────────────────────────────────────────────────
@@ -143,7 +147,7 @@ class PickPlaceServer(Node):
 
     def _load_config(self) -> SkillConfig:
         p = self.declare_parameter
-        return SkillConfig(
+        config = SkillConfig(
             scan_joint_positions_deg=tuple(
                 p("scan_joint_positions_deg", [0.0, -25.0, -63.0, 107.0, 0.0]).value
             ),
@@ -188,6 +192,9 @@ class PickPlaceServer(Node):
                 p("action_result_timeout_sec", 60.0).value
             ),
         )
+        if config.sweep_step_deg <= 0.0:
+            raise ValueError("sweep_step_deg must be positive")
+        return config
 
     # ────────────────────────────────────────────────────────────────
     # Action server callbacks
@@ -199,10 +206,16 @@ class PickPlaceServer(Node):
             return GoalResponse.REJECT
         return GoalResponse.ACCEPT
 
+    def _cancel_callback(self, _goal_handle):
+        self.get_logger().warn("PickPlace: cancel requested")
+        self._canceled = True
+        return CancelResponse.ACCEPT
+
     def _execute_callback(self, goal_handle: ServerGoalHandle) -> PickPlace.Result:
         try:
             return self._run(goal_handle)
         finally:
+            self._active_goal_handle = None
             if self._busy_lock.locked():
                 self._busy_lock.release()
 
@@ -210,6 +223,8 @@ class PickPlaceServer(Node):
         goal = goal_handle.request
         result = PickPlace.Result(success=False, message="", attempts=0)
         self._yaw_target_joint5 = None
+        self._canceled = False
+        self._active_goal_handle = goal_handle
 
         self._publish_phase(goal_handle, "detecting", "moving to scan pose")
         if not self._move_to_scan():
@@ -261,7 +276,11 @@ class PickPlaceServer(Node):
         if not self._send_move_to_pose(hover_pose):
             return self._fail(goal_handle, result, "hover motion failed")
         if self._config.hover_settle_sec > 0.0:
-            time.sleep(self._config.hover_settle_sec)
+            if not self._sleep_with_cancel(
+                self._config.hover_settle_sec,
+                "hover settle",
+            ):
+                return self._fail(goal_handle, result, "hover settle canceled")
 
         # yaw 정렬
         self._publish_phase(goal_handle, "aligning", "aligning gripper yaw to box")
@@ -350,6 +369,8 @@ class PickPlaceServer(Node):
             return seq
 
         for angle_deg in angles_to_try():
+            if self._cancel_requested("sweep"):
+                return [], None, attempts
             scan_deg[idx] = angle_deg
             self._publish_phase(
                 goal_handle, "detecting",
@@ -375,9 +396,15 @@ class PickPlaceServer(Node):
         return boxes, cup
 
     def _detect_blocks(self) -> list[BlockPose]:
-        time.sleep(self._config.detect_wait_after_motion_sec)
-        if not self._blocks_cli.wait_for_service(
-            timeout_sec=self._config.get_block_poses_timeout_sec
+        if not self._sleep_with_cancel(
+            self._config.detect_wait_after_motion_sec,
+            "detect settle",
+        ):
+            return []
+        if not self._wait_for_service(
+            self._blocks_cli,
+            self._config.get_block_poses_timeout_sec,
+            self._config.world_poses_service_name,
         ):
             self.get_logger().warn(
                 f"{self._config.world_poses_service_name} service unavailable"
@@ -385,7 +412,11 @@ class PickPlaceServer(Node):
             return []
         request = GetBlockPoses.Request(color="")
         future = self._blocks_cli.call_async(request)
-        response = self._wait_future(future, self._config.get_block_poses_timeout_sec)
+        response = self._wait_future(
+            future,
+            self._config.get_block_poses_timeout_sec,
+            "GetBlockPoses",
+        )
         if response is None:
             self.get_logger().warn("GetBlockPoses timed out")
             return []
@@ -415,9 +446,12 @@ class PickPlaceServer(Node):
         while attempts < 2:
             print("Select box color (red / green / blue): ", end="", flush=True)
             try:
-                choice = sys.stdin.readline().strip().lower()
+                line = self._readline_with_cancel("color selection")
             except Exception:  # noqa: BLE001
                 return ""
+            if line is None:
+                return ""
+            choice = line.strip().lower()
             if choice in available:
                 return choice
             if choice in VALID_COLORS:
@@ -525,7 +559,10 @@ class PickPlaceServer(Node):
         for jn in self._config.arm_joint_names:
             if jn not in names:
                 return None
-            out[jn] = float(positions[names.index(jn)])
+            idx = names.index(jn)
+            if idx >= len(positions):
+                return None
+            out[jn] = float(positions[idx])
         return out
 
     def _lookup_gripper_yaw(self) -> Optional[float]:
@@ -575,25 +612,32 @@ class PickPlaceServer(Node):
 
     def _run_action_goal(self, client: ActionClient, goal, label: str) -> bool:
         self._last_action_error = ""
-        if not client.wait_for_server(timeout_sec=self._config.action_goal_timeout_sec):
+        if self._cancel_requested(label):
+            return False
+        if not self._wait_for_action_server(
+            client,
+            self._config.action_goal_timeout_sec,
+            label,
+        ):
+            if self._canceled:
+                return False
             self._last_action_error = f"{label}: action server unavailable"
             self.get_logger().error(self._last_action_error)
             return False
         send_future = client.send_goal_async(goal)
-        gh = self._wait_future(send_future, self._config.action_goal_timeout_sec)
+        gh = self._wait_future(send_future, self._config.action_goal_timeout_sec, label)
         if gh is None:
-            self._last_action_error = f"{label}: send_goal timed out"
-            self.get_logger().error(self._last_action_error)
+            if not self._canceled:
+                self._last_action_error = f"{label}: send_goal timed out"
+                self.get_logger().error(self._last_action_error)
             return False
         if not gh.accepted:
             self._last_action_error = f"{label}: goal rejected"
             self.get_logger().error(self._last_action_error)
             return False
         result_future = gh.get_result_async()
-        wrapped = self._wait_future(result_future, self._config.action_result_timeout_sec)
+        wrapped = self._wait_for_result(result_future, gh, label)
         if wrapped is None:
-            self._last_action_error = f"{label}: result timed out"
-            self.get_logger().error(self._last_action_error)
             return False
         result = wrapped.result
         success = bool(getattr(result, "success", False))
@@ -603,17 +647,100 @@ class PickPlaceServer(Node):
             self.get_logger().error(self._last_action_error)
         return success
 
-    @staticmethod
-    def _wait_future(future, timeout_sec: float):
+    def _wait_for_action_server(
+        self,
+        client: ActionClient,
+        timeout_sec: float,
+        label: str,
+    ) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        while rclpy.ok():
+            if self._cancel_requested(label):
+                return False
+            if client.wait_for_server(timeout_sec=0.05):
+                return True
+            if time.monotonic() > deadline:
+                return False
+        return False
+
+    def _wait_for_service(self, client, timeout_sec: float, label: str) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        while rclpy.ok():
+            if self._cancel_requested(label):
+                return False
+            if client.wait_for_service(timeout_sec=0.05):
+                return True
+            if time.monotonic() > deadline:
+                return False
+        return False
+
+    def _wait_for_result(self, future, sub_goal_handle, label: str):
+        """하위 action 결과를 폴링 대기한다.
+
+        상위 PickPlace goal 에 cancel 이 요청되거나 result timeout 이 발생하면
+        진행 중인 하위 goal 을 cancel 한 뒤 None 을 반환해 호출부가 실패/취소
+        경로를 타게 한다.
+        """
+        deadline = time.monotonic() + max(0.0, self._config.action_result_timeout_sec)
+        while rclpy.ok() and not future.done():
+            if self._cancel_requested(label):
+                sub_goal_handle.cancel_goal_async()
+                return None
+            if time.monotonic() > deadline:
+                self._last_action_error = f"{label}: result timed out"
+                self.get_logger().error(self._last_action_error)
+                sub_goal_handle.cancel_goal_async()
+                return None
+            time.sleep(0.02)
+        if not future.done():
+            return None
+        return future.result()
+
+    def _wait_future(self, future, timeout_sec: float, label: str = ""):
         """외부 MultiThreadedExecutor 가 spin 중이라는 가정하에 폴링 대기."""
         deadline = time.monotonic() + max(0.0, timeout_sec)
         while rclpy.ok() and not future.done():
+            if label and self._cancel_requested(label):
+                return None
             if time.monotonic() > deadline:
                 return None
             time.sleep(0.02)
         if not future.done():
             return None
         return future.result()
+
+    def _sleep_with_cancel(self, duration_sec: float, label: str) -> bool:
+        deadline = time.monotonic() + max(0.0, duration_sec)
+        while rclpy.ok() and time.monotonic() < deadline:
+            if self._cancel_requested(label):
+                return False
+            time.sleep(min(0.02, deadline - time.monotonic()))
+        return not self._cancel_requested(label)
+
+    def _readline_with_cancel(self, label: str) -> Optional[str]:
+        while rclpy.ok():
+            if self._cancel_requested(label):
+                return None
+            readable, _, _ = select.select([sys.stdin], [], [], 0.1)
+            if readable:
+                return sys.stdin.readline()
+        return None
+
+    def _cancel_requested(self, label: str) -> bool:
+        gh = self._active_goal_handle
+        if gh is not None and gh.is_cancel_requested:
+            if not self._canceled:
+                self._last_action_error = f"{label}: canceled by client"
+                self.get_logger().warn(self._last_action_error)
+            self._canceled = True
+            return True
+        if self._canceled:
+            if not self._last_action_error:
+                self._last_action_error = f"{label}: canceled by client"
+                self.get_logger().warn(self._last_action_error)
+            self._canceled = True
+            return True
+        return False
 
     # ────────────────────────────────────────────────────────────────
     # Helpers
@@ -638,9 +765,14 @@ class PickPlaceServer(Node):
         result.success = False
         detail = self._last_action_error
         result.message = f"{message} | {detail}" if detail else message
-        self.get_logger().error(f"PickPlace failed: {result.message}")
-        if goal_handle.is_active:
-            goal_handle.abort()
+        if self._canceled:
+            self.get_logger().warn(f"PickPlace canceled: {result.message}")
+            if goal_handle.is_active:
+                goal_handle.canceled()
+        else:
+            self.get_logger().error(f"PickPlace failed: {result.message}")
+            if goal_handle.is_active:
+                goal_handle.abort()
         return result
 
 
@@ -656,7 +788,8 @@ def main(args=None) -> None:
     finally:
         executor.shutdown()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
