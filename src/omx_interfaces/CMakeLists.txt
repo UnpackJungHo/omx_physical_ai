@@ -18,7 +18,6 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/MoveToJoints.action"
   "action/GripperCommand.action"
   "action/PickPlace.action"
-  "action/PickDetected.action"
   "msg/BlockPose.msg"
   "msg/KeypointDetection.msg"
   "srv/GetBlockPoses.srv"
