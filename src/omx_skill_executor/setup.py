@@ -1,3 +1,5 @@
+from glob import glob
+import os
 from setuptools import find_packages, setup
 
 
@@ -14,6 +16,14 @@ setup(
             [f"resource/{package_name}"],
         ),
         (f"share/{package_name}", ["package.xml"]),
+        (
+            os.path.join("share", package_name, "config"),
+            glob("config/*.yaml"),
+        ),
+        (
+            os.path.join("share", package_name, "launch"),
+            glob("launch/*.launch.py"),
+        ),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
