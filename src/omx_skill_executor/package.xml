@@ -3,7 +3,7 @@
 <package format="3">
   <name>omx_skill_executor</name>
   <version>0.0.0</version>
-  <description>OMX skill executor — PickDetected first skill (Python prototype, C++ 승격 예정)</description>
+  <description>OMX skill executor — PickPlace first skill (Python prototype, C++ 승격 예정)</description>
   <maintainer email="kjhgfd6632@gmail.com">kjhz</maintainer>
   <license>Apache-2.0</license>
 
