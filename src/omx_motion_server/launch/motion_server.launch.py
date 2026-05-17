@@ -100,7 +100,7 @@ def generate_launch_description():
             {'stable_window_ms': 150},
             {'state_stale_ms': 200},
             {'publish_rate_hz': 20.0},
-            {'controller_state_topic': '/gripper_traj_controller/controller_state'},
+            {'controller_state_topic': '/gripper_controller/controller_state'},
         ],
     )
 

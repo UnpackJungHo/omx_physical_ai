@@ -1,12 +1,13 @@
-"""PickDetected 스킬 서버 실행.
+"""PickPlace 스킬 서버 실행.
 
 전제:
   - omx_bringup (ros2_control + MoveIt2) 가 이미 실행 중
   - omx_motion_server 가 실행 중 (MoveToJoints / MoveToPose / MoveToNamed / GripperCommand)
-  - omx_perception 의 get_block_poses_server 가 실행 중
+  - omx_perception 의 box_cup_world_pose_node 가 실행 중
+    (/perception/get_box_cup_world_poses 서비스 제공)
 
 사용:
-  ros2 launch omx_skill_executor pick_skill.launch.py
+  ros2 launch omx_skill_executor pick_place.launch.py
 """
 
 from __future__ import annotations
@@ -22,16 +23,16 @@ def generate_launch_description() -> LaunchDescription:
     config_path = os.path.join(
         get_package_share_directory("omx_skill_executor"),
         "config",
-        "pick_skill.yaml",
+        "pick_place_skill.yaml",
     )
 
-    pick_server = Node(
+    pick_place_server = Node(
         package="omx_skill_executor",
-        executable="pick_detected_server",
-        name="pick_detected_server",
+        executable="pick_place_server",
+        name="pick_place_server",
         parameters=[config_path],
         output="screen",
         emulate_tty=True,
     )
 
-    return LaunchDescription([pick_server])
+    return LaunchDescription([pick_place_server])

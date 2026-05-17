@@ -1,6 +1,5 @@
 # Goal
-string object_color      # "red" | "blue" | "green"
-string target_box        # "left" | "right"
+string object_color      # "red" | "blue" | "green"; 빈 문자열이면 CLI 선택
 bool retry_on_fail       # allow retry on failure
 ---
 # Result
@@ -9,5 +8,5 @@ string message
 int32 attempts
 ---
 # Feedback
-string phase             # "detecting" | "approaching" | "grasping" | "placing"
+string phase             # "detecting"|"aligning"|"approaching"|"grasping"|"placing"|"returning"
 string status

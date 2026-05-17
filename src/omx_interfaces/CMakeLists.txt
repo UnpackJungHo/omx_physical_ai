@@ -18,14 +18,10 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/MoveToJoints.action"
   "action/GripperCommand.action"
   "action/PickPlace.action"
-  "action/PickDetected.action"
   "msg/BlockPose.msg"
-  "msg/Top4Box.msg"
+  "msg/KeypointDetection.msg"
   "srv/GetBlockPoses.srv"
-  "srv/GetTop4Keypoints.srv"
-  "srv/PlanToJoints.srv"
-  "srv/ExecutePlan.srv"
-  "srv/ClearPlan.srv"
+  "srv/GetKeypointDetections.srv"
   "srv/CheckGrasp.srv"
   DEPENDENCIES std_msgs geometry_msgs action_msgs builtin_interfaces
 )

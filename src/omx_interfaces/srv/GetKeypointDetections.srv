@@ -4,4 +4,4 @@ bool publish_debug
 std_msgs/Header header
 bool success
 string message
-omx_interfaces/Top4Box[] boxes
+omx_interfaces/KeypointDetection[] detections

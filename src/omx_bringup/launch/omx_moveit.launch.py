@@ -70,6 +70,10 @@ def generate_launch_description():
         get_package_share_directory('omx_bringup'),
         'config', 'omx_f', 'kinematics.yaml'
     )
+    local_joint_limits = os.path.join(
+        get_package_share_directory('omx_bringup'),
+        'config', 'omx_f', 'joint_limits.yaml'
+    )
 
     moveit_config = (
         MoveItConfigsBuilder(
@@ -78,9 +82,7 @@ def generate_launch_description():
         )
         .robot_description(local_robot_description)
         .robot_description_semantic(local_srdf)
-        .joint_limits(
-            str(Path('config') / 'omx_f' / 'joint_limits.yaml')
-        )
+        .joint_limits(local_joint_limits)
         .trajectory_execution(local_moveit_controllers)
         .robot_description_kinematics(local_kinematics)
         .to_moveit_configs()
@@ -88,7 +90,7 @@ def generate_launch_description():
 
     # ── 노드 정의 ──────────────────────────────────────────────────────
 
-    # [D-1] move_group 노드
+    # move_group 노드
     #   - MoveIt2 핵심 노드: 경로 계획, 실행, Planning Scene 관리
     #   - arm_controller / gripper_controller action server에 연결
     move_group_node = Node(
@@ -101,7 +103,7 @@ def generate_launch_description():
         ],
     )
 
-    # [D-2] RViz — moveit.rviz (MotionPlanning 패널 포함)
+    # RViz — moveit.rviz (MotionPlanning 패널 포함)
     rviz_config_file = PathJoinSubstitution([
         FindPackageShare('open_manipulator_moveit_config'),
         'config', 'moveit.rviz',
@@ -123,8 +125,8 @@ def generate_launch_description():
         ],
     )
 
-    # [D-3] workspace_guard 노드
-    #   - Planning Scene에 충돌 오브젝트 추가 (floor, 작업 영역 경계)
+    # workspace_guard 노드
+    # Planning Scene에 충돌 오브젝트 추가 (floor, 작업 영역 경계)
     workspace_guard_node = Node(
         package='omx_bringup',
         executable='workspace_guard',

@@ -1,0 +1,19 @@
+inset_ratio: 0.7
+saturation_min: 30
+luminance_low_percentile: 10.0
+luminance_high_percentile: 95.0
+min_valid_pixels: 60
+distance_threshold: 25.0
+references:
+- name: red
+  lab_ab:
+  - 170.0
+  - 133.0
+- name: green
+  lab_ab:
+  - 74.0
+  - 155.0
+- name: blue
+  lab_ab:
+  - 158.0
+  - 62.0
