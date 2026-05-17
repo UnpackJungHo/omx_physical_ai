@@ -95,6 +95,18 @@ def test_box_yaw_world_applies_world_cam_rotation():
     )
 
 
+def test_box_yaw_world_composes_object_and_world_cam_rotations():
+    # object 가 카메라 z축 기준 30° 회전 + camera→world 변환이 z축 90°
+    # → world yaw = 30° + 90° = 120°.
+    rvec = np.asarray([0.0, 0.0, math.radians(30.0)], dtype=np.float64).reshape(3, 1)
+    rotation_world_cam = quaternion_to_rotation_matrix(
+        0.0, 0.0, math.sin(math.pi / 4), math.cos(math.pi / 4)
+    )
+    assert math.isclose(
+        box_yaw_world(rvec, rotation_world_cam), math.radians(120.0), abs_tol=1e-6
+    )
+
+
 def test_quaternion_from_yaw_roundtrip():
     for deg in (-90.0, -30.0, 0.0, 45.0, 120.0):
         qx, qy, qz, qw = quaternion_from_yaw(math.radians(deg))
