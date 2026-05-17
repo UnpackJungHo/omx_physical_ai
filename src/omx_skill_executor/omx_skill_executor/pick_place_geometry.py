@@ -8,14 +8,23 @@ import math
 
 
 def yaw_from_quaternion(x: float, y: float, z: float, w: float) -> float:
-    """quaternion 에서 world z축 기준 yaw 를 추출한다."""
+    """단위 quaternion (x, y, z, w) 에서 world z축 기준 yaw 를 추출한다.
+
+    입력이 정규화된 단위 quaternion 임을 전제한다.
+    """
     siny_cosp = 2.0 * (w * z + x * y)
     cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
     return math.atan2(siny_cosp, cosy_cosp)
 
 
 def wrap_to_pm45(angle_rad: float) -> float:
-    """각도를 box 90° 대칭을 이용해 (-pi/4, pi/4] 범위로 접는다."""
+    """각도를 box 90° 대칭을 이용해 (-pi/4, pi/4] 범위로 접는다.
+
+    -pi/4 부근에서 출력이 +pi/4 로 점프하는 불연속이 존재한다(90° 대칭상
+    -45° 와 +45° 는 같은 정렬). box_yaw-gripper_yaw 가 이 경계 근방에서
+    노이즈를 타면 호출부에서 joint 명령이 튈 수 있으므로, 필요 시 상위
+    레이어에서 hysteresis 를 고려한다.
+    """
     quarter = math.pi / 2.0
     wrapped = math.fmod(angle_rad, quarter)
     if wrapped > math.pi / 4.0:
