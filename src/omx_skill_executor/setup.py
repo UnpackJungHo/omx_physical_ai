@@ -30,14 +30,14 @@ setup(
     zip_safe=True,
     maintainer="kjhz",
     maintainer_email="kjhgfd6632@gmail.com",
-    description="OMX skill executor — PickDetected first skill (Python prototype)",
+    description="OMX skill executor — PickPlace first skill (Python prototype)",
     license="Apache-2.0",
     extras_require={
         "test": ["pytest"],
     },
     entry_points={
         "console_scripts": [
-            "pick_detected_server = omx_skill_executor.pick_detected_server:main",
+            "pick_place_server = omx_skill_executor.pick_place_server:main",
         ],
     },
 )
