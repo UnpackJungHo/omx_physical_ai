@@ -61,6 +61,24 @@ def object_points_for_class(class_id: int, cube_size_m: float, cup_radius_m: flo
     raise ValueError(f"Unsupported class_id for PnP: {class_id}")
 
 
+def box_yaw_world(rvec: np.ndarray, rotation_world_cam: np.ndarray) -> float:
+    """solvePnP rvec(object->camera)과 camera->world 회전으로 box 의 world yaw 산출.
+
+    box object frame 의 +x 축(윗면 TL->TR 모서리 방향)을 world 로 옮긴 뒤
+    world z축 기준 yaw 를 반환한다.
+    """
+    rotation_cam_obj, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64))
+    rotation_world_obj = np.asarray(rotation_world_cam, dtype=np.float64) @ rotation_cam_obj
+    x_axis_world = rotation_world_obj @ np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
+    return float(np.arctan2(x_axis_world[1], x_axis_world[0]))
+
+
+def quaternion_from_yaw(yaw: float) -> tuple[float, float, float, float]:
+    """world z축 기준 yaw 회전을 quaternion (x, y, z, w) 으로 변환."""
+    half = yaw / 2.0
+    return (0.0, 0.0, float(np.sin(half)), float(np.cos(half)))
+
+
 class BoxCupWorldPoseNode(Node):
     """Convert YOLO pose keypoints into OMX-F world-frame poses for Box and Cup."""
 
