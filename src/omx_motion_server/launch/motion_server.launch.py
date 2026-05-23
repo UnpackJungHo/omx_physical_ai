@@ -41,6 +41,11 @@ def generate_launch_description():
         get_package_share_directory('omx_bringup'),
         'config', 'omx_f', 'kinematics.yaml'
     )
+    # workspace 한계 단일 설정 소스 (workspace_guard 와 공유).
+    workspace_yaml = os.path.join(
+        get_package_share_directory('omx_bringup'),
+        'config', 'omx_f', 'workspace.yaml'
+    )
 
     moveit_config = (
         MoveItConfigsBuilder(
@@ -73,6 +78,7 @@ def generate_launch_description():
             moveit_config.robot_description_semantic,
             moveit_config.robot_description_kinematics,
             moveit_config.joint_limits,
+            workspace_yaml,
             {'use_sim_time': LaunchConfiguration('use_sim_time')},
         ],
     )
