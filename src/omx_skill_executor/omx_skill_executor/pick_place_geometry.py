@@ -17,6 +17,23 @@ def yaw_from_quaternion(x: float, y: float, z: float, w: float) -> float:
     return math.atan2(siny_cosp, cosy_cosp)
 
 
+def jaw_axis_yaw_from_quaternion(x: float, y: float, z: float, w: float) -> float:
+    """그리퍼 jaw 폐합축(end_effector_link +y축)의 world heading(rad).
+
+    end_effector_link 의 +y 축을 world 로 회전시킨 뒤 xy 평면 heading 을
+    반환한다. 두 그리퍼 손가락은 link5 의 y축 방향으로 벌어져 있어, 이
+    축이 jaw 가 박스를 누르는 방향이다. 수직 approach 축(end_effector +x)
+    에 직교해 항상 수평이므로, ZYX yaw 추출과 달리 그리퍼가 아래를 향할
+    때도 gimbal lock 이 없다.
+
+    입력이 정규화된 단위 quaternion 임을 전제한다.
+    """
+    # R @ [0, 1, 0] = 회전행렬의 2번째 열.
+    axis_x = 2.0 * (x * y - w * z)
+    axis_y = 1.0 - 2.0 * (x * x + z * z)
+    return math.atan2(axis_y, axis_x)
+
+
 def wrap_to_pm45(angle_rad: float) -> float:
     """각도를 box 90° 대칭을 이용해 (-pi/4, pi/4] 범위로 접는다.
 

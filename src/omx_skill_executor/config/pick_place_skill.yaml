@@ -1,7 +1,7 @@
 pick_place_server:
   ros__parameters:
     # 스캔 포즈 (joint1~5, deg) — 초기 탐지 자세
-    scan_joint_positions_deg: [0.0, -25.0, -63.0, 107.0, 0.0]
+    scan_joint_positions_deg: [0.0, -65.0, 0.0, 90.0, 0.0]
     arm_joint_names: ["joint1", "joint2", "joint3", "joint4", "joint5"]
 
     # joint1 스윕 (절대각 기준)
@@ -12,18 +12,18 @@ pick_place_server:
 
     # 탐지 안정화 / 타임아웃
     detect_wait_after_motion_sec: 0.8
-    get_block_poses_timeout_sec: 2.0
+    get_block_poses_timeout_sec: 5.0
     world_poses_service_name: "/perception/get_box_cup_world_poses"
 
     # 접근 / 그립 Cartesian
     approach_frame_id: "world"
     hover_z: 0.15
-    grasp_z: 0.055
+    grasp_z: 0.02
     move_velocity_scale: 0.2
     hover_settle_sec: 0.5
 
     # cup 낙하
-    drop_clearance_m: 0.10
+    drop_clearance_m: 0.03
 
     # yaw 정렬
     world_frame: "world"
@@ -31,7 +31,7 @@ pick_place_server:
     joint_states_topic: "/joint_states"
     yaw_min_corner_confidence: 0.30
     joint5_yaw_sign: 1.0          # 회전 방향이 반대면 -1.0 으로 (1회 캘리브레이션)
-    joint5_drift_tol_rad: 0.20
+    joint5_correction_max_rad: 0.52   # 하강 후 joint5 보정 허용 한계 (초과 시 중단) — 30°
     require_yaw: false            # true 면 yaw 산출 실패 시 skill 중단
 
     # 그리퍼

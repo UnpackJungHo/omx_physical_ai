@@ -4,10 +4,32 @@ from __future__ import annotations
 import math
 
 from omx_skill_executor.pick_place_geometry import (
+    jaw_axis_yaw_from_quaternion,
     joint5_target,
     wrap_to_pm45,
     yaw_from_quaternion,
 )
+
+
+def _angles_close(a: float, b: float, abs_tol: float = 1e-6) -> bool:
+    """Compare two angles modulo 2*pi."""
+    diff = math.atan2(math.sin(a - b), math.cos(a - b))
+    return abs(diff) <= abs_tol
+
+
+def _quat_mul(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    """Hamilton product of two (x, y, z, w) quaternions."""
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    )
 
 
 def test_yaw_from_quaternion_identity():
@@ -54,3 +76,44 @@ def test_joint5_target_uses_90deg_symmetry():
     # box_yaw 100° 는 10° 와 동일 정렬 → delta +10°.
     result = joint5_target(math.radians(5.0), math.radians(100.0), 0.0, 1.0)
     assert math.isclose(result, math.radians(15.0), abs_tol=1e-6)
+
+
+def test_jaw_axis_yaw_identity_points_along_world_y():
+    # end_effector_link +y 축이 world +y 와 일치 → heading 90°.
+    assert math.isclose(
+        jaw_axis_yaw_from_quaternion(0.0, 0.0, 0.0, 1.0),
+        math.radians(90.0),
+        abs_tol=1e-9,
+    )
+
+
+def test_jaw_axis_yaw_tracks_z_rotation():
+    # z축으로 theta 회전하면 jaw 축 heading 도 theta 만큼 증가한다.
+    for deg in (-90.0, 30.0, 120.0):
+        theta = math.radians(deg)
+        qz, qw = math.sin(theta / 2.0), math.cos(theta / 2.0)
+        assert _angles_close(
+            jaw_axis_yaw_from_quaternion(0.0, 0.0, qz, qw),
+            math.radians(90.0) + theta,
+        )
+
+
+def test_jaw_axis_yaw_well_defined_when_gripper_points_down():
+    # end_effector +x 축이 world -z 를 향하는(아래로 향한 그리퍼) Ry(90°):
+    # ZYX yaw 추출은 gimbal lock 이지만 jaw(y)축은 수평이라 명확하다.
+    s = math.sqrt(0.5)
+    q_down = (0.0, s, 0.0, s)  # Ry(90°)
+    assert math.isclose(
+        jaw_axis_yaw_from_quaternion(*q_down), math.radians(90.0), abs_tol=1e-6
+    )
+
+    # 아래를 향한 채 approach 축(=world -z) 둘레로 phi 만큼 roll → heading = 90° - phi.
+    for deg in (-60.0, 25.0, 100.0):
+        phi = math.radians(deg)
+        q_roll = (0.0, 0.0, math.sin(-phi / 2.0), math.cos(-phi / 2.0))  # Rz(-phi)
+        q_total = _quat_mul(q_roll, q_down)
+        assert math.isclose(
+            jaw_axis_yaw_from_quaternion(*q_total),
+            math.radians(90.0) - phi,
+            abs_tol=1e-6,
+        )

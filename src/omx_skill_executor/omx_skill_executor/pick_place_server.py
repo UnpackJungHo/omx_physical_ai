@@ -3,10 +3,10 @@
 0. 스킬 goal 수신
 1. 스캔 포즈로 이동 (MoveToJoints)
 2. 그리퍼 열기 (GripperCommand open)
-3. /perception/get_box_cup_world_poses 로 box+cup 탐지.
+3. ros2 service call /perception/get_box_cup_world_poses omx_interfaces/srv/GetBlockPoses "{}" 로 box+cup 탐지.
    box 와 cup 이 동시에 잡힐 때까지 joint1 절대각 스윕.
    끝까지 실패면 home 복귀 후 실패 반환.
-4. 탐지된 box 중 색 선택 (goal.object_color 가 채워져 있으면 생략).
+4. 탐지된 box 중 로봇 베이스에서 가장 가까운 box 선택.
 5. 선택 box 위 hover 로 이동 (MoveToPose, position only).
 6. yaw 정렬: TF 로 현재 그리퍼 yaw 조회 → joint5 회전 명령.
    box 의 yaw_confidence 가 낮으면 생략.
@@ -19,8 +19,6 @@
 from __future__ import annotations
 
 import math
-import select
-import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -49,9 +47,14 @@ from omx_interfaces.action import (
 from omx_interfaces.msg import BlockPose
 from omx_interfaces.srv import GetBlockPoses
 
-from omx_skill_executor.pick_place_geometry import joint5_target, yaw_from_quaternion
+from omx_skill_executor.pick_place_geometry import (
+    jaw_axis_yaw_from_quaternion,
+    joint5_target,
+    yaw_from_quaternion,
+)
 
-VALID_COLORS = ("red", "green", "blue")
+BOX_COLOR = "box"
+CUP_COLOR = "cup"
 
 
 @dataclass
@@ -76,7 +79,7 @@ class SkillConfig:
     joint_states_topic: str
     yaw_min_corner_confidence: float
     joint5_yaw_sign: float
-    joint5_drift_tol_rad: float
+    joint5_correction_max_rad: float
     require_yaw: bool
     gripper_open_position: float
     gripper_closed_position: float
@@ -136,7 +139,6 @@ class PickPlaceServer(Node):
 
         self._busy_lock = threading.Lock()
         self._last_action_error = ""
-        self._yaw_target_joint5: Optional[float] = None
         self._canceled = False
         self._active_goal_handle: Optional[ServerGoalHandle] = None
         self.get_logger().info("PickPlaceServer ready")
@@ -182,7 +184,9 @@ class PickPlaceServer(Node):
                 p("yaw_min_corner_confidence", 0.30).value
             ),
             joint5_yaw_sign=float(p("joint5_yaw_sign", 1.0).value),
-            joint5_drift_tol_rad=float(p("joint5_drift_tol_rad", 0.20).value),
+            joint5_correction_max_rad=float(
+                p("joint5_correction_max_rad", 0.2).value
+            ),
             require_yaw=bool(p("require_yaw", False).value),
             gripper_open_position=float(p("gripper_open_position", 1.0).value),
             gripper_closed_position=float(p("gripper_closed_position", 0.1).value),
@@ -222,7 +226,6 @@ class PickPlaceServer(Node):
     def _run(self, goal_handle: ServerGoalHandle) -> PickPlace.Result:
         goal = goal_handle.request
         result = PickPlace.Result(success=False, message="", attempts=0)
-        self._yaw_target_joint5 = None
         self._canceled = False
         self._active_goal_handle = goal_handle
 
@@ -252,15 +255,10 @@ class PickPlaceServer(Node):
                 goal_handle, result, "box and cup not both detected after sweep"
             )
 
-        # 색 선택
-        target_color = (goal.object_color or "").strip().lower()
-        target_block = self._select_box(boxes, target_color)
+        # 가장 가까운 박스 선택
+        target_block = self._select_closest_box(boxes)
         if target_block is None:
-            if target_color:
-                msg = f"requested color '{target_color}' not in detected boxes"
-            else:
-                msg = "color selection cancelled or invalid"
-            return self._fail(goal_handle, result, msg)
+            return self._fail(goal_handle, result, "no valid box detected")
 
         self.get_logger().info(
             f"Selected box color='{target_block.color}' "
@@ -293,9 +291,9 @@ class PickPlaceServer(Node):
         if not self._send_move_to_pose(grasp_pose):
             return self._fail(goal_handle, result, "descent motion failed")
 
-        # joint5 drift 검증
-        if not self._verify_joint5_after_descent():
-            return self._fail(goal_handle, result, "joint5 drift check failed")
+        # 하강 후 joint5 yaw 잔차 보정
+        if not self._realign_yaw_after_descent(target_block):
+            return self._fail(goal_handle, result, "joint5 yaw realignment failed")
 
         # close gripper
         self._publish_phase(goal_handle, "grasping", "closing gripper")
@@ -390,8 +388,8 @@ class PickPlaceServer(Node):
 
     def _detect_box_cup(self) -> tuple[list[BlockPose], Optional[BlockPose]]:
         blocks = self._detect_blocks()
-        boxes = [b for b in blocks if b.color in VALID_COLORS]
-        cups = [b for b in blocks if b.color == "cup"]
+        boxes = [b for b in blocks if b.color == BOX_COLOR]
+        cups = [b for b in blocks if b.color == CUP_COLOR]
         cup = max(cups, key=lambda b: b.confidence) if cups else None
         return boxes, cup
 
@@ -410,7 +408,7 @@ class PickPlaceServer(Node):
                 f"{self._config.world_poses_service_name} service unavailable"
             )
             return []
-        request = GetBlockPoses.Request(color="")
+        request = GetBlockPoses.Request()
         future = self._blocks_cli.call_async(request)
         response = self._wait_future(
             future,
@@ -422,45 +420,55 @@ class PickPlaceServer(Node):
             return []
         return list(response.blocks)
 
-    def _select_box(
-        self,
-        boxes: list[BlockPose],
-        preselected_color: str,
-    ) -> Optional[BlockPose]:
-        available = sorted({b.color for b in boxes if b.color in VALID_COLORS})
-        if preselected_color:
-            color = preselected_color
-        else:
-            color = self._prompt_color(available)
-        if not color:
+    def _select_closest_box(self, boxes: list[BlockPose]) -> Optional[BlockPose]:
+        """감지된 박스 중 로봇 베이스(원점)에서 가장 가까운 박스를 반환한다."""
+        if not boxes:
             return None
-        candidates = [b for b in boxes if b.color == color]
-        if not candidates:
-            self.get_logger().warn(f"color '{color}' not in detected set {available}")
-            return None
-        return max(candidates, key=lambda b: b.confidence)
+        return min(
+            boxes,
+            key=lambda b: (
+                b.grasp_pose.pose.position.x ** 2
+                + b.grasp_pose.pose.position.y ** 2
+            ),
+        )
 
-    def _prompt_color(self, available: list[str]) -> str:
-        print(f"\n[PickPlace] Detected box colors: {available}", flush=True)
-        attempts = 0
-        while attempts < 2:
-            print("Select box color (red / green / blue): ", end="", flush=True)
-            try:
-                line = self._readline_with_cancel("color selection")
-            except Exception:  # noqa: BLE001
-                return ""
-            if line is None:
-                return ""
-            choice = line.strip().lower()
-            if choice in available:
-                return choice
-            if choice in VALID_COLORS:
-                print(f"'{choice}' not detected. Retry.", flush=True)
-            else:
-                print("Invalid input. Use red / green / blue.", flush=True)
-            attempts += 1
-        print("Color selection failed.", flush=True)
-        return ""
+    def _plan_joint5_alignment(
+        self, target_block: BlockPose, label: str
+    ) -> Optional[tuple[dict, float]]:
+        """현재 joints/TF 로 joint5 yaw 정렬 목표각을 계산한다.
+
+        실패 시 self._last_action_error 에 사유를 적고 None 을 반환한다.
+        성공 시 (joints, joint5_target_rad) 을 반환한다.
+        """
+        joints = self._latest_joint_positions()
+        if joints is None:
+            self._last_action_error = "joint states unavailable"
+            return None
+
+        jaw_yaw = self._lookup_jaw_yaw()
+        if jaw_yaw is None:
+            self._last_action_error = "gripper TF unavailable"
+            return None
+
+        o = target_block.pose.pose.orientation
+        box_yaw = yaw_from_quaternion(o.x, o.y, o.z, o.w)
+        j5_cur = joints["joint5"]
+        j5_tgt = joint5_target(
+            j5_cur, box_yaw, jaw_yaw, self._config.joint5_yaw_sign
+        )
+        self.get_logger().info(
+            f"yaw align ({label}): box_yaw={math.degrees(box_yaw):.1f}° "
+            f"jaw_yaw={math.degrees(jaw_yaw):.1f}° "
+            f"joint5 {math.degrees(j5_cur):.1f}°→{math.degrees(j5_tgt):.1f}°"
+        )
+        return joints, j5_tgt
+
+    def _joint5_move_positions(self, joints: dict, j5_target: float) -> list[float]:
+        """joints dict 에서 joint5 만 j5_target 으로 바꾼 arm 위치 리스트."""
+        return [
+            joints["joint1"], joints["joint2"], joints["joint3"],
+            joints["joint4"], j5_target,
+        ]
 
     def _align_yaw(self, target_block: BlockPose) -> bool:
         """hover 상태에서 box yaw 에 맞춰 joint5 를 회전한다.
@@ -484,51 +492,53 @@ class PickPlaceServer(Node):
                 f"< {cfg.yaw_min_corner_confidence:.2f}"
             )
 
-        joints = self._latest_joint_positions()
-        if joints is None:
-            return _skip_or_fail("joint states unavailable")
-
-        gripper_yaw = self._lookup_gripper_yaw()
-        if gripper_yaw is None:
-            return _skip_or_fail("gripper TF unavailable")
-
-        o = target_block.pose.pose.orientation
-        box_yaw = yaw_from_quaternion(o.x, o.y, o.z, o.w)
-        j5_cur = joints["joint5"]
-        j5_target = joint5_target(j5_cur, box_yaw, gripper_yaw, cfg.joint5_yaw_sign)
-        self.get_logger().info(
-            f"yaw align: box_yaw={math.degrees(box_yaw):.1f}° "
-            f"gripper_yaw={math.degrees(gripper_yaw):.1f}° "
-            f"joint5 {math.degrees(j5_cur):.1f}°→{math.degrees(j5_target):.1f}°"
+        plan = self._plan_joint5_alignment(target_block, "hover")
+        if plan is None:
+            return _skip_or_fail(self._last_action_error)
+        joints, j5_target = plan
+        return self._send_move_to_joints(
+            self._joint5_move_positions(joints, j5_target)
         )
-        positions = [
-            joints["joint1"], joints["joint2"], joints["joint3"],
-            joints["joint4"], j5_target,
-        ]
-        if not self._send_move_to_joints(positions):
-            return False
-        self._yaw_target_joint5 = j5_target
-        return True
 
-    def _verify_joint5_after_descent(self) -> bool:
-        """하강 후 joint5 가 yaw 정렬 목표값을 유지하는지 검증한다."""
-        if self._yaw_target_joint5 is None:
+    def _realign_yaw_after_descent(self, target_block: BlockPose) -> bool:
+        """grasp 높이에서 joint5 yaw 잔차를 보정한다.
+
+        하강은 position-only IK 라 정렬해 둔 joint5 가 틀어질 수 있다. 닫기
+        직전 grasp 자세에서 box yaw 와의 잔차를 다시 맞춘다. 보정량이 안전
+        한계를 넘으면(하강 IK 가 joint5 를 크게 틀어 큰 회전이 필요 → grasp
+        높이에서 박스 충돌 위험) 실패 처리한다.
+
+        hover 에서 정렬을 생략한 경우(yaw_confidence 부족)에는 보정도
+        생략한다.
+        """
+        cfg = self._config
+        if target_block.yaw_confidence < cfg.yaw_min_corner_confidence:
             return True
-        joints = self._latest_joint_positions()
-        if joints is None:
+
+        plan = self._plan_joint5_alignment(target_block, "grasp")
+        if plan is None:
             self.get_logger().warn(
-                "joint states unavailable; skip joint5 drift check"
+                f"joint5 realign skipped: {self._last_action_error}"
             )
             return True
-        drift = abs(joints["joint5"] - self._yaw_target_joint5)
-        if drift > self._config.joint5_drift_tol_rad:
+        joints, j5_target = plan
+
+        correction = abs(j5_target - joints["joint5"])
+        if correction > cfg.joint5_correction_max_rad:
             self._last_action_error = (
-                f"joint5 drift {math.degrees(drift):.1f}° exceeds tol "
-                f"{math.degrees(self._config.joint5_drift_tol_rad):.1f}°"
+                f"joint5 correction {math.degrees(correction):.1f}° exceeds "
+                f"limit {math.degrees(cfg.joint5_correction_max_rad):.1f}° "
+                "(descent IK drifted joint5 too far)"
             )
             self.get_logger().error(self._last_action_error)
             return False
-        return True
+
+        # 잔차가 무시할 수준이면 불필요한 재계획/이동을 생략한다.
+        if correction < math.radians(1.0):
+            return True
+        return self._send_move_to_joints(
+            self._joint5_move_positions(joints, j5_target)
+        )
 
     def _build_pose(self, reference: PoseStamped, z: float) -> PoseStamped:
         ref = reference.pose
@@ -565,7 +575,8 @@ class PickPlaceServer(Node):
             out[jn] = float(positions[idx])
         return out
 
-    def _lookup_gripper_yaw(self) -> Optional[float]:
+    def _lookup_jaw_yaw(self) -> Optional[float]:
+        """그리퍼 jaw 폐합축(end_effector_link +y축)의 world heading(rad)."""
         try:
             tf = self._tf_buffer.lookup_transform(
                 self._config.world_frame,
@@ -577,7 +588,7 @@ class PickPlaceServer(Node):
             self.get_logger().warn(f"gripper TF lookup failed: {exc}")
             return None
         q = tf.transform.rotation
-        return yaw_from_quaternion(q.x, q.y, q.z, q.w)
+        return jaw_axis_yaw_from_quaternion(q.x, q.y, q.z, q.w)
 
     # ────────────────────────────────────────────────────────────────
     # Action client wrappers
@@ -716,15 +727,6 @@ class PickPlaceServer(Node):
                 return False
             time.sleep(min(0.02, deadline - time.monotonic()))
         return not self._cancel_requested(label)
-
-    def _readline_with_cancel(self, label: str) -> Optional[str]:
-        while rclpy.ok():
-            if self._cancel_requested(label):
-                return None
-            readable, _, _ = select.select([sys.stdin], [], [], 0.1)
-            if readable:
-                return sys.stdin.readline()
-        return None
 
     def _cancel_requested(self, label: str) -> bool:
         gh = self._active_goal_handle
