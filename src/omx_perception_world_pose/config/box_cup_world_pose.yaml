@@ -1,0 +1,15 @@
+box_cup_world_pose:
+  ros__parameters:
+    camera_intrinsics_path: ""
+    keypoints_service_name: "/perception/get_box_cup_keypoints"
+    world_service_name: "/perception/get_box_cup_world_poses"
+    target_frame: "world"
+    camera_frame: "default_cam"
+    cube_size_m: 0.030
+    box_output_z_m: 0.015
+    cup_radius_m: 0.070
+    cup_output_z_m: 0.080
+    min_keypoint_confidence: 0.10
+    keypoints_timeout_sec: 2.0
+    tf_lookup_timeout_sec: 0.5
+    keypoint_order: [0, 1, 2, 3]
