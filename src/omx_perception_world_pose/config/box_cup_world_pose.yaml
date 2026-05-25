@@ -5,11 +5,31 @@ box_cup_world_pose:
     world_service_name: "/perception/get_box_cup_world_poses"
     target_frame: "world"
     camera_frame: "default_cam"
-    cube_size_m: 0.030
+    # Ray-plane intersection: 각 detection 의 keypoint 4점이 world z = *_top_z_m
+    # 평면 위에 있다고 가정한다. 객체 모델 크기(이전 cube_size_m, cup_radius_m)에
+    # 의존하지 않는다. 박스 윗면 z (= 테이블 + 큐브 한 변), 컵 입구 z (= 컵 높이)
+    # 를 실측해서 채울 것.
+    box_top_z_m: 0.030
     box_output_z_m: 0.015
-    cup_radius_m: 0.070
+    cup_top_z_m: 0.080
     cup_output_z_m: 0.080
+    # eye-in-hand 카메라(link5 마운트) 의 URDF rpy 추정 오차로 생기는 systematic
+    # XY bias 보정. 측정 방법: 같은 scan pose 에서 박스를 여러 위치에 놓고
+    # perception (x,y) - EE-touched (x,y) 의 평균이 (dx, dy) 라면 여기에 (-dx, -dy)
+    # 를 넣는다. scan pose 가 바뀌면 재교정 필요. 근본 해결은 URDF camera_mount
+    # rpy/xyz 미세조정 또는 hand-eye calibration.
+    world_offset_x_m: 0.000
+    world_offset_y_m: 0.015
     min_keypoint_confidence: 0.10
     keypoints_timeout_sec: 2.0
     tf_lookup_timeout_sec: 0.5
     keypoint_order: [0, 1, 2, 3]
+    # multi-frame fusion: 같은 자세에서 N회 인퍼런스 후 cluster median.
+    # num_samples 회 keypoint 서비스를 sample_interval_sec 간격으로 호출하고,
+    # 같은 color + XY 거리 < cluster_match_tolerance_m 인 detection 을 한 cluster 로
+    # 묶어 axis-wise median(position) / circular median(yaw) 로 융합한다.
+    # min_valid_samples 미만이 모인 cluster 는 폐기한다.
+    num_samples: 3
+    sample_interval_sec: 0.05
+    min_valid_samples: 2
+    cluster_match_tolerance_m: 0.03

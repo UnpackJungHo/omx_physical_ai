@@ -13,11 +13,14 @@ import cv2
 from cv_bridge import CvBridge, CvBridgeError
 import numpy as np
 import rclpy
+from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-from sensor_msgs.msg import Image
+from rclpy.time import Time as RclpyTime
+from sensor_msgs.msg import CameraInfo, Image
+import tf2_ros
 
 import math
 
@@ -52,6 +55,12 @@ class BoxCupKeypointNode(Node):
         self.declare_parameter("conf", 0.25)
         self.declare_parameter("max_det", 20)
         self.declare_parameter("publish_debug", False)
+        # snapshot 시 block (world x,y,z) -> image pixel reprojection 에 사용.
+        # 기본값은 omx_perception_world_pose 와 일치시킨다.
+        self.declare_parameter("target_frame", "world")
+        self.declare_parameter("camera_frame", "default_cam")
+        self.declare_parameter("camera_info_topic", "/camera/info")
+        self.declare_parameter("tf_lookup_timeout_sec", 0.5)
 
         self._bridge = CvBridge()
         self._lock = threading.Lock()
@@ -59,6 +68,14 @@ class BoxCupKeypointNode(Node):
         self._latest_stamp = None
         self._stop_event = threading.Event()
         self._keyboard_thread: threading.Thread | None = None
+
+        self._target_frame = str(self.get_parameter("target_frame").value)
+        self._camera_frame = str(self.get_parameter("camera_frame").value)
+        self._tf_lookup_timeout_sec = float(self.get_parameter("tf_lookup_timeout_sec").value)
+
+        # CameraInfo 가 도착하면 K, D 를 채워 둔다. snapshot 시 cv2.projectPoints 에 사용.
+        self._cam_K: np.ndarray | None = None
+        self._cam_D: np.ndarray | None = None
 
         self._model_path = self._resolve_path(str(self.get_parameter("model_path").value))
         if not self._model_path.exists():
@@ -101,6 +118,21 @@ class BoxCupKeypointNode(Node):
             GetBlockPoses,
             "/perception/get_box_cup_world_poses",
             callback_group=cb_group,
+        )
+
+        # snapshot 라벨을 정확한 detection 위에 그리려면 block 의 world 좌표를
+        # 이미지 픽셀로 reproject 해야 한다. TF + CameraInfo 가 필요하다.
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+
+        camera_info_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        camera_info_topic = str(self.get_parameter("camera_info_topic").value)
+        self._cam_info_sub = self.create_subscription(
+            CameraInfo, camera_info_topic, self._on_camera_info, camera_info_qos,
         )
 
         self._start_keyboard_listener()
@@ -154,6 +186,15 @@ class BoxCupKeypointNode(Node):
         with self._lock:
             self._latest_frame = frame.copy()
             self._latest_stamp = msg.header.stamp
+
+    def _on_camera_info(self, msg: CameraInfo) -> None:
+        # K (3x3), D (k1..k5) 캐싱. usb_cam 은 항상 동일 intrinsics 를 publish 하므로
+        # 매 메시지 갱신해도 동일. msg.d 가 비어 있으면 0 distortion 로 처리.
+        K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
+        D = np.array(msg.d, dtype=np.float64).flatten() if len(msg.d) else np.zeros(5, dtype=np.float64)
+        with self._lock:
+            self._cam_K = K
+            self._cam_D = D
 
     def _handle_get_keypoints(
         self,
@@ -308,14 +349,174 @@ class BoxCupKeypointNode(Node):
 
         return resp.blocks
 
+    def _quat_to_rotmat(self, x: float, y: float, z: float, w: float) -> np.ndarray:
+        # 단위 quaternion 가정. TF2 가 정규화된 회전을 보장.
+        xx, yy, zz = x * x, y * y, z * z
+        xy, xz, yz = x * y, x * z, y * z
+        wx, wy, wz = w * x, w * y, w * z
+        return np.array([
+            [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz),       2.0 * (xz + wy)],
+            [2.0 * (xy + wz),       1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
+            [2.0 * (xz - wy),       2.0 * (yz + wx),       1.0 - 2.0 * (xx + yy)],
+        ], dtype=np.float64)
+
+    def _project_blocks_to_image(
+        self,
+        blocks: list,
+        stamp: Any,
+    ) -> list[tuple[float, float] | None]:
+        """각 block 의 world (x,y,z) 를 카메라 이미지 픽셀 (u,v) 로 reprojection.
+
+        반환: blocks 길이와 동일한 list. 투영 실패(intrinsics 미수신, TF 실패,
+        Z<=0 등) 인 경우 해당 entry 는 None.
+        """
+        n = len(blocks)
+        if n == 0:
+            return []
+
+        with self._lock:
+            K = None if self._cam_K is None else self._cam_K.copy()
+            D = None if self._cam_D is None else self._cam_D.copy()
+
+        if K is None:
+            self.get_logger().debug(
+                "snapshot reprojection skipped: CameraInfo not received yet"
+            )
+            return [None] * n
+
+        # camera_frame 에서 본 world 좌표가 필요하므로 TF: world -> camera_frame.
+        # stamp 가 있을 때 그 시점 transform 을 우선, 없으면 latest available.
+        try:
+            tf_time = RclpyTime() if stamp is None else RclpyTime.from_msg(stamp)
+            tf_msg = self._tf_buffer.lookup_transform(
+                self._camera_frame,
+                self._target_frame,
+                tf_time,
+                timeout=Duration(seconds=self._tf_lookup_timeout_sec),
+            )
+        except Exception as exc:
+            self.get_logger().debug(
+                f"snapshot reprojection skipped: TF lookup failed: {exc}"
+            )
+            return [None] * n
+
+        t = tf_msg.transform.translation
+        q = tf_msg.transform.rotation
+        R = self._quat_to_rotmat(q.x, q.y, q.z, q.w)
+        rvec, _ = cv2.Rodrigues(R)
+        tvec = np.array([t.x, t.y, t.z], dtype=np.float64).reshape(3, 1)
+
+        object_pts = np.array(
+            [
+                [
+                    float(b.pose.pose.position.x),
+                    float(b.pose.pose.position.y),
+                    float(b.pose.pose.position.z),
+                ]
+                for b in blocks
+            ],
+            dtype=np.float64,
+        ).reshape(-1, 1, 3)
+
+        if D is None:
+            D = np.zeros(5, dtype=np.float64)
+        img_pts, _ = cv2.projectPoints(object_pts, rvec, tvec, K, D)
+        img_pts = img_pts.reshape(-1, 2)
+
+        # 카메라 뒤(Z<=0) 또는 NaN 인 경우는 None 으로 표시. cv2.projectPoints 가
+        # Z<=0 일 때 부호가 뒤집힌 좌표를 돌려주므로 직접 검사한다.
+        cam_pts = (R @ object_pts.reshape(-1, 3).T + tvec).T  # (n, 3)
+        results: list[tuple[float, float] | None] = []
+        for i in range(n):
+            u, v = float(img_pts[i, 0]), float(img_pts[i, 1])
+            z_cam = float(cam_pts[i, 2])
+            if not (math.isfinite(u) and math.isfinite(v)) or z_cam <= 0.0:
+                results.append(None)
+            else:
+                results.append((u, v))
+        return results
+
+    @staticmethod
+    def _target_class_id_for_block(block: Any) -> int:
+        # box_cup_world_pose_node 는 cup -> color="cup", box -> color="box"|"unknown"|색이름.
+        # 매칭은 class_id 1=Cup, 0=Box 로만 충분하다.
+        color = (block.color or "").strip().lower()
+        return 1 if color == "cup" else 0
+
+    def _match_blocks_to_detections(
+        self,
+        blocks: list,
+        detections: list[dict[str, Any]],
+        projected: list[tuple[float, float] | None],
+    ) -> dict[int, int]:
+        """block_idx -> detection_idx greedy 매칭.
+
+        - block 의 target class_id 와 동일한 unassigned detection 만 후보.
+        - projected (u,v) 와 detection keypoint centroid 의 픽셀 거리 최소를 선택.
+        - block 은 입력 순서(=server confidence 내림차순)대로 우선 배정.
+        - projected 가 None 인 block 은 매칭 시도하지 않음(미매칭 처리).
+        """
+        det_centroids: dict[int, tuple[float, float]] = {}
+        det_class: dict[int, int] = {}
+        for di, det in enumerate(detections):
+            kps = [
+                (float(x), float(y))
+                for x, y, _ in det["keypoints"]
+                if x > 0 or y > 0
+            ]
+            if not kps:
+                continue
+            cx = sum(p[0] for p in kps) / len(kps)
+            cy = sum(p[1] for p in kps) / len(kps)
+            det_centroids[di] = (cx, cy)
+            det_class[di] = int(det["class_id"])
+
+        assigned: set[int] = set()
+        matches: dict[int, int] = {}
+        for bi, block in enumerate(blocks):
+            uv = projected[bi]
+            if uv is None:
+                continue
+            target_class = self._target_class_id_for_block(block)
+            best_di = -1
+            best_d2 = float("inf")
+            for di, (cx, cy) in det_centroids.items():
+                if di in assigned:
+                    continue
+                if det_class.get(di) != target_class:
+                    continue
+                d2 = (cx - uv[0]) ** 2 + (cy - uv[1]) ** 2
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_di = di
+            if best_di >= 0:
+                matches[bi] = best_di
+                assigned.add(best_di)
+        return matches
+
     def _draw_world_poses(
         self,
         image: np.ndarray,
         detections: list[dict[str, Any]],
         blocks: list,
     ) -> None:
-        """solvePnP 결과 (x, y, yaw_deg)를 각 검출 centroid 근처에 그린다."""
-        # blocks는 confidence 내림차순, detections도 동일 순서이므로 index로 매칭
+        """fused world pose 를 해당 detection 위에 라벨로 그린다.
+
+        매칭은 (1) block.color->class_id 일치 + (2) world->image reprojection 후
+        픽셀 최근접 detection 으로, confidence 순 greedy 배정한다. 이는 multi-frame
+        fusion 으로 block list size/order 가 snapshot frame 의 detections 와
+        달라질 수 있는 경우에도 라벨이 엉뚱한 객체에 붙는 문제를 막는다.
+        """
+        if not blocks:
+            return
+
+        with self._lock:
+            stamp = self._latest_stamp
+        projected = self._project_blocks_to_image(blocks, stamp)
+        matches = self._match_blocks_to_detections(blocks, detections, projected)
+
+        h, w = image.shape[:2]
+        fallback_count = 0
         for idx, block in enumerate(blocks):
             color_name = block.color
             p = block.pose.pose.position
@@ -333,8 +534,16 @@ class BoxCupKeypointNode(Node):
             if yaw_deg is not None:
                 lines.append(f"yaw={yaw_deg:.1f}deg")
 
-            # anchor: 해당 detection의 keypoint centroid; 없으면 이미지 상단 나열
-            anchor_x, anchor_y = self._detection_centroid(detections, idx)
+            if idx in matches:
+                anchor_x, anchor_y = self._detection_centroid(detections, matches[idx])
+            else:
+                uv = projected[idx]
+                if uv is not None and 0 <= uv[0] < w and 0 <= uv[1] < h:
+                    anchor_x, anchor_y = int(round(uv[0])), int(round(uv[1]))
+                else:
+                    # 매칭/투영 모두 실패: 영상 왼쪽 상단에 순서대로 fallback 표기.
+                    anchor_x, anchor_y = 10, 60 + fallback_count * 60
+                    fallback_count += 1
 
             bg_x = anchor_x
             bg_y = anchor_y + 12

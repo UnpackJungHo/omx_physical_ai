@@ -111,7 +111,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "box_cup_model_path",
-            default_value="runs/pose/box_cup_pose_2class_201/weights/best.pt",
+            default_value="runs/pose/box_cup_pose_2class_v2/weights/best.pt",
             description="YOLOv8-Pose best.pt for box/cup keypoint detection.",
         ),
         DeclareLaunchArgument(

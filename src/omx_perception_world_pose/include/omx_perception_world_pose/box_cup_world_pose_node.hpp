@@ -41,7 +41,19 @@ private:
   std::optional<geometry_msgs::msg::TransformStamped>
   lookup_transform(const builtin_interfaces::msg::Time & stamp);
 
-  std::optional<omx_interfaces::msg::BlockPose> process_detection(
+  struct DetectionSample
+  {
+    int class_id;
+    std::string color;
+    double x;             // world frame
+    double y;             // world frame
+    double yaw_world;     // box only; ignored when has_yaw=false
+    bool has_yaw;
+    float detection_confidence;
+    float yaw_confidence;
+  };
+
+  std::optional<DetectionSample> process_detection(
     const omx_interfaces::msg::KeypointDetection & det,
     const geometry_msgs::msg::TransformStamped & transform);
 
@@ -52,14 +64,26 @@ private:
   std::string world_service_name_;
   std::string target_frame_;
   std::string camera_frame_;
-  double cube_size_m_;
+  // Ray-plane intersection prior: each detection's 4 keypoints are assumed to
+  // lie on a horizontal plane at world z = *_top_z_m. Output z is set to
+  // *_output_z_m (typically object center/grasp height, distinct from rim).
+  double box_top_z_m_;
   double box_output_z_m_;
-  double cup_radius_m_;
+  double cup_top_z_m_;
   double cup_output_z_m_;
+  // 측정된 perception (x,y) - ground truth (x,y) bias 의 반대 부호로 채워
+  // process_detection 결과에 더해 보정한다. eye-in-hand 구성이므로 scan pose
+  // 가 바뀌면 이 값도 재교정해야 한다.
+  double world_offset_x_m_;
+  double world_offset_y_m_;
   double min_keypoint_confidence_;
   double keypoints_timeout_sec_;
   double tf_lookup_timeout_sec_;
   std::vector<int64_t> keypoint_order_;
+  int num_samples_;
+  double sample_interval_sec_;
+  int min_valid_samples_;
+  double cluster_match_tolerance_m_;
 
   CameraIntrinsics intrinsics_;
 

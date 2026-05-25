@@ -1,4 +1,5 @@
 #include <cmath>
+#include <optional>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -13,28 +14,6 @@
 namespace
 {
 
-std::vector<cv::Point3f> box_object_points(double cube_size_m)
-{
-  float half = static_cast<float>(cube_size_m / 2.0);
-  return {
-    {-half, -half, 0.0f},
-    { half, -half, 0.0f},
-    { half,  half, 0.0f},
-    {-half,  half, 0.0f},
-  };
-}
-
-std::vector<cv::Point3f> cup_object_points(double cup_radius_m)
-{
-  float r = static_cast<float>(cup_radius_m);
-  return {
-    {-r, 0.0f, 0.0f},
-    { 0.0f, -r, 0.0f},
-    { r, 0.0f, 0.0f},
-    { 0.0f,  r, 0.0f},
-  };
-}
-
 cv::Matx33d quat_to_rot(double qx, double qy, double qz, double qw)
 {
   double n = std::sqrt(qx * qx + qy * qy + qz * qz + qw * qw);
@@ -46,62 +25,93 @@ cv::Matx33d quat_to_rot(double qx, double qy, double qz, double qw)
     2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy));
 }
 
-double box_yaw_world(const cv::Vec3d & rvec, const cv::Matx33d & R_world_cam)
+std::optional<std::vector<cv::Point3d>> project_keypoints_to_plane(
+  const std::vector<cv::Point2f> & image_points,
+  const cv::Mat & K, const cv::Mat & D,
+  const cv::Matx33d & R_world_cam, const cv::Vec3d & t_world_cam,
+  double plane_z)
 {
-  cv::Matx33d R_cam_obj;
-  cv::Rodrigues(rvec, R_cam_obj);
-  cv::Matx33d R_world_obj = R_world_cam * R_cam_obj;
-  cv::Vec3d x_world(R_world_obj(0, 0), R_world_obj(1, 0), R_world_obj(2, 0));
-  return std::atan2(x_world[1], x_world[0]);
+  if (image_points.empty()) {return std::nullopt;}
+
+  std::vector<cv::Point2f> undistorted;
+  cv::undistortPoints(image_points, undistorted, K, D);
+
+  std::vector<cv::Point3d> world_points;
+  world_points.reserve(image_points.size());
+
+  constexpr double kEpsDz = 1e-6;
+
+  for (const auto & p : undistorted) {
+    cv::Vec3d d_cam(p.x, p.y, 1.0);
+    cv::Vec3d d_world = R_world_cam * d_cam;
+
+    if (std::abs(d_world[2]) < kEpsDz) {return std::nullopt;}
+    double lambda = (plane_z - t_world_cam[2]) / d_world[2];
+    if (lambda <= 0.0) {return std::nullopt;}
+
+    cv::Vec3d hit = t_world_cam + lambda * d_world;
+    world_points.emplace_back(hit[0], hit[1], hit[2]);
+  }
+  return world_points;
+}
+
+cv::Point2d centroid_xy(const std::vector<cv::Point3d> & pts)
+{
+  double sx = 0.0, sy = 0.0;
+  for (const auto & p : pts) {sx += p.x; sy += p.y;}
+  const double n = static_cast<double>(pts.size());
+  return {sx / n, sy / n};
+}
+
+double box_yaw_from_corners(const std::vector<cv::Point3d> & p)
+{
+  if (p.size() < 4) {return 0.0;}
+  static constexpr double kObjEdgeAngles[4] = {
+    0.0, M_PI / 2.0, M_PI, -M_PI / 2.0,
+  };
+  double s_sum = 0.0, c_sum = 0.0;
+  for (int i = 0; i < 4; ++i) {
+    double dx = p[(i + 1) % 4].x - p[i].x;
+    double dy = p[(i + 1) % 4].y - p[i].y;
+    double yaw = std::atan2(dy, dx) - kObjEdgeAngles[i];
+    s_sum += std::sin(yaw);
+    c_sum += std::cos(yaw);
+  }
+  return std::atan2(s_sum, c_sum);
+}
+
+// 합성 카메라: fx=fy=500, cx=cy=320/240, no distortion. 카메라가 world (0,0,H)
+// 에 놓여 -z 방향(아래)을 본다. OpenCV camera frame: +x=image right, +y=image
+// down, +z=forward. 즉 R_world_cam 은 +x_cam -> +x_world, +y_cam -> -y_world,
+// +z_cam -> -z_world (180-deg roll about x_world).
+cv::Mat make_K(double fx = 500.0, double fy = 500.0,
+  double cx = 320.0, double cy = 240.0)
+{
+  return (cv::Mat_<double>(3, 3) <<
+    fx, 0.0, cx,
+    0.0, fy, cy,
+    0.0, 0.0, 1.0);
+}
+
+cv::Mat make_zero_D() {return cv::Mat::zeros(1, 5, CV_64F);}
+
+cv::Matx33d R_downward_camera()
+{
+  // x_cam -> x_world, y_cam -> -y_world, z_cam -> -z_world
+  return cv::Matx33d(
+    1.0,  0.0,  0.0,
+    0.0, -1.0,  0.0,
+    0.0,  0.0, -1.0);
 }
 
 constexpr double kEps = 1e-5;
+constexpr double kPosEps = 1e-4;
 constexpr double kDeg = M_PI / 180.0;
 
 }  // namespace
 
 // ============================================================
-// object_points_box_square_corners
-// ============================================================
-
-TEST(ObjectPoints, BoxSquareCorners)
-{
-  auto pts = box_object_points(0.030);
-  ASSERT_EQ(pts.size(), 4u);
-  float half = 0.015f;
-  EXPECT_NEAR(pts[0].x, -half, kEps);
-  EXPECT_NEAR(pts[0].y, -half, kEps);
-  EXPECT_NEAR(pts[1].x,  half, kEps);
-  EXPECT_NEAR(pts[1].y, -half, kEps);
-  EXPECT_NEAR(pts[2].x,  half, kEps);
-  EXPECT_NEAR(pts[2].y,  half, kEps);
-  EXPECT_NEAR(pts[3].x, -half, kEps);
-  EXPECT_NEAR(pts[3].y,  half, kEps);
-  for (const auto & p : pts) {EXPECT_NEAR(p.z, 0.0f, kEps);}
-}
-
-// ============================================================
-// object_points_cup_rim_cardinals
-// ============================================================
-
-TEST(ObjectPoints, CupRimCardinals)
-{
-  auto pts = cup_object_points(0.07);
-  ASSERT_EQ(pts.size(), 4u);
-  float r = 0.07f;
-  EXPECT_NEAR(pts[0].x, -r, kEps);
-  EXPECT_NEAR(pts[0].y,  0.0f, kEps);
-  EXPECT_NEAR(pts[1].x,  0.0f, kEps);
-  EXPECT_NEAR(pts[1].y, -r, kEps);
-  EXPECT_NEAR(pts[2].x,  r, kEps);
-  EXPECT_NEAR(pts[2].y,  0.0f, kEps);
-  EXPECT_NEAR(pts[3].x,  0.0f, kEps);
-  EXPECT_NEAR(pts[3].y,  r, kEps);
-  for (const auto & p : pts) {EXPECT_NEAR(p.z, 0.0f, kEps);}
-}
-
-// ============================================================
-// quaternion_identity_is_eye
+// quaternion tests (kept from before)
 // ============================================================
 
 TEST(QuaternionToRot, IdentityIsEye)
@@ -115,91 +125,165 @@ TEST(QuaternionToRot, IdentityIsEye)
   }
 }
 
-// ============================================================
-// quaternion_z180_flips_xy
-// ============================================================
-
 TEST(QuaternionToRot, Z180FlipsXY)
 {
-  // q = (0, 0, 1, 0) represents 180-deg rotation about Z
   auto R = quat_to_rot(0.0, 0.0, 1.0, 0.0);
-  // x -> -x, y -> -y, z -> z
   EXPECT_NEAR(R(0, 0), -1.0, kEps);
   EXPECT_NEAR(R(1, 1), -1.0, kEps);
   EXPECT_NEAR(R(2, 2),  1.0, kEps);
 }
 
 // ============================================================
-// box_yaw_identity_zero
+// ray-plane intersection tests
 // ============================================================
 
-TEST(BoxYaw, IdentityZero)
+// 카메라가 (0,0,1) 위에서 아래를 본다. 이미지 중심 픽셀(cx,cy) 의 ray 는 정확히
+// -z_world 방향이므로 plane z=0 과 (0,0,0) 에서 만난다.
+TEST(RayPlane, CenterPixelHitsOriginOnGround)
 {
-  cv::Vec3d rvec(0.0, 0.0, 0.0);
-  cv::Matx33d R_I = cv::Matx33d::eye();
-  double yaw = box_yaw_world(rvec, R_I);
-  EXPECT_NEAR(yaw, 0.0, kEps);
+  auto K = make_K();
+  auto D = make_zero_D();
+  auto R = R_downward_camera();
+  cv::Vec3d t(0.0, 0.0, 1.0);
+
+  std::vector<cv::Point2f> px{{320.0f, 240.0f}};
+  auto result = project_keypoints_to_plane(px, K, D, R, t, 0.0);
+  ASSERT_TRUE(result.has_value());
+  ASSERT_EQ(result->size(), 1u);
+  EXPECT_NEAR((*result)[0].x, 0.0, kPosEps);
+  EXPECT_NEAR((*result)[0].y, 0.0, kPosEps);
+  EXPECT_NEAR((*result)[0].z, 0.0, kPosEps);
+}
+
+// 픽셀 (cx + fx*dx_world, cy) 의 ray 는 camera frame 에서 (dx_world, 0, 1) 방향.
+// world frame 으로 회전 시 (dx_world, 0, -1). camera 높이 H=1 에서 plane z=0 과
+// 교점 = (dx_world*1, 0, 0).
+TEST(RayPlane, OffsetPixelMapsToScaledWorldXY)
+{
+  auto K = make_K();
+  auto D = make_zero_D();
+  auto R = R_downward_camera();
+  cv::Vec3d t(0.0, 0.0, 1.0);
+
+  // shift +50 px in u, -30 px in v.
+  std::vector<cv::Point2f> px{{370.0f, 210.0f}};  // (cx+50, cy-30)
+  auto result = project_keypoints_to_plane(px, K, D, R, t, 0.0);
+  ASSERT_TRUE(result.has_value());
+  // expected: x = +50/500 * 1 = 0.10, y = -(-30/500) * 1 = +0.06 (y_cam->-y_world)
+  EXPECT_NEAR((*result)[0].x,  0.10, kPosEps);
+  EXPECT_NEAR((*result)[0].y,  0.06, kPosEps);
+}
+
+// plane_z = 0.030 (박스 윗면) 으로 올리면 광선 진행 거리가 줄어 (1-0.03)배로
+// 스케일.
+TEST(RayPlane, NonZeroPlaneScalesXY)
+{
+  auto K = make_K();
+  auto D = make_zero_D();
+  auto R = R_downward_camera();
+  cv::Vec3d t(0.0, 0.0, 1.0);
+  const double plane_z = 0.030;
+
+  std::vector<cv::Point2f> px{{370.0f, 240.0f}};  // u shift +50
+  auto result = project_keypoints_to_plane(px, K, D, R, t, plane_z);
+  ASSERT_TRUE(result.has_value());
+  const double expected_x = 0.10 * (1.0 - plane_z);
+  EXPECT_NEAR((*result)[0].x, expected_x, kPosEps);
+  EXPECT_NEAR((*result)[0].y, 0.0, kPosEps);
+  EXPECT_NEAR((*result)[0].z, plane_z, kPosEps);
+}
+
+// ray 가 plane 과 평행(horizontal)이면 nullopt.
+TEST(RayPlane, HorizontalRayFails)
+{
+  auto K = make_K();
+  auto D = make_zero_D();
+  // camera 가 +x 방향을 보는 자세 (z_cam = +x_world). plane z=0 과 평행.
+  cv::Matx33d R(
+    0.0, 0.0, 1.0,
+    1.0, 0.0, 0.0,
+    0.0, 1.0, 0.0);
+  cv::Vec3d t(0.0, 0.0, 0.5);
+  std::vector<cv::Point2f> px{{320.0f, 240.0f}};
+  auto result = project_keypoints_to_plane(px, K, D, R, t, 0.0);
+  EXPECT_FALSE(result.has_value());
+}
+
+// 카메라가 plane 아래에서 위 plane 을 향해도(즉 lambda > 0) 정상 처리되어야
+// 하지만, 위쪽 plane 을 카메라가 등지면(lambda<0) 실패해야 함.
+TEST(RayPlane, BehindCameraFails)
+{
+  auto K = make_K();
+  auto D = make_zero_D();
+  auto R = R_downward_camera();  // 아래를 봄
+  cv::Vec3d t(0.0, 0.0, 1.0);
+  // plane z = 2.0 -> camera 가 등지고 있는 위쪽 -> intersect behind camera
+  std::vector<cv::Point2f> px{{320.0f, 240.0f}};
+  auto result = project_keypoints_to_plane(px, K, D, R, t, 2.0);
+  EXPECT_FALSE(result.has_value());
 }
 
 // ============================================================
-// box_yaw_object_30deg (object rotated 30° about Z in camera frame)
+// centroid + box_yaw_from_corners
 // ============================================================
 
-TEST(BoxYaw, Object30Deg)
+TEST(Centroid, MeanOfFourCorners)
 {
-  double angle = 30.0 * kDeg;
-  cv::Vec3d rvec(0.0, 0.0, angle);
-  cv::Matx33d R_I = cv::Matx33d::eye();
-  double yaw = box_yaw_world(rvec, R_I);
-  EXPECT_NEAR(yaw, angle, kEps);
+  std::vector<cv::Point3d> pts{
+    {1.0, 2.0, 0.0},
+    {3.0, 2.0, 0.0},
+    {3.0, 4.0, 0.0},
+    {1.0, 4.0, 0.0},
+  };
+  auto c = centroid_xy(pts);
+  EXPECT_NEAR(c.x, 2.0, kEps);
+  EXPECT_NEAR(c.y, 3.0, kEps);
 }
 
-// ============================================================
-// box_yaw_world_cam_90deg (camera->world 90° about Z)
-// ============================================================
-
-TEST(BoxYaw, WorldCam90Deg)
+// 축 정렬 정사각형 -> yaw = 0.
+TEST(BoxYawFromCorners, AxisAlignedZero)
 {
-  cv::Vec3d rvec(0.0, 0.0, 0.0);
-  double angle = 90.0 * kDeg;
-  cv::Matx33d R_world_cam = quat_to_rot(
-    0.0, 0.0, std::sin(angle / 2.0), std::cos(angle / 2.0));
-  double yaw = box_yaw_world(rvec, R_world_cam);
-  EXPECT_NEAR(yaw, angle, kEps);
+  std::vector<cv::Point3d> p{
+    {-0.5, -0.5, 0.0},
+    { 0.5, -0.5, 0.0},
+    { 0.5,  0.5, 0.0},
+    {-0.5,  0.5, 0.0},
+  };
+  EXPECT_NEAR(box_yaw_from_corners(p), 0.0, kEps);
 }
 
-// ============================================================
-// box_yaw_compose_30_plus_90 = 120
-// ============================================================
-
-TEST(BoxYaw, Compose30Plus90)
+// 30도 회전된 정사각형 -> yaw = 30 deg.
+TEST(BoxYawFromCorners, Rotated30Deg)
 {
-  double obj_angle = 30.0 * kDeg;
-  double cam_angle = 90.0 * kDeg;
-  cv::Vec3d rvec(0.0, 0.0, obj_angle);
-  cv::Matx33d R_world_cam = quat_to_rot(
-    0.0, 0.0, std::sin(cam_angle / 2.0), std::cos(cam_angle / 2.0));
-  double yaw = box_yaw_world(rvec, R_world_cam);
-  EXPECT_NEAR(yaw, obj_angle + cam_angle, kEps);
+  const double a = 30.0 * kDeg;
+  const double c = std::cos(a), s = std::sin(a);
+  auto rot = [&](double x, double y) {
+      return cv::Point3d(c * x - s * y, s * x + c * y, 0.0);
+    };
+  std::vector<cv::Point3d> p{
+    rot(-0.5, -0.5),
+    rot( 0.5, -0.5),
+    rot( 0.5,  0.5),
+    rot(-0.5,  0.5),
+  };
+  EXPECT_NEAR(box_yaw_from_corners(p), a, kEps);
 }
 
-// ============================================================
-// quaternion_from_yaw_roundtrip
-// ============================================================
-
-TEST(BoxYaw, QuaternionFromYawRoundtrip)
+// 노이즈가 있어도 평균(circular mean) 이 동작해야 함.
+TEST(BoxYawFromCorners, NoisyRotatedStillClose)
 {
-  double input_yaw = 45.0 * kDeg;
-  double qz = std::sin(input_yaw / 2.0);
-  double qw = std::cos(input_yaw / 2.0);
-
-  // q = (0, 0, qz, qw) -> R
-  cv::Matx33d R = quat_to_rot(0.0, 0.0, qz, qw);
-
-  // recover yaw from x-axis
-  cv::Vec3d x_world(R(0, 0), R(1, 0), R(2, 0));
-  double recovered_yaw = std::atan2(x_world[1], x_world[0]);
-  EXPECT_NEAR(recovered_yaw, input_yaw, kEps);
+  const double a = -15.0 * kDeg;
+  const double c = std::cos(a), s = std::sin(a);
+  auto rot = [&](double x, double y) {
+      return cv::Point3d(c * x - s * y, s * x + c * y, 0.0);
+    };
+  std::vector<cv::Point3d> p{
+    rot(-0.5 + 0.005, -0.5 - 0.003),
+    rot( 0.5 - 0.004, -0.5 + 0.002),
+    rot( 0.5 + 0.001,  0.5 + 0.006),
+    rot(-0.5 - 0.002,  0.5 - 0.005),
+  };
+  EXPECT_NEAR(box_yaw_from_corners(p), a, 2.0 * kDeg);
 }
 
 int main(int argc, char ** argv)
