@@ -49,6 +49,7 @@ venv/
 /BoxTopDetector2Yolov8/
 /BoxTopDetector2Yolov8_merged_dataset/
 /BoxTopDetector2Yolov8_pose2class_dataset/
+/BoxTopDetector2Yolov8_pose2class_dataset_v2/
 /runs/
 /yolo*
 /myThinking.md
