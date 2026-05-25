@@ -34,6 +34,21 @@ def jaw_axis_yaw_from_quaternion(x: float, y: float, z: float, w: float) -> floa
     return math.atan2(axis_y, axis_x)
 
 
+def wrap_yaw_zero_pi_over_2(angle_rad: float) -> float:
+    """각도를 box 90° 회전 대칭을 이용해 [0, pi/2) 범위로 접는다.
+
+    perception (omx_perception_world_pose) 가 box yaw 를 동일한 구간으로
+    wrap 해서 publish 하므로, skill 측에서 gripper jaw heading 을 같은
+    구간으로 정규화해 두면 두 yaw 가 같은 표현이 되어 delta 계산이
+    일관된다.
+    """
+    period = math.pi / 2.0
+    wrapped = math.fmod(angle_rad, period)
+    if wrapped < 0.0:
+        wrapped += period
+    return wrapped
+
+
 def wrap_to_pm45(angle_rad: float) -> float:
     """각도를 box 90° 대칭을 이용해 (-pi/4, pi/4] 범위로 접는다.
 
@@ -59,8 +74,12 @@ def joint5_target(
 ) -> float:
     """box 면과 그리퍼를 평행하게 맞추는 joint5 목표각(rad).
 
-    joint5 는 수직 approach 축 기준 roll 이라 world yaw 변화량과 1:1.
-    yaw_sign 은 자세에 따라 고정된 부호(+1/-1)로, 1회 캘리브레이션한다.
+    perception 은 box_yaw 를 [0, pi/2) 로 wrap 해서 보낸다. gripper_yaw 도
+    동일 구간으로 정규화한 뒤 차이를 (-pi/4, pi/4] 로 접어 최단 회전을
+    구한다. joint5 는 수직 approach 축 기준 roll 이라 world yaw 변화량과
+    1:1 이고, yaw_sign 은 자세에 따라 고정된 부호(+1/-1)로 1회 캘리브레이션한다.
     """
-    delta_world = wrap_to_pm45(box_yaw - gripper_yaw)
+    box_yaw_norm = wrap_yaw_zero_pi_over_2(box_yaw)
+    gripper_yaw_norm = wrap_yaw_zero_pi_over_2(gripper_yaw)
+    delta_world = wrap_to_pm45(box_yaw_norm - gripper_yaw_norm)
     return joint5_current + yaw_sign * delta_world

@@ -7,6 +7,7 @@ from omx_skill_executor.pick_place_geometry import (
     jaw_axis_yaw_from_quaternion,
     joint5_target,
     wrap_to_pm45,
+    wrap_yaw_zero_pi_over_2,
     yaw_from_quaternion,
 )
 
@@ -59,6 +60,39 @@ def test_wrap_to_pm45_folds_minus80_to_10():
 
 def test_wrap_to_pm45_folds_full_circle():
     assert math.isclose(wrap_to_pm45(math.radians(360.0)), 0.0, abs_tol=1e-6)
+
+
+def test_wrap_yaw_zero_pi_over_2_within_range_unchanged():
+    for deg in (0.0, 15.0, 45.0, 89.9):
+        assert math.isclose(
+            wrap_yaw_zero_pi_over_2(math.radians(deg)),
+            math.radians(deg),
+            abs_tol=1e-9,
+        )
+
+
+def test_wrap_yaw_zero_pi_over_2_folds_90_to_0():
+    # 90° 회전 대칭이므로 90° 는 0° 와 같은 정렬.
+    assert math.isclose(
+        wrap_yaw_zero_pi_over_2(math.radians(90.0)), 0.0, abs_tol=1e-6
+    )
+
+
+def test_wrap_yaw_zero_pi_over_2_folds_negative_into_range():
+    # -30° 는 60° 와 같은 정렬 (mod 90°).
+    assert math.isclose(
+        wrap_yaw_zero_pi_over_2(math.radians(-30.0)),
+        math.radians(60.0),
+        abs_tol=1e-6,
+    )
+
+
+def test_wrap_yaw_zero_pi_over_2_folds_200_to_20():
+    assert math.isclose(
+        wrap_yaw_zero_pi_over_2(math.radians(200.0)),
+        math.radians(20.0),
+        abs_tol=1e-6,
+    )
 
 
 def test_joint5_target_positive_sign():
