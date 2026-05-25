@@ -1,30 +1,33 @@
-// grasp_detector — Step 1: Dynamixel current 기반 grasp 판단
+// grasp_detector — Dynamixel current 기반 grasp 판단 (force-only)
 //
 // 목적
-//   IL 데이터 라벨링 / RL 보상 신호 / classical pick & place retry 로직의
-//   전제 조건이 되는 "그리퍼가 박스를 잡았는가?" 신호를 제공한다.
+//   IL 데이터 라벨링 / RL 보상 신호 / pick & place retry 로직의 전제 조건이
+//   되는 "그리퍼가 박스를 잡았는가?" 신호를 제공한다.
 //
-// 판단 로직 (3-신호 AND, stable_window_ms 안정화)
-//   1. |present_current| > current_thresh_ma
-//   2. |goal_pos − present_pos| > position_error_thresh
-//   3. |present_velocity| < velocity_thresh
-//   세 조건이 stable_window_ms 동안 연속 만족하면 is_grasping = true.
+// 판단 로직 (force-only, stable_window_ms 안정화)
+//   force_estimate = effort × current_unit_to_ma_ (signed mA)
+//   force_estimate < grasp_force_threshold_ma  (예: < -1000 mA)
+//   이 조건이 stable_window_ms 동안 연속 만족하면 is_grasping = true.
+//
+//   signed 음수 임계값을 쓰는 이유: 클로즈 방향으로 작용하는 dynamixel current
+//   는 음수로 측정된다 (실측 -1150 mA 부근). 절대값이 아닌 signed 비교로
+//   close 방향 부하만 잡고, open/리액션 토크의 양수 부하는 grasp 로 보지 않는다.
 //
 // 입력
-//   /joint_states                                (sensor_msgs/JointState)
-//     - effort[gripper] 가 dynamixel_hardware_interface 의
-//       Present Current (Dynamixel raw unit) 로 매핑되어 발행된다.
-//   /gripper_traj_controller/controller_state    (control_msgs/JointTrajectoryControllerState)
-//     - reference.positions[gripper] = 최신 goal position.
+//   /joint_states  (sensor_msgs/JointState)
+//     effort[gripper] 가 dynamixel_hardware_interface 의 Present Current
+//     (Dynamixel raw unit) 로 매핑되어 발행된다.
 //
 // 출력
-//   /gripper/is_grasping                         (std_msgs/Bool, transient_local)
-//   /gripper/grasp_force_estimate                (std_msgs/Float32, mA)
-//   /gripper/check_grasp                         (omx_interfaces/srv/CheckGrasp)
+//   /gripper/is_grasping            (std_msgs/Bool, transient_local)
+//   /gripper/grasp_force_estimate   (std_msgs/Float32, mA)  ← raw stream, 외부
+//                                    그래프 클라이언트가 직접 구독한다. 토픽
+//                                    이름/타입/QoS/발행 주기/값 정의는 절대
+//                                    바꾸지 말 것 (omx_web_ws 차트 의존).
+//   /gripper/check_grasp            (omx_interfaces/srv/CheckGrasp)
 //
 // 동시성
 //   기본 SingleThreadedExecutor 한 개에 모든 콜백을 묶는다.
-//   (joint_state, controller_state, service 모두 짧은 콜백 — lock 한 개로 충분)
 
 #include <algorithm>
 #include <cmath>
@@ -37,7 +40,6 @@
 #include <rclcpp/rclcpp.hpp>
 
 #include <sensor_msgs/msg/joint_state.hpp>
-#include <control_msgs/msg/joint_trajectory_controller_state.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float32.hpp>
 
@@ -55,22 +57,17 @@ public:
     // ── 파라미터 ────────────────────────────────────────────────────
     gripper_joint_ = declare_parameter<std::string>("gripper_joint", "gripper_joint_1");
     current_unit_to_ma_ = declare_parameter<double>("current_unit_to_ma", 2.69);
-    current_thresh_ma_ = declare_parameter<double>("current_thresh_ma", 70.0);
-    position_error_thresh_ = declare_parameter<double>("position_error_thresh", 0.03);
-    velocity_thresh_ = declare_parameter<double>("velocity_thresh", 0.05);
+    grasp_force_threshold_ma_ =
+      declare_parameter<double>("grasp_force_threshold_ma", -1000.0);
     stable_window_ms_ = declare_parameter<int>("stable_window_ms", 150);
     state_stale_ms_ = declare_parameter<int>("state_stale_ms", 200);
     publish_rate_hz_ = declare_parameter<double>("publish_rate_hz", 20.0);
 
-    const std::string controller_state_topic = declare_parameter<std::string>(
-      "controller_state_topic",
-      "/gripper_traj_controller/controller_state");
-
     RCLCPP_INFO(get_logger(),
-      "grasp_detector params: joint=%s current_thresh=%.1fmA pos_err=%.3f vel=%.3f "
+      "grasp_detector params: joint=%s force_threshold=%.1fmA "
       "stable=%dms stale=%dms unit_to_ma=%.3f",
-      gripper_joint_.c_str(), current_thresh_ma_, position_error_thresh_,
-      velocity_thresh_, stable_window_ms_, state_stale_ms_, current_unit_to_ma_);
+      gripper_joint_.c_str(), grasp_force_threshold_ma_,
+      stable_window_ms_, state_stale_ms_, current_unit_to_ma_);
 
     // ── publishers ─────────────────────────────────────────────────
     // is_grasping 은 latched (transient_local) — 늦게 뜨는 구독자도 마지막 값을 본다.
@@ -80,6 +77,8 @@ public:
     is_grasping_pub_ = create_publisher<std_msgs::msg::Bool>("/gripper/is_grasping", latched_qos);
 
     // 힘 추정값은 일반 sensor 스트림 — best effort, depth 10.
+    // omx_web_ws 차트가 이 토픽을 직접 구독하므로 이름/타입/QoS/발행 주기를
+    // 변경하면 안 된다.
     rclcpp::QoS sensor_qos(10);
     sensor_qos.best_effort();
     force_pub_ = create_publisher<std_msgs::msg::Float32>(
@@ -91,13 +90,6 @@ public:
     joint_state_sub_ = create_subscription<sensor_msgs::msg::JointState>(
       "/joint_states", js_qos,
       std::bind(&GraspDetector::on_joint_state, this, std::placeholders::_1));
-
-    rclcpp::QoS cs_qos(rclcpp::KeepLast(10));
-    cs_qos.reliable();
-    controller_state_sub_ =
-      create_subscription<control_msgs::msg::JointTrajectoryControllerState>(
-      controller_state_topic, cs_qos,
-      std::bind(&GraspDetector::on_controller_state, this, std::placeholders::_1));
 
     // ── service ────────────────────────────────────────────────────
     check_grasp_srv_ = create_service<omx_interfaces::srv::CheckGrasp>(
@@ -116,17 +108,17 @@ private:
   // ── 한 sample 의 평가 결과 ───────────────────────────────────────
   struct SampleEval
   {
-    bool valid;          // 모든 입력이 살아있고 정상이면 true
-    bool conditions_met; // 3-신호 AND
-    std::string reason;  // 평가 사유
-    double current_ma;
-    double position_error;
-    double velocity;
-    rclcpp::Time stamp;
+    bool valid{false};            // 모든 입력이 살아있고 정상이면 true
+    bool conditions_met{false};   // force_estimate < threshold
+    std::string reason;           // 평가 사유
+    double current_ma{0.0};
+    // rclcpp::Time 의 기본 생성자가 explicit 이라 SampleEval e{} value-init
+    // 시 implicit default ctor 사용이 막힌다. 명시적 기본값으로 회피.
+    rclcpp::Time stamp{0, 0, RCL_ROS_TIME};
   };
 
   // ────────────────────────────────────────────────────────────────
-  // /joint_states 콜백: gripper_joint_1 의 position / velocity / effort 추출
+  // /joint_states 콜백: gripper_joint_1 의 effort 추출
   // ────────────────────────────────────────────────────────────────
   void on_joint_state(const sensor_msgs::msg::JointState::SharedPtr msg)
   {
@@ -145,36 +137,11 @@ private:
         "effort 가 추가되어 있는지 확인하라.");
       return;
     }
-    if (msg->position.size() <= idx || msg->velocity.size() <= idx) {
-      return;
-    }
 
     std::lock_guard<std::mutex> lk(mtx_);
-    last_position_ = msg->position[idx];
-    last_velocity_ = msg->velocity[idx];
     last_current_unit_ = msg->effort[idx];
     last_state_stamp_ = msg->header.stamp;
     has_state_ = true;
-  }
-
-  // ────────────────────────────────────────────────────────────────
-  // /gripper_traj_controller/controller_state 콜백: 최신 goal position 추출
-  // ────────────────────────────────────────────────────────────────
-  void on_controller_state(
-    const control_msgs::msg::JointTrajectoryControllerState::SharedPtr msg)
-  {
-    auto it = std::find(msg->joint_names.begin(), msg->joint_names.end(), gripper_joint_);
-    if (it == msg->joint_names.end()) {
-      return;
-    }
-    const size_t idx = static_cast<size_t>(std::distance(msg->joint_names.begin(), it));
-    if (msg->reference.positions.size() <= idx) {
-      return;
-    }
-    std::lock_guard<std::mutex> lk(mtx_);
-    last_goal_position_ = msg->reference.positions[idx];
-    last_goal_stamp_ = msg->header.stamp;
-    has_goal_ = true;
   }
 
   // ────────────────────────────────────────────────────────────────
@@ -182,13 +149,7 @@ private:
   // ────────────────────────────────────────────────────────────────
   SampleEval evaluate_locked() const
   {
-    SampleEval e{};
-    e.valid = false;
-    e.conditions_met = false;
-    e.current_ma = 0.0;
-    e.position_error = 0.0;
-    e.velocity = 0.0;
-    e.stamp = rclcpp::Time(0, 0, RCL_ROS_TIME);
+    SampleEval e;  // 멤버 기본값으로 초기화됨
 
     if (!has_state_) {
       e.reason = "no_state";
@@ -206,37 +167,11 @@ private:
     }
 
     e.current_ma = last_current_unit_ * current_unit_to_ma_;
-    e.velocity = last_velocity_;
     e.stamp = state_stamp;
-
-    if (!has_goal_) {
-      // goal 이 없으면 position error 비교가 불가 — grasping 은 false 로 단정.
-      e.reason = "no_command";
-      e.valid = true;
-      return e;
-    }
-    e.position_error = last_goal_position_ - last_position_;
-
-    const double abs_current = std::abs(e.current_ma);
-    const double abs_pos_err = std::abs(e.position_error);
-    const double abs_vel = std::abs(e.velocity);
-
-    const bool current_high = abs_current > current_thresh_ma_;
-    const bool blocked_position = abs_pos_err > position_error_thresh_;
-    const bool stationary = abs_vel < velocity_thresh_;
-
     e.valid = true;
-    e.conditions_met = current_high && blocked_position && stationary;
-    if (e.conditions_met) {
-      e.reason = "grasping";
-    } else if (!stationary) {
-      e.reason = "moving";
-    } else if (!current_high) {
-      e.reason = "no_object";
-    } else {
-      // current 는 높은데 position_error 가 작음 — goal 에 도달했다는 뜻.
-      e.reason = "no_object";
-    }
+    // signed 비교 — close 방향 토크가 음수로 측정된다는 캘리브레이션 전제.
+    e.conditions_met = e.current_ma < grasp_force_threshold_ma_;
+    e.reason = e.conditions_met ? "grasping" : "no_object";
     return e;
   }
 
@@ -298,9 +233,8 @@ private:
       is_grasping_pub_->publish(b);
       last_published_ = grasping;
       RCLCPP_INFO(get_logger(),
-        "[grasp_detector] is_grasping=%s reason=%s current=%.1fmA pos_err=%.3f vel=%.3f",
-        grasping ? "true" : "false", e.reason.c_str(),
-        e.current_ma, e.position_error, e.velocity);
+        "[grasp_detector] is_grasping=%s reason=%s current=%.1fmA",
+        grasping ? "true" : "false", e.reason.c_str(), e.current_ma);
     }
 
     std_msgs::msg::Float32 f;
@@ -324,8 +258,10 @@ private:
     }
     res->is_grasping = grasping_stable;
     res->current_ma = static_cast<float>(e.current_ma);
-    res->position_error = static_cast<float>(e.position_error);
-    res->velocity = static_cast<float>(e.velocity);
+    // position_error / velocity 는 force-only 판단에서 사용하지 않는다.
+    // srv 호환을 위해 0 으로 채운다.
+    res->position_error = 0.0f;
+    res->velocity = 0.0f;
     res->reason = e.reason;
     res->stamp = e.stamp;
   }
@@ -333,9 +269,7 @@ private:
   // ── 파라미터 ─────────────────────────────────────────────────────
   std::string gripper_joint_;
   double current_unit_to_ma_;
-  double current_thresh_ma_;
-  double position_error_thresh_;
-  double velocity_thresh_;
+  double grasp_force_threshold_ma_;
   int stable_window_ms_;
   int state_stale_ms_;
   double publish_rate_hz_;
@@ -343,13 +277,8 @@ private:
   // ── 상태 ────────────────────────────────────────────────────────
   std::mutex mtx_;
   bool has_state_{false};
-  bool has_goal_{false};
-  double last_position_{0.0};
-  double last_velocity_{0.0};
   double last_current_unit_{0.0};
-  double last_goal_position_{0.0};
   builtin_interfaces::msg::Time last_state_stamp_;
-  builtin_interfaces::msg::Time last_goal_stamp_;
 
   struct HistEntry { rclcpp::Time t; bool met; };
   std::deque<HistEntry> history_;
@@ -357,8 +286,6 @@ private:
 
   // ── ROS 인터페이스 ───────────────────────────────────────────────
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
-  rclcpp::Subscription<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
-    controller_state_sub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr is_grasping_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr force_pub_;
   rclcpp::Service<omx_interfaces::srv::CheckGrasp>::SharedPtr check_grasp_srv_;

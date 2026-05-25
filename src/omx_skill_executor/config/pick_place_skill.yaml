@@ -18,7 +18,7 @@ pick_place_server:
     # 접근 / 그립 Cartesian
     approach_frame_id: "world"
     hover_z: 0.15
-    grasp_z: 0.02
+    grasp_z: 0.035
     move_velocity_scale: 0.2
     hover_settle_sec: 0.5
 
@@ -31,7 +31,7 @@ pick_place_server:
     joint_states_topic: "/joint_states"
     yaw_min_corner_confidence: 0.30
     joint5_yaw_sign: 1.0          # 회전 방향이 반대면 -1.0 으로 (1회 캘리브레이션)
-    joint5_correction_max_rad: 0.52   # 하강 후 joint5 보정 허용 한계 (초과 시 중단) — 30°
+    joint5_correction_max_rad: 0.87   # grasp 위치에서 joint5 회전 허용 한계 (초과 시 중단) - 50°. wrap_to_pm45 출력 +/-45 deg 를 마진 포함해 커버.
     require_yaw: false            # true 면 yaw 산출 실패 시 skill 중단
 
     # 그리퍼
@@ -42,3 +42,9 @@ pick_place_server:
     # 액션 응답 타임아웃 (초)
     action_goal_timeout_sec: 5.0
     action_result_timeout_sec: 60.0
+
+    # grasp 검증 (scan 복귀 후 /gripper/check_grasp 호출)
+    max_grasp_retries: 2              # verify 실패 시 detect 부터 재시도 횟수
+    check_grasp_service_name: "/gripper/check_grasp"
+    check_grasp_timeout_sec: 2.0
+    grasp_settle_sec: 0.3             # scan 도달 후 force 안정화 대기

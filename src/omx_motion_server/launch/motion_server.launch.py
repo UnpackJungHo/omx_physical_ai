@@ -84,7 +84,7 @@ def generate_launch_description():
     )
 
     # ── grasp_detector ─────────────────────────────────────────────────
-    # Step 1: Dynamixel current 기반 grasp 판단 노드.
+    # Dynamixel current 기반 grasp 판단 노드 (force-only).
     # MoveGroupInterface 를 쓰지 않으므로 robot_description 등은 불필요.
     # 노드 이름은 executable 의 C++ 생성자에서 부여한다.
     grasp_detector_node = Node(
@@ -93,20 +93,18 @@ def generate_launch_description():
         output='screen',
         parameters=[
             {'use_sim_time': LaunchConfiguration('use_sim_time')},
-            # 실물 캘리브레이션 결과 (30mm 박스, Goal Current=400 unit):
-            #   빈 그리퍼 open/close: |current| < ~100 mA
-            #   박스 그립 시       : |current| ~ 1076 mA
-            # 안전 마진 두고 400 mA 로 설정. 값을 바꿀 때:
-            #   ros2 param set /grasp_detector current_thresh_ma <new>
+            # 실물 캘리브레이션 결과:
+            #   빈 그리퍼 close: force_estimate ≈ -100 mA 부근
+            #   박스 그립 시  : force_estimate ≈ -1150 mA
+            # signed 음수 임계값으로 close 방향 부하만 잡는다.
+            # 값을 바꿀 때:
+            #   ros2 param set /grasp_detector grasp_force_threshold_ma <new>
             {'gripper_joint': 'gripper_joint_1'},
             {'current_unit_to_ma': 2.69},
-            {'current_thresh_ma': 400.0},
-            {'position_error_thresh': 0.03},
-            {'velocity_thresh': 0.05},
+            {'grasp_force_threshold_ma': -1000.0},
             {'stable_window_ms': 150},
             {'state_stale_ms': 200},
             {'publish_rate_hz': 20.0},
-            {'controller_state_topic': '/gripper_controller/controller_state'},
         ],
     )
 

@@ -8,12 +8,16 @@
    끝까지 실패면 home 복귀 후 실패 반환.
 4. 탐지된 box 중 로봇 베이스에서 가장 가까운 box 선택.
 5. 선택 box 위 hover 로 이동 (MoveToPose, position only).
-6. yaw 정렬: TF 로 현재 그리퍼 yaw 조회 → joint5 회전 명령.
-   box 의 yaw_confidence 가 낮으면 생략.
-7. grasp_z 로 하강 → joint5 drift 검증 → 그리퍼 닫기 → 스캔 포즈 복귀.
-8. 저장한 cup 위치 위 (cup_z + drop_clearance) 로 이동 → 그리퍼 열기 (낙하).
-9. 스캔 포즈 복귀.
-10. home 복귀 → 그리퍼 닫기.
+6. grasp_z 로 하강 (MoveToPose, position only).
+7. grasp 위치에서 yaw 정렬: TF 로 현재 그리퍼 yaw 조회 → joint5 회전 명령.
+   box 의 yaw_confidence 가 낮으면 생략. 회전량이 한계를 넘으면 실패.
+8. 그리퍼 닫기 → 스캔 포즈 복귀.
+9. /gripper/check_grasp 서비스로 grasp 검증.
+   실패 시 그리퍼 열고 단계 3 부터 재진입 (최대 max_grasp_retries 회).
+   max_grasp_retries 까지 실패하면 home 복귀 후 실패 반환.
+10. 저장한 cup 위치 위 (cup_z + drop_clearance) 로 이동 → 그리퍼 열기 (낙하).
+11. 스캔 포즈 복귀.
+12. home 복귀 → 그리퍼 닫기.
 """
 
 from __future__ import annotations
@@ -45,7 +49,7 @@ from omx_interfaces.action import (
     PickPlace,
 )
 from omx_interfaces.msg import BlockPose
-from omx_interfaces.srv import GetBlockPoses
+from omx_interfaces.srv import CheckGrasp, GetBlockPoses
 
 from omx_skill_executor.pick_place_geometry import (
     jaw_axis_yaw_from_quaternion,
@@ -86,6 +90,10 @@ class SkillConfig:
     gripper_max_effort: float
     action_goal_timeout_sec: float
     action_result_timeout_sec: float
+    max_grasp_retries: int
+    check_grasp_service_name: str
+    check_grasp_timeout_sec: float
+    grasp_settle_sec: float
 
 
 class PickPlaceServer(Node):
@@ -113,6 +121,10 @@ class PickPlaceServer(Node):
         )
         self._blocks_cli = self.create_client(
             GetBlockPoses, self._config.world_poses_service_name,
+            callback_group=self._cb_group,
+        )
+        self._check_grasp_cli = self.create_client(
+            CheckGrasp, self._config.check_grasp_service_name,
             callback_group=self._cb_group,
         )
 
@@ -195,9 +207,19 @@ class PickPlaceServer(Node):
             action_result_timeout_sec=float(
                 p("action_result_timeout_sec", 60.0).value
             ),
+            max_grasp_retries=int(p("max_grasp_retries", 2).value),
+            check_grasp_service_name=str(
+                p("check_grasp_service_name", "/gripper/check_grasp").value
+            ),
+            check_grasp_timeout_sec=float(
+                p("check_grasp_timeout_sec", 2.0).value
+            ),
+            grasp_settle_sec=float(p("grasp_settle_sec", 0.3).value),
         )
         if config.sweep_step_deg <= 0.0:
             raise ValueError("sweep_step_deg must be positive")
+        if config.max_grasp_retries < 0:
+            raise ValueError("max_grasp_retries must be >= 0")
         return config
 
     # ────────────────────────────────────────────────────────────────
@@ -237,73 +259,142 @@ class PickPlaceServer(Node):
         if not self._send_gripper(self._config.gripper_open_position):
             return self._fail(goal_handle, result, "open gripper failed")
 
-        self._publish_phase(goal_handle, "detecting", "initial detection")
-        boxes, cup = self._detect_box_cup()
-        result.attempts = 1
+        # detect → approach → grasp → verify 의 한 attempt 를 max_grasp_retries+1
+        # 까지 반복한다. verify 실패만 다음 attempt 로 넘어가고, 그 외 motion
+        # 실패는 즉시 fail (재시도가 같은 실패를 반복할 가능성이 크다).
+        max_attempts = self._config.max_grasp_retries + 1
+        target_block: Optional[BlockPose] = None
+        cup: Optional[BlockPose] = None
 
-        if not (boxes and cup):
-            boxes, cup, result.attempts = self._sweep_for_box_cup(
-                goal_handle, result.attempts
-            )
-
-        if not (boxes and cup):
+        for grasp_attempt in range(1, max_attempts + 1):
             self._publish_phase(
-                goal_handle, "detecting", "box+cup not found, returning home"
+                goal_handle, "detecting",
+                f"grasp attempt {grasp_attempt}/{max_attempts}",
             )
-            self._move_to_named("home")
+
+            # 두 번째 이후 attempt 는 그리퍼 재-open + scan 자세 보장.
+            if grasp_attempt > 1:
+                if not self._send_gripper(self._config.gripper_open_position):
+                    return self._fail(goal_handle, result, "reopen gripper failed")
+                if not self._move_to_scan():
+                    return self._fail(
+                        goal_handle, result, "re-scan pose move failed"
+                    )
+
+            boxes, cup = self._detect_box_cup()
+            result.attempts += 1
+
+            if not (boxes and cup):
+                boxes, cup, result.attempts = self._sweep_for_box_cup(
+                    goal_handle, result.attempts
+                )
+
+            if not (boxes and cup):
+                self._publish_phase(
+                    goal_handle, "detecting", "box+cup not found, returning home"
+                )
+                self._move_to_named("home")
+                return self._fail(
+                    goal_handle, result,
+                    "box and cup not both detected after sweep"
+                )
+
+            target_block = self._select_closest_box(boxes)
+            if target_block is None:
+                return self._fail(goal_handle, result, "no valid box detected")
+
+            self.get_logger().info(
+                f"Selected box color='{target_block.color}' "
+                f"pos=({target_block.grasp_pose.pose.position.x:.3f}, "
+                f"{target_block.grasp_pose.pose.position.y:.3f}) "
+                f"conf={target_block.confidence:.2f} "
+                f"yaw_conf={target_block.yaw_confidence:.2f}"
+            )
+
+            # hover
+            self._publish_phase(
+                goal_handle, "approaching", "hover above target box"
+            )
+            hover_pose = self._build_pose(
+                target_block.grasp_pose, self._config.hover_z
+            )
+            if not self._send_move_to_pose(hover_pose):
+                return self._fail(goal_handle, result, "hover motion failed")
+            if self._config.hover_settle_sec > 0.0:
+                if not self._sleep_with_cancel(
+                    self._config.hover_settle_sec,
+                    "hover settle",
+                ):
+                    return self._fail(
+                        goal_handle, result, "hover settle canceled"
+                    )
+
+            # descent (yaw 정렬은 grasp 위치 도달 후에 수행한다)
+            self._publish_phase(
+                goal_handle, "approaching", "descending to grasp"
+            )
+            grasp_pose = self._build_pose(
+                target_block.grasp_pose, self._config.grasp_z
+            )
+            if not self._send_move_to_pose(grasp_pose):
+                return self._fail(goal_handle, result, "descent motion failed")
+
+            # grasp 위치에서 joint5 yaw 정렬
+            self._publish_phase(
+                goal_handle, "aligning", "aligning gripper yaw to box"
+            )
+            if not self._align_yaw_at_grasp(target_block):
+                return self._fail(goal_handle, result, "yaw alignment failed")
+
+            # close gripper
+            self._publish_phase(goal_handle, "grasping", "closing gripper")
+            if not self._send_gripper(self._config.gripper_closed_position):
+                return self._fail(goal_handle, result, "close gripper failed")
+
+            # 스캔 포즈 복귀
+            self._publish_phase(
+                goal_handle, "returning", "returning to scan pose"
+            )
+            if not self._move_to_scan():
+                return self._fail(
+                    goal_handle, result, "return to scan pose failed"
+                )
+
+            # grasp 검증 — scan 자세에서 /gripper/check_grasp 평가.
+            self._publish_phase(
+                goal_handle, "grasping",
+                f"verifying grasp ({grasp_attempt}/{max_attempts})",
+            )
+            verified, verify_detail = self._verify_grasp()
+            if verified:
+                self.get_logger().info(f"grasp verified: {verify_detail}")
+                break
+            self.get_logger().warn(
+                f"grasp verify failed "
+                f"({grasp_attempt}/{max_attempts}): {verify_detail}"
+            )
+            if self._canceled:
+                self._last_action_error = (
+                    f"grasp verify canceled: {verify_detail}"
+                )
+                return self._fail(goal_handle, result, "grasp verify canceled")
+            if grasp_attempt >= max_attempts:
+                self._last_action_error = verify_detail
+                self._move_to_named("home")
+                return self._fail(
+                    goal_handle, result,
+                    f"grasp not detected after {max_attempts} attempts"
+                )
+            # 다음 attempt 로
+        else:
+            # for-else: break 없이 루프 종료 = 모든 attempt 실패. 위의 cap
+            # 분기에서 이미 fail return 되므로 도달하지 않지만 방어적으로
+            # 처리한다.
             return self._fail(
-                goal_handle, result, "box and cup not both detected after sweep"
+                goal_handle, result, "grasp verify loop exited unexpectedly"
             )
 
-        # 가장 가까운 박스 선택
-        target_block = self._select_closest_box(boxes)
-        if target_block is None:
-            return self._fail(goal_handle, result, "no valid box detected")
-
-        self.get_logger().info(
-            f"Selected box color='{target_block.color}' "
-            f"pos=({target_block.grasp_pose.pose.position.x:.3f}, "
-            f"{target_block.grasp_pose.pose.position.y:.3f}) "
-            f"conf={target_block.confidence:.2f} "
-            f"yaw_conf={target_block.yaw_confidence:.2f}"
-        )
-
-        # hover
-        self._publish_phase(goal_handle, "approaching", "hover above target box")
-        hover_pose = self._build_pose(target_block.grasp_pose, self._config.hover_z)
-        if not self._send_move_to_pose(hover_pose):
-            return self._fail(goal_handle, result, "hover motion failed")
-        if self._config.hover_settle_sec > 0.0:
-            if not self._sleep_with_cancel(
-                self._config.hover_settle_sec,
-                "hover settle",
-            ):
-                return self._fail(goal_handle, result, "hover settle canceled")
-
-        # yaw 정렬
-        self._publish_phase(goal_handle, "aligning", "aligning gripper yaw to box")
-        if not self._align_yaw(target_block):
-            return self._fail(goal_handle, result, "yaw alignment failed")
-
-        # descent
-        self._publish_phase(goal_handle, "approaching", "descending to grasp")
-        grasp_pose = self._build_pose(target_block.grasp_pose, self._config.grasp_z)
-        if not self._send_move_to_pose(grasp_pose):
-            return self._fail(goal_handle, result, "descent motion failed")
-
-        # 하강 후 joint5 yaw 잔차 보정
-        if not self._realign_yaw_after_descent(target_block):
-            return self._fail(goal_handle, result, "joint5 yaw realignment failed")
-
-        # close gripper
-        self._publish_phase(goal_handle, "grasping", "closing gripper")
-        if not self._send_gripper(self._config.gripper_closed_position):
-            return self._fail(goal_handle, result, "close gripper failed")
-
-        # 스캔 포즈 복귀
-        self._publish_phase(goal_handle, "returning", "returning to scan pose")
-        if not self._move_to_scan():
-            return self._fail(goal_handle, result, "return to scan pose failed")
+        assert target_block is not None and cup is not None
 
         # cup 위로 이동
         self._publish_phase(goal_handle, "placing", "moving above cup")
@@ -385,6 +476,40 @@ class PickPlaceServer(Node):
             if boxes and cup:
                 return boxes, cup, attempts
         return [], None, attempts
+
+    def _verify_grasp(self) -> tuple[bool, str]:
+        """scan 자세에서 /gripper/check_grasp 로 grasp 여부를 확인한다.
+
+        반환: (성공 여부, 사유/현재값 요약 문자열).
+        cancel 이면 (False, "...canceled...") 로 반환하고 self._canceled 가
+        True 인지로 상위가 구분한다.
+        """
+        cfg = self._config
+        if cfg.grasp_settle_sec > 0.0:
+            if not self._sleep_with_cancel(cfg.grasp_settle_sec, "grasp settle"):
+                return False, "canceled during grasp settle"
+        if not self._wait_for_service(
+            self._check_grasp_cli,
+            cfg.check_grasp_timeout_sec,
+            cfg.check_grasp_service_name,
+        ):
+            if self._canceled:
+                return False, "canceled while waiting for check_grasp service"
+            return False, f"{cfg.check_grasp_service_name} unavailable"
+        future = self._check_grasp_cli.call_async(CheckGrasp.Request())
+        response = self._wait_future(
+            future, cfg.check_grasp_timeout_sec, "CheckGrasp"
+        )
+        if response is None:
+            if self._canceled:
+                return False, "CheckGrasp canceled"
+            return False, "CheckGrasp timed out"
+        summary = (
+            f"is_grasping={response.is_grasping} "
+            f"reason={response.reason} "
+            f"current={response.current_ma:.1f}mA"
+        )
+        return bool(response.is_grasping), summary
 
     def _detect_box_cup(self) -> tuple[list[BlockPose], Optional[BlockPose]]:
         blocks = self._detect_blocks()
@@ -470,11 +595,18 @@ class PickPlaceServer(Node):
             joints["joint4"], j5_target,
         ]
 
-    def _align_yaw(self, target_block: BlockPose) -> bool:
-        """hover 상태에서 box yaw 에 맞춰 joint5 를 회전한다.
+    def _align_yaw_at_grasp(self, target_block: BlockPose) -> bool:
+        """grasp 높이에 도달한 뒤 box yaw 에 맞춰 joint5 를 회전한다.
 
-        yaw_confidence 가 낮거나 joint/ TF 미가용 시: require_yaw 가 False 면
-        정렬을 생략하고 True 반환, True 면 실패 반환.
+        hover 단계에서는 정렬하지 않고 descent 후 한 번에 정렬한다. 이유:
+        하강은 position-only IK 라 hover 에서 미리 맞춰둔 joint5 가 틀어져
+        잔차 보정이 필요했는데, grasp 위치에서 단번에 정렬하면 그 두-단계
+        오차를 없앨 수 있다.
+
+        yaw_confidence 가 낮거나 joint/ TF 미가용 시: require_yaw 가 False
+        면 정렬을 생략하고 True 반환, True 면 실패 반환. 회전 명령량이
+        joint5_correction_max_rad 를 넘으면 grasp 높이에서의 박스 충돌
+        위험으로 보고 실패 처리한다.
         """
         cfg = self._config
 
@@ -492,48 +624,21 @@ class PickPlaceServer(Node):
                 f"< {cfg.yaw_min_corner_confidence:.2f}"
             )
 
-        plan = self._plan_joint5_alignment(target_block, "hover")
-        if plan is None:
-            return _skip_or_fail(self._last_action_error)
-        joints, j5_target = plan
-        return self._send_move_to_joints(
-            self._joint5_move_positions(joints, j5_target)
-        )
-
-    def _realign_yaw_after_descent(self, target_block: BlockPose) -> bool:
-        """grasp 높이에서 joint5 yaw 잔차를 보정한다.
-
-        하강은 position-only IK 라 정렬해 둔 joint5 가 틀어질 수 있다. 닫기
-        직전 grasp 자세에서 box yaw 와의 잔차를 다시 맞춘다. 보정량이 안전
-        한계를 넘으면(하강 IK 가 joint5 를 크게 틀어 큰 회전이 필요 → grasp
-        높이에서 박스 충돌 위험) 실패 처리한다.
-
-        hover 에서 정렬을 생략한 경우(yaw_confidence 부족)에는 보정도
-        생략한다.
-        """
-        cfg = self._config
-        if target_block.yaw_confidence < cfg.yaw_min_corner_confidence:
-            return True
-
         plan = self._plan_joint5_alignment(target_block, "grasp")
         if plan is None:
-            self.get_logger().warn(
-                f"joint5 realign skipped: {self._last_action_error}"
-            )
-            return True
+            return _skip_or_fail(self._last_action_error)
         joints, j5_target = plan
 
         correction = abs(j5_target - joints["joint5"])
         if correction > cfg.joint5_correction_max_rad:
             self._last_action_error = (
-                f"joint5 correction {math.degrees(correction):.1f}° exceeds "
-                f"limit {math.degrees(cfg.joint5_correction_max_rad):.1f}° "
-                "(descent IK drifted joint5 too far)"
+                f"joint5 rotation {math.degrees(correction):.1f}° exceeds "
+                f"limit {math.degrees(cfg.joint5_correction_max_rad):.1f}°"
             )
             self.get_logger().error(self._last_action_error)
             return False
 
-        # 잔차가 무시할 수준이면 불필요한 재계획/이동을 생략한다.
+        # 회전량이 무시할 수준이면 불필요한 재계획/이동을 생략한다.
         if correction < math.radians(1.0):
             return True
         return self._send_move_to_joints(
