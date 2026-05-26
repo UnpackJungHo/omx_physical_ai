@@ -53,7 +53,8 @@ from omx_interfaces.srv import CheckGrasp, GetBlockPoses
 
 from omx_skill_executor.pick_place_geometry import (
     jaw_axis_yaw_from_quaternion,
-    joint5_target,
+    wrap_to_pm45,
+    wrap_yaw_zero_pi_over_2,
     yaw_from_quaternion,
 )
 
@@ -70,20 +71,21 @@ class SkillConfig:
     sweep_positive_max_deg: float
     sweep_negative_min_deg: float
     detect_wait_after_motion_sec: float
-    get_block_poses_timeout_sec: float
+    service_call_timeout_sec: float
     world_poses_service_name: str
     approach_frame_id: str
     hover_z: float
     grasp_z: float
     move_velocity_scale: float
     hover_settle_sec: float
+    refine_at_hover: bool
+    refine_match_tolerance_m: float
     drop_clearance_m: float
     world_frame: str
     gripper_link: str
     joint_states_topic: str
     yaw_min_corner_confidence: float
     joint5_yaw_sign: float
-    joint5_correction_max_rad: float
     require_yaw: bool
     gripper_open_position: float
     gripper_closed_position: float
@@ -92,8 +94,11 @@ class SkillConfig:
     action_result_timeout_sec: float
     max_grasp_retries: int
     check_grasp_service_name: str
-    check_grasp_timeout_sec: float
     grasp_settle_sec: float
+    yaw_align_max_iterations: int
+    yaw_align_tolerance_rad: float
+    yaw_align_max_total_correction_rad: float
+    yaw_align_iter_settle_sec: float
 
 
 class PickPlaceServer(Node):
@@ -176,8 +181,8 @@ class PickPlaceServer(Node):
             detect_wait_after_motion_sec=float(
                 p("detect_wait_after_motion_sec", 0.8).value
             ),
-            get_block_poses_timeout_sec=float(
-                p("get_block_poses_timeout_sec", 2.0).value
+            service_call_timeout_sec=float(
+                p("service_call_timeout_sec", 15.0).value
             ),
             world_poses_service_name=str(
                 p("world_poses_service_name",
@@ -188,6 +193,10 @@ class PickPlaceServer(Node):
             grasp_z=float(p("grasp_z", 0.055).value),
             move_velocity_scale=float(p("move_velocity_scale", 0.2).value),
             hover_settle_sec=float(p("hover_settle_sec", 0.5).value),
+            refine_at_hover=bool(p("refine_at_hover", True).value),
+            refine_match_tolerance_m=float(
+                p("refine_match_tolerance_m", 0.05).value
+            ),
             drop_clearance_m=float(p("drop_clearance_m", 0.10).value),
             world_frame=str(p("world_frame", "world").value),
             gripper_link=str(p("gripper_link", "end_effector_link").value),
@@ -196,9 +205,6 @@ class PickPlaceServer(Node):
                 p("yaw_min_corner_confidence", 0.30).value
             ),
             joint5_yaw_sign=float(p("joint5_yaw_sign", 1.0).value),
-            joint5_correction_max_rad=float(
-                p("joint5_correction_max_rad", 0.2).value
-            ),
             require_yaw=bool(p("require_yaw", False).value),
             gripper_open_position=float(p("gripper_open_position", 1.0).value),
             gripper_closed_position=float(p("gripper_closed_position", 0.1).value),
@@ -211,15 +217,30 @@ class PickPlaceServer(Node):
             check_grasp_service_name=str(
                 p("check_grasp_service_name", "/gripper/check_grasp").value
             ),
-            check_grasp_timeout_sec=float(
-                p("check_grasp_timeout_sec", 2.0).value
-            ),
             grasp_settle_sec=float(p("grasp_settle_sec", 0.3).value),
+            yaw_align_max_iterations=int(
+                p("yaw_align_max_iterations", 4).value
+            ),
+            yaw_align_tolerance_rad=math.radians(float(
+                p("yaw_align_tolerance_deg", 0.5).value
+            )),
+            yaw_align_max_total_correction_rad=math.radians(float(
+                p("yaw_align_max_total_correction_deg", 60.0).value
+            )),
+            yaw_align_iter_settle_sec=float(
+                p("yaw_align_iter_settle_sec", 0.1).value
+            ),
         )
         if config.sweep_step_deg <= 0.0:
             raise ValueError("sweep_step_deg must be positive")
         if config.max_grasp_retries < 0:
             raise ValueError("max_grasp_retries must be >= 0")
+        if config.yaw_align_max_iterations < 1:
+            raise ValueError("yaw_align_max_iterations must be >= 1")
+        if config.yaw_align_tolerance_rad <= 0.0:
+            raise ValueError("yaw_align_tolerance_deg must be positive")
+        if config.yaw_align_max_total_correction_rad <= 0.0:
+            raise ValueError("yaw_align_max_total_correction_deg must be positive")
         return config
 
     # ────────────────────────────────────────────────────────────────
@@ -328,6 +349,16 @@ class PickPlaceServer(Node):
                     return self._fail(
                         goal_handle, result, "hover settle canceled"
                     )
+
+            # hover 자세(nadir) 에서 fresh 측정으로 target 의 yaw/위치를 갱신.
+            # 초기 scan 은 비스듬한 시점이라 yaw 오차가 큰데, 직하방에서 재측정해
+            # joint5 정렬 정확도를 끌어올린다. 매칭 실패 시 silent fallback.
+            if self._config.refine_at_hover:
+                self._publish_phase(
+                    goal_handle, "approaching",
+                    "re-measuring target at hover",
+                )
+                target_block = self._refine_target_at_hover(target_block)
 
             # descent (yaw 정렬은 grasp 위치 도달 후에 수행한다)
             self._publish_phase(
@@ -490,20 +521,13 @@ class PickPlaceServer(Node):
                 return False, "canceled during grasp settle"
         if not self._wait_for_service(
             self._check_grasp_cli,
-            cfg.check_grasp_timeout_sec,
             cfg.check_grasp_service_name,
         ):
-            if self._canceled:
-                return False, "canceled while waiting for check_grasp service"
-            return False, f"{cfg.check_grasp_service_name} unavailable"
+            return False, "canceled while waiting for check_grasp service"
         future = self._check_grasp_cli.call_async(CheckGrasp.Request())
-        response = self._wait_future(
-            future, cfg.check_grasp_timeout_sec, "CheckGrasp"
-        )
+        response = self._wait_future(future, "CheckGrasp")
         if response is None:
-            if self._canceled:
-                return False, "CheckGrasp canceled"
-            return False, "CheckGrasp timed out"
+            return False, "CheckGrasp canceled"
         summary = (
             f"is_grasping={response.is_grasping} "
             f"reason={response.reason} "
@@ -519,6 +543,12 @@ class PickPlaceServer(Node):
         return boxes, cup
 
     def _detect_blocks(self) -> list[BlockPose]:
+        """world_pose 서비스에서 detection 결과를 받아 BlockPose 리스트를 반환.
+
+        응답이 오면 비어 있든 채워져 있든 그 결과로 판정한다 (signal-based).
+        시간 timeout 없음. cancel 만 검사. 빈 리스트 = 이 자세에서 탐지 실패
+        → 호출부는 sweep 으로 진행.
+        """
         if not self._sleep_with_cancel(
             self._config.detect_wait_after_motion_sec,
             "detect settle",
@@ -526,22 +556,17 @@ class PickPlaceServer(Node):
             return []
         if not self._wait_for_service(
             self._blocks_cli,
-            self._config.get_block_poses_timeout_sec,
             self._config.world_poses_service_name,
         ):
             self.get_logger().warn(
-                f"{self._config.world_poses_service_name} service unavailable"
+                f"{self._config.world_poses_service_name} unavailable (canceled)"
             )
             return []
         request = GetBlockPoses.Request()
         future = self._blocks_cli.call_async(request)
-        response = self._wait_future(
-            future,
-            self._config.get_block_poses_timeout_sec,
-            "GetBlockPoses",
-        )
+        response = self._wait_future(future, "GetBlockPoses")
         if response is None:
-            self.get_logger().warn("GetBlockPoses timed out")
+            # cancel 만 가능한 경로
             return []
         return list(response.blocks)
 
@@ -557,36 +582,84 @@ class PickPlaceServer(Node):
             ),
         )
 
-    def _plan_joint5_alignment(
-        self, target_block: BlockPose, label: str
-    ) -> Optional[tuple[dict, float]]:
-        """현재 joints/TF 로 joint5 yaw 정렬 목표각을 계산한다.
+    def _refine_target_at_hover(
+        self, target_block: BlockPose,
+    ) -> BlockPose:
+        """hover 자세(nadir) 에서 fresh 측정으로 target 의 yaw 만 갱신한다.
 
-        실패 시 self._last_action_error 에 사유를 적고 None 을 반환한다.
-        성공 시 (joints, joint5_target_rad) 을 반환한다.
+        매칭 규칙: target 과 같은 color 의 block 중 XY 거리가 가장 가깝고
+        refine_match_tolerance_m 이내인 것을 채택. 측정 실패 / 매칭 실패 /
+        거리 초과 시 입력 target 을 그대로 반환 (silent fallback). 동작
+        보장이 깨지지 않도록 절대 실패하지 않는다.
+
+        주의: (x, y, z) 는 초기 scan 측정값을 유지하고 orientation 만 hover
+        측정값으로 덮어쓴다. hover→descent 사이의 옆이동을 방지하기 위함이며,
+        yaw 정확도 향상만이 목적이다. (x, y) 정밀화가 필요하면 별도 옵션으로
+        분리하는 게 깔끔하다.
         """
-        joints = self._latest_joint_positions()
-        if joints is None:
-            self._last_action_error = "joint states unavailable"
-            return None
+        fresh = self._detect_blocks()
+        if not fresh:
+            self.get_logger().warn(
+                "hover refine: no blocks detected, keeping initial yaw"
+            )
+            return target_block
 
-        jaw_yaw = self._lookup_jaw_yaw()
-        if jaw_yaw is None:
-            self._last_action_error = "gripper TF unavailable"
-            return None
+        candidates = [b for b in fresh if b.color == target_block.color]
+        if not candidates:
+            self.get_logger().warn(
+                f"hover refine: no '{target_block.color}' block in fresh "
+                f"measurement, keeping initial yaw"
+            )
+            return target_block
 
-        o = target_block.pose.pose.orientation
-        box_yaw = yaw_from_quaternion(o.x, o.y, o.z, o.w)
-        j5_cur = joints["joint5"]
-        j5_tgt = joint5_target(
-            j5_cur, box_yaw, jaw_yaw, self._config.joint5_yaw_sign
+        ox = target_block.pose.pose.position.x
+        oy = target_block.pose.pose.position.y
+        best = min(
+            candidates,
+            key=lambda b: (
+                (b.pose.pose.position.x - ox) ** 2
+                + (b.pose.pose.position.y - oy) ** 2
+            ),
         )
+        dx = best.pose.pose.position.x - ox
+        dy = best.pose.pose.position.y - oy
+        dist = math.hypot(dx, dy)
+        if dist > self._config.refine_match_tolerance_m:
+            self.get_logger().warn(
+                f"hover refine: closest '{target_block.color}' block "
+                f"{dist*1000:.0f}mm away (> {self._config.refine_match_tolerance_m*1000:.0f}mm), "
+                f"keeping initial yaw"
+            )
+            return target_block
+
+        # yaw 만 갱신: 초기 target 을 복제 후 orientation 과 yaw_confidence 만 교체.
+        # 위치(pose.position, grasp_pose.pose.position) 는 초기 scan 값을 유지해
+        # hover→descent 사이 옆이동을 방지한다.
+        o_old = target_block.pose.pose.orientation
+        o_new = best.pose.pose.orientation
+        yaw_old = yaw_from_quaternion(o_old.x, o_old.y, o_old.z, o_old.w)
+        yaw_new = yaw_from_quaternion(o_new.x, o_new.y, o_new.z, o_new.w)
         self.get_logger().info(
-            f"yaw align ({label}): box_yaw={math.degrees(box_yaw):.1f}° "
-            f"jaw_yaw={math.degrees(jaw_yaw):.1f}° "
-            f"joint5 {math.degrees(j5_cur):.1f}°→{math.degrees(j5_tgt):.1f}°"
+            f"hover refine (yaw only): "
+            f"yaw {math.degrees(yaw_old):.1f}°→{math.degrees(yaw_new):.1f}°, "
+            f"yaw_conf {target_block.yaw_confidence:.2f}→{best.yaw_confidence:.2f} "
+            f"(hover pos shift was {dist*1000:.1f}mm, not applied)"
         )
-        return joints, j5_tgt
+        refined = BlockPose()
+        refined.header = target_block.header
+        # pose: 위치 유지, orientation 만 hover 값으로 교체
+        refined.pose.header = target_block.pose.header
+        refined.pose.pose.position = target_block.pose.pose.position
+        refined.pose.pose.orientation = o_new
+        # grasp_pose: 위치 유지, orientation 만 교체 (joint5 정렬은 pose.orientation 사용
+        # 이지만 일관성 위해 같이 갱신)
+        refined.grasp_pose.header = target_block.grasp_pose.header
+        refined.grasp_pose.pose.position = target_block.grasp_pose.pose.position
+        refined.grasp_pose.pose.orientation = o_new
+        refined.color = target_block.color
+        refined.confidence = target_block.confidence
+        refined.yaw_confidence = best.yaw_confidence
+        return refined
 
     def _joint5_move_positions(self, joints: dict, j5_target: float) -> list[float]:
         """joints dict 에서 joint5 만 j5_target 으로 바꾼 arm 위치 리스트."""
@@ -596,17 +669,22 @@ class PickPlaceServer(Node):
         ]
 
     def _align_yaw_at_grasp(self, target_block: BlockPose) -> bool:
-        """grasp 높이에 도달한 뒤 box yaw 에 맞춰 joint5 를 회전한다.
+        """grasp 높이에서 box yaw 에 맞춰 joint5 를 closed-loop 로 정렬한다.
+
+        approach 축(end_effector +x)이 world z 와 평행할 때만 'joint5 Δθ →
+        world yaw Δθ' 가 1:1 이다. position-only IK 로 도달한 자세는 orientation
+        제약이 없어 approach 축이 기울어 있을 수 있고, 그 경우 단발 보정으로
+        world yaw 잔차가 cos(tilt) 배만큼 부족하게 줄어든다. 각 iteration 마다
+        TF 재조회 → 새 잔차 측정 → joint5 이동을 반복해 tolerance 이하까지
+        수렴시킨다 (보통 2~3 회).
 
         hover 단계에서는 정렬하지 않고 descent 후 한 번에 정렬한다. 이유:
         하강은 position-only IK 라 hover 에서 미리 맞춰둔 joint5 가 틀어져
-        잔차 보정이 필요했는데, grasp 위치에서 단번에 정렬하면 그 두-단계
-        오차를 없앨 수 있다.
+        잔차 보정이 필요했는데, grasp 위치에서 closed-loop 로 정렬하면 그
+        두-단계 오차를 없앨 수 있다.
 
-        yaw_confidence 가 낮거나 joint/ TF 미가용 시: require_yaw 가 False
-        면 정렬을 생략하고 True 반환, True 면 실패 반환. 회전 명령량이
-        joint5_correction_max_rad 를 넘으면 grasp 높이에서의 박스 충돌
-        위험으로 보고 실패 처리한다.
+        yaw_confidence 가 낮거나 joint/TF 미가용 / 누적 회전 cap 초과 시:
+        require_yaw 가 False 면 skip True, True 면 실패 반환.
         """
         cfg = self._config
 
@@ -624,25 +702,118 @@ class PickPlaceServer(Node):
                 f"< {cfg.yaw_min_corner_confidence:.2f}"
             )
 
-        plan = self._plan_joint5_alignment(target_block, "grasp")
-        if plan is None:
-            return _skip_or_fail(self._last_action_error)
-        joints, j5_target = plan
+        # box_yaw 는 target 고정. iteration 마다 jaw_yaw 만 다시 측정한다.
+        o = target_block.pose.pose.orientation
+        box_yaw = yaw_from_quaternion(o.x, o.y, o.z, o.w)
+        box_yaw_norm = wrap_yaw_zero_pi_over_2(box_yaw)
 
-        correction = abs(j5_target - joints["joint5"])
-        if correction > cfg.joint5_correction_max_rad:
-            self._last_action_error = (
-                f"joint5 rotation {math.degrees(correction):.1f}° exceeds "
-                f"limit {math.degrees(cfg.joint5_correction_max_rad):.1f}°"
+        initial_joint5: Optional[float] = None
+        last_delta_world: Optional[float] = None
+        last_logged_residual_rad: Optional[float] = None
+
+        for iteration in range(1, cfg.yaw_align_max_iterations + 1):
+            joints = self._latest_joint_positions()
+            if joints is None:
+                return _skip_or_fail("joint states unavailable")
+
+            jaw_yaw = self._lookup_jaw_yaw()
+            if jaw_yaw is None:
+                return _skip_or_fail("gripper TF unavailable")
+
+            tilt_deg = self._lookup_approach_tilt_deg()
+            tilt_str = f"{tilt_deg:.1f}°" if tilt_deg is not None else "n/a"
+
+            gripper_yaw_norm = wrap_yaw_zero_pi_over_2(jaw_yaw)
+            delta_world = wrap_to_pm45(box_yaw_norm - gripper_yaw_norm)
+            residual_rad = abs(delta_world)
+
+            j5_cur = joints["joint5"]
+            if initial_joint5 is None:
+                initial_joint5 = j5_cur
+
+            # 이전 iteration 대비 잔차 변화율(=실효 gain). 1:1 이면 |new/prev|≈0,
+            # tilt α 가 있으면 |new/prev|≈1-cos(α). 부호 뒤집힘은 wrap 경계 진동 신호.
+            gain_str = "n/a"
+            if last_delta_world is not None and abs(last_delta_world) > 1e-9:
+                gain = delta_world / last_delta_world
+                gain_str = f"{gain:+.3f}"
+
+            self.get_logger().info(
+                f"yaw align iter {iteration}/{cfg.yaw_align_max_iterations}: "
+                f"box_yaw={math.degrees(box_yaw):+.2f}° "
+                f"jaw_yaw={math.degrees(jaw_yaw):+.2f}° "
+                f"box_norm={math.degrees(box_yaw_norm):.2f}° "
+                f"jaw_norm={math.degrees(gripper_yaw_norm):.2f}° "
+                f"delta={math.degrees(delta_world):+.2f}° "
+                f"residual={math.degrees(residual_rad):.2f}° "
+                f"joint5_cur={math.degrees(j5_cur):+.2f}° "
+                f"approach_tilt={tilt_str} "
+                f"iter_gain={gain_str} "
+                f"total_corr={math.degrees(j5_cur - initial_joint5):+.2f}°"
             )
-            self.get_logger().error(self._last_action_error)
-            return False
+            last_logged_residual_rad = residual_rad
 
-        # 회전량이 무시할 수준이면 불필요한 재계획/이동을 생략한다.
-        if correction < math.radians(1.0):
-            return True
-        return self._send_move_to_joints(
-            self._joint5_move_positions(joints, j5_target)
+            if residual_rad <= cfg.yaw_align_tolerance_rad:
+                self.get_logger().info(
+                    f"yaw align CONVERGED in {iteration} iter: "
+                    f"residual {math.degrees(residual_rad):.2f}° "
+                    f"<= tol {math.degrees(cfg.yaw_align_tolerance_rad):.2f}° "
+                    f"(total_corr={math.degrees(j5_cur - initial_joint5):+.2f}°)"
+                )
+                return True
+
+            last_delta_world = delta_world
+
+            j5_tgt = j5_cur + cfg.joint5_yaw_sign * delta_world
+            projected_total = abs(j5_tgt - initial_joint5)
+            if projected_total > cfg.yaw_align_max_total_correction_rad:
+                msg = (
+                    f"iter {iteration}: projected total correction "
+                    f"{math.degrees(projected_total):.2f}° exceeds cap "
+                    f"{math.degrees(cfg.yaw_align_max_total_correction_rad):.2f}°"
+                )
+                return _skip_or_fail(msg)
+
+            self.get_logger().info(
+                f"yaw align iter {iteration}: cmd joint5 "
+                f"{math.degrees(j5_cur):+.2f}° → {math.degrees(j5_tgt):+.2f}° "
+                f"(Δ={math.degrees(j5_tgt - j5_cur):+.2f}°)"
+            )
+
+            if not self._send_move_to_joints(
+                self._joint5_move_positions(joints, j5_tgt)
+            ):
+                # _last_action_error 는 _send_move_to_joints 가 설정.
+                return False
+
+            if cfg.yaw_align_iter_settle_sec > 0.0:
+                if not self._sleep_with_cancel(
+                    cfg.yaw_align_iter_settle_sec,
+                    f"yaw align iter {iteration} settle",
+                ):
+                    return False
+
+        # 모든 iteration 소진. 마지막 잔차 한 번 더 측정해 로그만 남김.
+        final_jaw_yaw = self._lookup_jaw_yaw()
+        if final_jaw_yaw is not None:
+            final_residual = abs(wrap_to_pm45(
+                box_yaw_norm - wrap_yaw_zero_pi_over_2(final_jaw_yaw)
+            ))
+            self.get_logger().warn(
+                f"yaw align did NOT converge after "
+                f"{cfg.yaw_align_max_iterations} iter: "
+                f"final residual {math.degrees(final_residual):.2f}° "
+                f"(tol {math.degrees(cfg.yaw_align_tolerance_rad):.2f}°, "
+                f"last_pre_move_residual="
+                f"{math.degrees(last_logged_residual_rad):.2f}°)"
+            )
+        else:
+            self.get_logger().warn(
+                f"yaw align did NOT converge after "
+                f"{cfg.yaw_align_max_iterations} iter, final TF unavailable"
+            )
+        return _skip_or_fail(
+            f"did not converge after {cfg.yaw_align_max_iterations} iterations"
         )
 
     def _build_pose(self, reference: PoseStamped, z: float) -> PoseStamped:
@@ -695,6 +866,28 @@ class PickPlaceServer(Node):
         q = tf.transform.rotation
         return jaw_axis_yaw_from_quaternion(q.x, q.y, q.z, q.w)
 
+    def _lookup_approach_tilt_deg(self) -> Optional[float]:
+        """approach 축(end_effector +x)이 world -z(정 아래)에서 벗어난 각(deg).
+
+        0°=완벽 수직 아래, 90°=수평. joint5 회전이 world XY yaw 변화로
+        반영되는 비율은 약 cos(tilt) 라 closed-loop 수렴 속도의 진단 지표가 된다.
+        """
+        try:
+            tf = self._tf_buffer.lookup_transform(
+                self._config.world_frame,
+                self._config.gripper_link,
+                Time(),
+                timeout=Duration(seconds=0.5),
+            )
+        except TransformException as exc:
+            self.get_logger().debug(f"approach tilt TF lookup failed: {exc}")
+            return None
+        q = tf.transform.rotation
+        # R @ [1,0,0] 의 z 성분 = 2(qx·qz - qy·qw). 정 아래일 때 ax_z = -1.
+        ax_z = 2.0 * (q.x * q.z - q.y * q.w)
+        cos_tilt = max(-1.0, min(1.0, -ax_z))
+        return math.degrees(math.acos(cos_tilt))
+
     # ────────────────────────────────────────────────────────────────
     # Action client wrappers
     # ────────────────────────────────────────────────────────────────
@@ -741,7 +934,10 @@ class PickPlaceServer(Node):
             self.get_logger().error(self._last_action_error)
             return False
         send_future = client.send_goal_async(goal)
-        gh = self._wait_future(send_future, self._config.action_goal_timeout_sec, label)
+        gh = self._wait_future(
+            send_future, label,
+            timeout_sec=self._config.action_goal_timeout_sec,
+        )
         if gh is None:
             if not self._canceled:
                 self._last_action_error = f"{label}: send_goal timed out"
@@ -779,14 +975,24 @@ class PickPlaceServer(Node):
                 return False
         return False
 
-    def _wait_for_service(self, client, timeout_sec: float, label: str) -> bool:
-        deadline = time.monotonic() + max(0.0, timeout_sec)
+    def _wait_for_service(self, client, label: str) -> bool:
+        """service 가 ready 될 때까지 대기. service_call_timeout_sec 초과 시 False.
+
+        timeout 의 의미: "다음 단계로 넘어가는 signal" (예: sweep). cancel 도 검사.
+        무한 대기는 좋지 않다는 사용자 결정에 따라 합리적 상한선을 둔다.
+        """
+        deadline = time.monotonic() + max(0.0, self._config.service_call_timeout_sec)
         while rclpy.ok():
             if self._cancel_requested(label):
                 return False
             if client.wait_for_service(timeout_sec=0.05):
                 return True
             if time.monotonic() > deadline:
+                self.get_logger().warn(
+                    f"{label}: service wait timeout "
+                    f"(>{self._config.service_call_timeout_sec:.1f}s), "
+                    f"proceeding to next step"
+                )
                 return False
         return False
 
@@ -812,13 +1018,30 @@ class PickPlaceServer(Node):
             return None
         return future.result()
 
-    def _wait_future(self, future, timeout_sec: float, label: str = ""):
-        """외부 MultiThreadedExecutor 가 spin 중이라는 가정하에 폴링 대기."""
-        deadline = time.monotonic() + max(0.0, timeout_sec)
+    def _wait_future(
+        self, future, label: str = "", timeout_sec: Optional[float] = None,
+    ):
+        """future 응답을 기다린다. timeout 초과 또는 cancel 시 None.
+
+        timeout_sec=None 이면 service_call_timeout_sec 사용 (service 응답 대기 용도).
+        action 같이 별도 timeout 이 필요한 호출은 명시적으로 timeout_sec 전달.
+
+        timeout 의 의미는 "다음 단계로 넘어가는 signal", fail 이 아님. 응답이
+        오면 시간과 무관하게 즉시 그 결과로 판정.
+        """
+        effective_timeout = (
+            self._config.service_call_timeout_sec
+            if timeout_sec is None else timeout_sec
+        )
+        deadline = time.monotonic() + max(0.0, effective_timeout)
         while rclpy.ok() and not future.done():
             if label and self._cancel_requested(label):
                 return None
             if time.monotonic() > deadline:
+                self.get_logger().warn(
+                    f"{label}: response timeout "
+                    f"(>{effective_timeout:.1f}s), proceeding to next step"
+                )
                 return None
             time.sleep(0.02)
         if not future.done():

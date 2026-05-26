@@ -10,29 +10,48 @@ pick_place_server:
     sweep_positive_max_deg: 90.0
     sweep_negative_min_deg: -90.0
 
-    # 탐지 안정화 / 타임아웃
+    # 탐지 안정화 + 서비스 응답 상한.
+    # service_call_timeout_sec 은 fail 임계값이 아니라 "응답 못 받으면 빈 결과로
+    # 간주하고 다음 단계(sweep) 로 넘어가는 signal". 응답이 오면 시간과 무관하게
+    # 즉시 그 결과로 판정한다.
     detect_wait_after_motion_sec: 0.8
-    get_block_poses_timeout_sec: 5.0
+    service_call_timeout_sec: 15.0
     world_poses_service_name: "/perception/get_box_cup_world_poses"
 
     # 접근 / 그립 Cartesian
     approach_frame_id: "world"
     hover_z: 0.15
-    grasp_z: 0.035
+    grasp_z: 0.032
     move_velocity_scale: 0.2
     hover_settle_sec: 0.5
 
+    # hover 자세(=2차 scan pose, nadir 가정)에서 fresh 측정으로 target 의 yaw/위치
+    # 를 갱신한다. 초기 scan 은 비스듬한 시점이라 perspective foreshortening +
+    # plane_z prior 오차가 yaw 로 비대칭 증폭되는데, hover 에서 직하방 view 로
+    # 다시 측정하면 이 오차가 거의 사라진다. 매칭(같은 color + XY 최근접) 실패
+    # 또는 측정 실패 시 silent fallback 으로 초기 측정값을 그대로 유지한다.
+    refine_at_hover: true
+    refine_match_tolerance_m: 0.05    # hover 측정값과 초기 target 의 XY 거리 임계값 (m)
+
     # cup 낙하
-    drop_clearance_m: 0.03
+    drop_clearance_m: 0.028
 
     # yaw 정렬
     world_frame: "world"
     gripper_link: "end_effector_link"
     joint_states_topic: "/joint_states"
     yaw_min_corner_confidence: 0.30
-    joint5_yaw_sign: 1.0          # 회전 방향이 반대면 -1.0 으로 (1회 캘리브레이션)
-    joint5_correction_max_rad: 0.87   # grasp 위치에서 joint5 회전 허용 한계 (초과 시 중단) - 50°. wrap_to_pm45 출력 +/-45 deg 를 마진 포함해 커버.
+    joint5_yaw_sign: -1.0          # 회전 방향이 반대면 -1.0 으로 (1회 캘리브레이션)
     require_yaw: false            # true 면 yaw 산출 실패 시 skill 중단
+
+    # yaw closed-loop 정렬: TF 재조회 반복으로 approach 축 기울기 보정.
+    # joint5 회전이 world XY yaw 에 1:1 로 반영되지 않을 때(approach 축이 vertical 이
+    # 아닐 때) 1회 명령으로 부족한 잔차를 수렴까지 반복한다. tilt α 가 있으면
+    # 매 iteration 잔차가 |delta·cos(α)| 비율로 줄어들어 보통 2~3 회 안에 수렴.
+    yaw_align_max_iterations: 4              # 최대 반복 횟수
+    yaw_align_tolerance_deg: 0.5             # 잔차 ≤ tolerance 면 수렴 종료
+    yaw_align_max_total_correction_deg: 60.0 # 누적 joint5 회전 안전 cap
+    yaw_align_iter_settle_sec: 0.1           # 이동 후 joint state/TF 안정화 짧은 wait
 
     # 그리퍼
     gripper_open_position: 1.0
@@ -44,7 +63,7 @@ pick_place_server:
     action_result_timeout_sec: 60.0
 
     # grasp 검증 (scan 복귀 후 /gripper/check_grasp 호출)
+    # check_grasp 응답도 신호 기반 무한 대기.
     max_grasp_retries: 2              # verify 실패 시 detect 부터 재시도 횟수
     check_grasp_service_name: "/gripper/check_grasp"
-    check_grasp_timeout_sec: 2.0
     grasp_settle_sec: 0.3             # scan 도달 후 force 안정화 대기
