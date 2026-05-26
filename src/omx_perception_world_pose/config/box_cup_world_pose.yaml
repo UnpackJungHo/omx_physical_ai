@@ -6,9 +6,8 @@ box_cup_world_pose:
     target_frame: "world"
     camera_frame: "default_cam"
     # Ray-plane intersection: 각 detection 의 keypoint 4점이 world z = *_top_z_m
-    # 평면 위에 있다고 가정한다. 객체 모델 크기(이전 cube_size_m, cup_radius_m)에
-    # 의존하지 않는다. 박스 윗면 z (= 테이블 + 큐브 한 변), 컵 입구 z (= 컵 높이)
-    # 를 실측해서 채울 것.
+    # 평면 위에 있다고 가정한다. 객체 모델 크기에 의존하지 않는다. 박스 윗면 z
+    # (= 테이블 + 큐브 한 변), 컵 입구 z (= 컵 높이) 를 실측해서 채울 것.
     box_top_z_m: 0.030
     box_output_z_m: 0.015
     cup_top_z_m: 0.080
@@ -21,15 +20,20 @@ box_cup_world_pose:
     world_offset_x_m: 0.000
     world_offset_y_m: 0.015
     min_keypoint_confidence: 0.10
-    keypoints_timeout_sec: 2.0
+    # 키포인트 서비스 응답 상한. pick_place 의 service_call_timeout_sec(15.0)
+    # 보다 짧게 두어 client 가 먼저 끊기지 않도록 한다. timeout 시 client 에
+    # nullopt(=빈 BlockPose[]) 응답을 보내 client 가 sweep 으로 넘어가게 한다.
+    keypoints_timeout_sec: 12.0
     tf_lookup_timeout_sec: 0.5
     keypoint_order: [0, 1, 2, 3]
-    # multi-frame fusion: 같은 자세에서 N회 인퍼런스 후 cluster median.
-    # num_samples 회 keypoint 서비스를 sample_interval_sec 간격으로 호출하고,
+    # multi-frame fusion: 같은 자세에서 N개의 서로 다른 image frame 으로 추론한 결과를
+    # cluster median 으로 융합. 키포인트 노드가 새 frame 도착 신호 기반으로 N회
+    # inference 후 한 응답에 담아 보내므로, 본 노드 측에는 시간 sleep 이 없다.
     # 같은 color + XY 거리 < cluster_match_tolerance_m 인 detection 을 한 cluster 로
     # 묶어 axis-wise median(position) / circular median(yaw) 로 융합한다.
-    # min_valid_samples 미만이 모인 cluster 는 폐기한다.
-    num_samples: 3
-    sample_interval_sec: 0.05
+    # min_valid_samples 는 (1) 키포인트 서버의 "부분 성공" 임계값 및 (2) cluster 별
+    # 최소 sample 수, 양쪽으로 사용된다. server 가 N개 다 못 모아도 ≥ min_valid 면
+    # success=true 로 부분 응답한다.
+    num_samples: 5
     min_valid_samples: 2
     cluster_match_tolerance_m: 0.03

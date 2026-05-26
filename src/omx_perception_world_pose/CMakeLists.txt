@@ -7,13 +7,11 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
-find_package(tf2_geometry_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
-find_package(sensor_msgs REQUIRED)
-find_package(std_msgs REQUIRED)
+find_package(builtin_interfaces REQUIRED)
 find_package(omx_interfaces REQUIRED)
-find_package(cv_bridge REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
@@ -30,13 +28,11 @@ target_compile_features(box_cup_world_pose_node PUBLIC cxx_std_17)
 
 ament_target_dependencies(box_cup_world_pose_node
   rclcpp
+  tf2
   tf2_ros
-  tf2_geometry_msgs
   geometry_msgs
-  sensor_msgs
-  std_msgs
+  builtin_interfaces
   omx_interfaces
-  cv_bridge
 )
 
 target_link_libraries(box_cup_world_pose_node

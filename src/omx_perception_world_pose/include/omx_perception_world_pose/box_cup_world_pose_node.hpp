@@ -1,11 +1,13 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
-#include "geometry_msgs/msg/pose_stamped.hpp"
-#include "omx_interfaces/msg/block_pose.hpp"
+#include "builtin_interfaces/msg/time.hpp"
+#include "geometry_msgs/msg/transform_stamped.hpp"
 #include "omx_interfaces/msg/keypoint_detection.hpp"
 #include "omx_interfaces/srv/get_block_poses.hpp"
 #include "omx_interfaces/srv/get_keypoint_detections.hpp"
@@ -13,7 +15,6 @@
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
 
-#include <opencv2/calib3d.hpp>
 #include <opencv2/core.hpp>
 
 namespace omx_perception_world_pose
@@ -21,8 +22,8 @@ namespace omx_perception_world_pose
 
 struct CameraIntrinsics
 {
-  cv::Mat K;  // 3x3 camera matrix
-  cv::Mat D;  // distortion coefficients
+  cv::Mat K;  // 카메라 내부 파라미터 행렬(3 x 3)
+  cv::Mat D;  // 랜즈 왜곡 계수
 };
 
 class BoxCupWorldPoseNode : public rclcpp::Node
@@ -36,7 +37,7 @@ private:
     std::shared_ptr<omx_interfaces::srv::GetBlockPoses::Response> response);
 
   std::optional<omx_interfaces::srv::GetKeypointDetections::Response>
-  call_keypoint_service(bool publish_debug);
+  call_keypoint_service(int num_samples, int min_valid_samples, bool publish_debug);
 
   std::optional<geometry_msgs::msg::TransformStamped>
   lookup_transform(const builtin_interfaces::msg::Time & stamp);
@@ -81,7 +82,6 @@ private:
   double tf_lookup_timeout_sec_;
   std::vector<int64_t> keypoint_order_;
   int num_samples_;
-  double sample_interval_sec_;
   int min_valid_samples_;
   double cluster_match_tolerance_m_;
 

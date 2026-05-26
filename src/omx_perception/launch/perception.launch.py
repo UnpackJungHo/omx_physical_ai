@@ -70,6 +70,9 @@ def generate_launch_description():
                 "publish_debug": ParameterValue(
                     LaunchConfiguration("box_cup_publish_debug"), value_type=bool
                 ),
+                "frame_wait_timeout_sec": ParameterValue(
+                    LaunchConfiguration("box_cup_frame_wait_timeout_sec"), value_type=float
+                ),
             }
         ],
     )
@@ -111,12 +114,12 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "box_cup_model_path",
-            default_value="runs/pose/box_cup_pose_2class_v2/weights/best.pt",
+            default_value="runs/pose/box_cup_pose_2class_v2/weights/best.pt", # Yolo 모델 경로
             description="YOLOv8-Pose best.pt for box/cup keypoint detection.",
         ),
         DeclareLaunchArgument(
             "box_cup_output_dir",
-            default_value="tmp_kjh/box_cup_pose_image",
+            default_value="tmp_kjh/box_cup_pose_image", # 스냅샷 저장 경로
             description="Directory where p-key YOLO snapshot images are saved.",
         ),
         DeclareLaunchArgument(
@@ -138,6 +141,11 @@ def generate_launch_description():
             "box_cup_publish_debug",
             default_value="false",
             description="Publish annotated debug image to /perception/debug_image.",
+        ),
+        DeclareLaunchArgument(
+            "box_cup_frame_wait_timeout_sec",
+            default_value="2.0",
+            description="Per-sample timeout while waiting for a new image frame.",
         ),
         OpaqueFunction(function=_launch_camera),
         yolo_keypoint,

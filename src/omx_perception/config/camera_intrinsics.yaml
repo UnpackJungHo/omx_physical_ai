@@ -1,6 +1,13 @@
 image_width: 640
 image_height: 480
 camera_name: default_cam
+# 카메라 내부 파라미터
+# [ fx  0  cx
+#   fy  0  cy  
+#    0  0   1 ]
+# fx, fy: 초점거리
+# cx, cy: 이미지 중심점
+# 3D 좌표를 이미지 픽셀 좌표로 투영할 때 사용
 camera_matrix:
   rows: 3
   cols: 3
@@ -8,6 +15,7 @@ camera_matrix:
            0.0,      665.4206,  223.25648,
            0.0,        0.0,       1.0]
 distortion_model: plumb_bob
+# distortion_coefficients = 랜즈 왜곡 계수. 
 distortion_coefficients:
   rows: 1
   cols: 5

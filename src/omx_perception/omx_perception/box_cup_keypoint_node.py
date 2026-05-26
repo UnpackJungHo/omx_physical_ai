@@ -15,7 +15,7 @@ import numpy as np
 import rclpy
 from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
-from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 from rclpy.time import Time as RclpyTime
@@ -24,7 +24,7 @@ import tf2_ros
 
 import math
 
-from omx_interfaces.msg import KeypointDetection
+from omx_interfaces.msg import KeypointDetection, KeypointSample
 from omx_interfaces.srv import GetBlockPoses, GetKeypointDetections
 
 
@@ -61,17 +61,32 @@ class BoxCupKeypointNode(Node):
         self.declare_parameter("camera_frame", "default_cam")
         self.declare_parameter("camera_info_topic", "/camera/info")
         self.declare_parameter("tf_lookup_timeout_sec", 0.5)
+        # GetKeypointDetections 처리 시 새 image frame 도착을 기다리는 단위 timeout.
+        # 시간 sleep 이 아니라 condition signal 의 fallback 상한값이다 (카메라 hang
+        # 같은 비정상 상황에서만 영향). 정상이면 fps 주기에 맞춰 즉시 wake.
+        self.declare_parameter("frame_wait_timeout_sec", 2.0)
 
         self._bridge = CvBridge()
-        self._lock = threading.Lock()
+        # Condition 은 RLock 위에 wait/notify 를 얹는다. `with self._lock:` 구문은
+        # 기존 그대로 동작하며, 신규 _on_image 시 notify_all() 로 대기중인 서비스
+        # 핸들러를 즉시 깨운다 (시간 sleep 회피).
+        self._lock = threading.Condition()
         self._latest_frame: np.ndarray | None = None
         self._latest_stamp = None
+        # _on_image 가 새 frame 을 받을 때마다 증가하는 monotonic counter.
+        # 서비스 핸들러가 N 개의 서로 다른 frame 을 가져갈 때 동일 frame 중복
+        # 사용을 막는 trigger 로 쓴다.
+        self._frame_counter = 0
         self._stop_event = threading.Event()
         self._keyboard_thread: threading.Thread | None = None
+        self._model_lock = threading.Lock()
 
         self._target_frame = str(self.get_parameter("target_frame").value)
         self._camera_frame = str(self.get_parameter("camera_frame").value)
         self._tf_lookup_timeout_sec = float(self.get_parameter("tf_lookup_timeout_sec").value)
+        self._frame_wait_timeout_sec = float(
+            self.get_parameter("frame_wait_timeout_sec").value
+        )
 
         # CameraInfo 가 도착하면 K, D 를 채워 둔다. snapshot 시 cv2.projectPoints 에 사용.
         self._cam_K: np.ndarray | None = None
@@ -106,18 +121,19 @@ class BoxCupKeypointNode(Node):
         if self._publish_debug:
             self._debug_pub = self.create_publisher(Image, "/perception/debug_image", 1)
 
-        cb_group = ReentrantCallbackGroup()
+        self._service_cb_group = MutuallyExclusiveCallbackGroup()
+        self._client_cb_group = ReentrantCallbackGroup()
         self._srv = self.create_service(
             GetKeypointDetections,
             "/perception/get_box_cup_keypoints",
             self._handle_get_keypoints,
-            callback_group=cb_group,
+            callback_group=self._service_cb_group,
         )
 
         self._world_pose_client = self.create_client(
             GetBlockPoses,
             "/perception/get_box_cup_world_poses",
-            callback_group=cb_group,
+            callback_group=self._client_cb_group,
         )
 
         # snapshot 라벨을 정확한 detection 위에 그리려면 block 의 world 좌표를
@@ -186,6 +202,10 @@ class BoxCupKeypointNode(Node):
         with self._lock:
             self._latest_frame = frame.copy()
             self._latest_stamp = msg.header.stamp
+            self._frame_counter += 1
+            # GetKeypointDetections 핸들러가 새 frame 도착을 기다리고 있다면
+            # 즉시 깨워서 sample 추론을 진행하게 한다.
+            self._lock.notify_all()
 
     def _on_camera_info(self, msg: CameraInfo) -> None:
         # K (3x3), D (k1..k5) 캐싱. usb_cam 은 항상 동일 intrinsics 를 publish 하므로
@@ -201,17 +221,68 @@ class BoxCupKeypointNode(Node):
         request: GetKeypointDetections.Request,
         response: GetKeypointDetections.Response,
     ) -> GetKeypointDetections.Response:
+        num_samples = max(1, int(request.num_samples))
+        min_valid_samples = int(request.min_valid_samples)
+        min_valid_samples = max(1, min(num_samples, min_valid_samples))
+
         with self._lock:
-            frame = None if self._latest_frame is None else self._latest_frame.copy()
-            stamp = self._latest_stamp
+            last_seen_counter = self._frame_counter
 
-        if frame is None:
-            response.success = False
-            response.message = "no image frame received yet"
-            return response
+        last_frame: np.ndarray | None = None
+        last_stamp = None
+        last_raw_detections: list[dict[str, Any]] = []
 
-        try:
-            result = self._model.predict(
+        for _ in range(num_samples):
+            frame_data = self._wait_for_next_frame(last_seen_counter)
+            if frame_data is None:
+                break
+
+            frame, stamp, last_seen_counter = frame_data
+            try:
+                result = self._predict_frame(frame)
+            except Exception as exc:  # noqa: BLE001
+                response.success = False
+                response.message = f"YOLO inference error: {exc}"
+                return response
+
+            raw_detections = self._extract_detections(result)
+            sample = KeypointSample()
+            if stamp is not None:
+                sample.stamp = stamp
+            sample.detections = self._to_keypoint_detection_msgs(raw_detections)
+            response.samples.append(sample)
+
+            last_frame = frame
+            last_stamp = stamp
+            last_raw_detections = raw_detections
+
+        response.header.frame_id = self._camera_frame
+        if last_stamp is not None:
+            response.header.stamp = last_stamp
+
+        if request.publish_debug and last_frame is not None:
+            self._publish_debug_image(last_frame, last_stamp, last_raw_detections)
+
+        collected = len(response.samples)
+        response.success = collected >= min_valid_samples
+        if response.success:
+            if collected < num_samples:
+                response.message = (
+                    f"collected {collected}/{num_samples} sample(s); "
+                    f"min_valid_samples={min_valid_samples}"
+                )
+            else:
+                response.message = ""
+        else:
+            response.message = (
+                f"collected {collected}/{num_samples} sample(s), "
+                f"below min_valid_samples={min_valid_samples}"
+            )
+        return response
+
+    def _predict_frame(self, frame: np.ndarray):
+        with self._model_lock:
+            return self._model.predict(
                 source=frame,
                 imgsz=self._imgsz,
                 conf=self._conf,
@@ -219,18 +290,26 @@ class BoxCupKeypointNode(Node):
                 device=self._device,
                 verbose=False,
             )[0]
-        except Exception as exc:  # noqa: BLE001
-            response.success = False
-            response.message = f"YOLO inference error: {exc}"
-            return response
 
-        raw_detections = self._extract_detections(result)
+    def _wait_for_next_frame(
+        self,
+        last_seen_counter: int,
+    ) -> tuple[np.ndarray, Any, int] | None:
+        with self._lock:
+            got_frame = self._lock.wait_for(
+                lambda: self._frame_counter > last_seen_counter or self._stop_event.is_set(),
+                timeout=self._frame_wait_timeout_sec,
+            )
+            if not got_frame or self._latest_frame is None:
+                return None
 
-        if stamp is not None:
-            from builtin_interfaces.msg import Time
-            response.header.stamp = stamp
-        response.header.frame_id = "default_cam"
+            return self._latest_frame.copy(), self._latest_stamp, self._frame_counter
 
+    def _to_keypoint_detection_msgs(
+        self,
+        raw_detections: list[dict[str, Any]],
+    ) -> list[KeypointDetection]:
+        detections: list[KeypointDetection] = []
         for det in raw_detections:
             kd = KeypointDetection()
             kd.class_id = int(det["class_id"])
@@ -240,30 +319,32 @@ class BoxCupKeypointNode(Node):
             kd.color_confidence = 0.0
             flat: list[float] = []
             for kp_x, kp_y, kp_conf in det["keypoints"]:
-                flat.extend([kp_x, kp_y, kp_conf])
+                flat.extend([float(kp_x), float(kp_y), float(kp_conf)])
             kd.keypoints = flat
-            response.detections.append(kd)
+            detections.append(kd)
+        return detections
 
-        if request.publish_debug:
-            annotated = frame.copy()
-            self._draw_detections(annotated, raw_detections)
-            if self._debug_pub is not None:
-                try:
-                    img_msg = self._bridge.cv2_to_imgmsg(annotated, encoding="bgr8")
-                    if stamp is not None:
-                        img_msg.header.stamp = stamp
-                    img_msg.header.frame_id = "default_cam"
-                    self._debug_pub.publish(img_msg)
-                except CvBridgeError as exc:
-                    self.get_logger().warning(f"failed to publish debug image: {exc}")
-            else:
-                self.get_logger().warning(
-                    "publish_debug requested but publish_debug param is false; no publisher created"
-                )
-
-        response.success = True
-        response.message = ""
-        return response
+    def _publish_debug_image(
+        self,
+        frame: np.ndarray,
+        stamp: Any,
+        raw_detections: list[dict[str, Any]],
+    ) -> None:
+        annotated = frame.copy()
+        self._draw_detections(annotated, raw_detections)
+        if self._debug_pub is not None:
+            try:
+                img_msg = self._bridge.cv2_to_imgmsg(annotated, encoding="bgr8")
+                if stamp is not None:
+                    img_msg.header.stamp = stamp
+                img_msg.header.frame_id = self._camera_frame
+                self._debug_pub.publish(img_msg)
+            except CvBridgeError as exc:
+                self.get_logger().warning(f"failed to publish debug image: {exc}")
+        else:
+            self.get_logger().warning(
+                "publish_debug requested but publish_debug param is false; no publisher created"
+            )
 
     def _start_keyboard_listener(self) -> None:
         self._keyboard_thread = threading.Thread(target=self._keyboard_loop, daemon=True)
@@ -297,14 +378,7 @@ class BoxCupKeypointNode(Node):
             self.get_logger().warning("cannot save YOLO snapshot: no /image/raw frame received yet")
             return
 
-        result = self._model.predict(
-            source=frame,
-            imgsz=self._imgsz,
-            conf=self._conf,
-            max_det=self._max_det,
-            device=self._device,
-            verbose=False,
-        )[0]
+        result = self._predict_frame(frame)
         detections = self._extract_detections(result)
         annotated = frame.copy()
         self._draw_detections(annotated, detections)

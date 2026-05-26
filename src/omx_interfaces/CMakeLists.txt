@@ -21,6 +21,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/PickPlace.action"
   "msg/BlockPose.msg"
   "msg/KeypointDetection.msg"
+  "msg/KeypointSample.msg"
   "srv/GetBlockPoses.srv"
   "srv/GetKeypointDetections.srv"
   "srv/CheckGrasp.srv"
