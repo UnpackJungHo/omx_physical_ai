@@ -101,7 +101,7 @@ def generate_launch_description():
             #   ros2 param set /grasp_detector grasp_force_threshold_ma <new>
             {'gripper_joint': 'gripper_joint_1'},
             {'current_unit_to_ma': 2.69},
-            {'grasp_force_threshold_ma': -1000.0},
+            {'grasp_force_threshold_ma': -500.0},
             {'stable_window_ms': 150},
             {'state_stale_ms': 200},
             {'publish_rate_hz': 20.0},

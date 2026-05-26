@@ -6,7 +6,7 @@
 //
 // 판단 로직 (force-only, stable_window_ms 안정화)
 //   force_estimate = effort × current_unit_to_ma_ (signed mA)
-//   force_estimate < grasp_force_threshold_ma  (예: < -1000 mA)
+//   force_estimate < grasp_force_threshold_ma  (예: < -500 mA)
 //   이 조건이 stable_window_ms 동안 연속 만족하면 is_grasping = true.
 //
 //   signed 음수 임계값을 쓰는 이유: 클로즈 방향으로 작용하는 dynamixel current
@@ -58,7 +58,7 @@ public:
     gripper_joint_ = declare_parameter<std::string>("gripper_joint", "gripper_joint_1");
     current_unit_to_ma_ = declare_parameter<double>("current_unit_to_ma", 2.69);
     grasp_force_threshold_ma_ =
-      declare_parameter<double>("grasp_force_threshold_ma", -1000.0);
+      declare_parameter<double>("grasp_force_threshold_ma", -500.0);
     stable_window_ms_ = declare_parameter<int>("stable_window_ms", 150);
     state_stale_ms_ = declare_parameter<int>("state_stale_ms", 200);
     publish_rate_hz_ = declare_parameter<double>("publish_rate_hz", 20.0);
