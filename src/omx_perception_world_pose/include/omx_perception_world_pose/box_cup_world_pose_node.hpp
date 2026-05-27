@@ -52,6 +52,14 @@ private:
     bool has_yaw;
     float detection_confidence;
     float yaw_confidence;
+    // cup 일 때만 채움: 4 모서리의 world (x, y) (keypoint_order_ 순서 그대로).
+    // box 는 빈 벡터 유지. skill 측 cup-내부 박스 판정에 사용.
+    std::vector<cv::Point2d> corners_world;
+    // box detection 일 때만 의미 있음: 같은 sample 안의 cup detection 의 image
+    // keypoint polygon 에 box image center 가 들어갔는지. 카메라 광선이 컵
+    // prism 을 통과하면 박스의 실제 z 와 무관하게 "컵 위/안" 으로 분류된다.
+    // cup detection 자체이거나 같은 sample 에 cup 이 없으면 false.
+    bool in_cup_image_polygon = false;
   };
 
   std::optional<DetectionSample> process_detection(
@@ -84,6 +92,10 @@ private:
   int num_samples_;
   int min_valid_samples_;
   double cluster_match_tolerance_m_;
+  // box cluster 의 in_cup_image_polygon vote 비율이 이 임계값 이상이면 응답에서
+  // 제외한다. 0.0 이면 image-space 필터 비활성. 1.0 이면 모든 sample 에서 컵
+  // image polygon 안이어야 제외.
+  double cup_image_polygon_vote_threshold_;
 
   CameraIntrinsics intrinsics_;
 

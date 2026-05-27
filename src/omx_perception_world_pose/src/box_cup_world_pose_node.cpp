@@ -172,6 +172,57 @@ double median_sorted(std::vector<double> values)
 // mean) 대신 sin/cos 각각의 median 을 따로 취한 뒤 atan2 로 합쳐, 한두 개의
 // outlier (예: YOLO keypoint 가 한 frame 에서 크게 튄 경우) 에도 흔들리지
 // 않는 robust 한 대표값을 얻는다. wrap-around (예: 0° vs 89.9°) 도 자연스럽게 처리.
+// [기능] image 픽셀 평면에서 점이 polygon 내부인지 ray casting 으로 판정.
+// poly 가 3 점 미만이면 false. 시계/반시계 무관.
+bool point_in_polygon_image(
+  const cv::Point2f & p, const std::vector<cv::Point2f> & poly)
+{
+  const int n = static_cast<int>(poly.size());
+  if (n < 3) {return false;}
+  bool inside = false;
+  int j = n - 1;
+  for (int i = 0; i < n; ++i) {
+    const float xi = poly[i].x, yi = poly[i].y;
+    const float xj = poly[j].x, yj = poly[j].y;
+    if ((yi > p.y) != (yj > p.y)) {
+      const float denom = yj - yi;
+      if (std::abs(denom) >= 1e-9f) {
+        const float x_intersect = (xj - xi) * (p.y - yi) / denom + xi;
+        if (p.x < x_intersect) {inside = !inside;}
+      }
+    }
+    j = i;
+  }
+  return inside;
+}
+
+// [기능] keypoint flat array 에서 keypoint_order 순서로 4 점 (image (u,v)) 을 뽑는다.
+// keypoints flat layout: [k0_x, k0_y, k0_conf, k1_x, k1_y, k1_conf, ...]
+// keypoints 가 12개 미만이면 빈 벡터 반환.
+std::vector<cv::Point2f> extract_keypoint_image_polygon(
+  const omx_interfaces::msg::KeypointDetection & det,
+  const std::vector<int64_t> & keypoint_order)
+{
+  std::vector<cv::Point2f> out;
+  if (det.keypoints.size() < 12 || keypoint_order.size() < 4) {return out;}
+  out.reserve(4);
+  for (size_t ki = 0; ki < 4; ++ki) {
+    const size_t base = static_cast<size_t>(keypoint_order[ki]) * 3;
+    if (base + 1 >= det.keypoints.size()) {return {};}
+    out.emplace_back(det.keypoints[base], det.keypoints[base + 1]);
+  }
+  return out;
+}
+
+// [기능] 4 개 image keypoint 의 산술 평균 (image 평면 중심).
+cv::Point2f image_polygon_centroid(const std::vector<cv::Point2f> & pts)
+{
+  cv::Point2f s(0.f, 0.f);
+  for (const auto & p : pts) {s += p;}
+  const float n = static_cast<float>(pts.size());
+  return cv::Point2f(s.x / n, s.y / n);
+}
+
 double circular_median_yaw_normalized(const std::vector<double> & yaws)
 {
   if (yaws.empty()) {return 0.0;}              // 표본 없으면 0 반환 (호출부에서 has_yaw=false 와 함께 사용)
@@ -217,6 +268,11 @@ BoxCupWorldPoseNode::BoxCupWorldPoseNode(const rclcpp::NodeOptions & options)
   declare_parameter("num_samples", 3);
   declare_parameter("min_valid_samples", 2);
   declare_parameter("cluster_match_tolerance_m", 0.03);
+  // image-space cup polygon filter: 같은 sample 의 cup keypoint 4 점이 만드는
+  // image polygon 에 box image center 가 들어가면 그 sample 의 box detection 을
+  // "컵 위/안" 으로 vote. cluster 의 vote 비율이 이 임계값 이상이면 응답에서
+  // 박스를 제외 (적층된 컵 안 박스 잡으러 가는 사고 방지). 0.0 비활성.
+  declare_parameter("cup_image_polygon_vote_threshold", 0.5);
 
   keypoints_service_name_ = get_parameter("keypoints_service_name").as_string();
   world_service_name_ = get_parameter("world_service_name").as_string();
@@ -235,6 +291,14 @@ BoxCupWorldPoseNode::BoxCupWorldPoseNode(const rclcpp::NodeOptions & options)
   num_samples_ = static_cast<int>(get_parameter("num_samples").as_int());
   min_valid_samples_ = static_cast<int>(get_parameter("min_valid_samples").as_int());
   cluster_match_tolerance_m_ = get_parameter("cluster_match_tolerance_m").as_double();
+  cup_image_polygon_vote_threshold_ =
+    get_parameter("cup_image_polygon_vote_threshold").as_double();
+  if (cup_image_polygon_vote_threshold_ < 0.0 ||
+      cup_image_polygon_vote_threshold_ > 1.0)
+  {
+    throw std::runtime_error(
+      "cup_image_polygon_vote_threshold must be in [0.0, 1.0]");
+  }
   if (num_samples_ < 1) {
     throw std::runtime_error("num_samples must be >= 1");
   }
@@ -302,6 +366,14 @@ void BoxCupWorldPoseNode::handle_get_block_poses(
     double ref_x;                              // cluster 기준점 x (첫 sample 값, 거리비교 anchor)
     double ref_y;                              // cluster 기준점 y
     builtin_interfaces::msg::Time latest_stamp;// 이 cluster 에 마지막으로 추가된 sample 의 시각
+    // cup cluster 만 채움. corners_xs[k], corners_ys[k] 는 모든 sample 의 k 번째
+    // corner world (x, y) 누적. 4 corner 가 keypoint_order_ 동일 순서로 정렬되어
+    // 있어 k 별 median 으로 융합해도 의미가 보존된다.
+    std::vector<std::vector<double>> corners_xs;
+    std::vector<std::vector<double>> corners_ys;
+    // box cluster 만 누적: 이 cluster 에 join 한 sample 중 cup image polygon
+    // 안이었던 sample 수. xs.size() 대비 비율로 적층 여부 판정.
+    int in_cup_votes = 0;
   };
 
   std::vector<Cluster> clusters;               // 이번 호출 동안 동적으로 자라는 cluster 모음
@@ -338,10 +410,52 @@ void BoxCupWorldPoseNode::handle_get_block_poses(
     any_stamp_set = true;                                                       // 최소 1회 성공 표시
     ++successful_samples;                                                       // keypoint+TF 동시 성공 카운트
 
+    // 이 sample 의 cup image polygon (있을 때만). box 의 image-space 적층 검사에 사용.
+    // 첫 번째로 만난 conf 통과 cup detection 의 4 keypoint 를 polygon 으로 사용.
+    // cup keypoint conf 가 낮거나 cup 이 없으면 polygon 은 빈 채로 둠 → 검사 skip.
+    std::vector<cv::Point2f> cup_image_polygon;
+    for (const auto & det : sample.detections) {
+      if (det.class_id != omx_interfaces::msg::KeypointDetection::CLASS_CUP) {
+        continue;
+      }
+      auto poly = extract_keypoint_image_polygon(det, keypoint_order_);
+      if (poly.empty()) {continue;}
+      // cup keypoint min conf 가 임계값 이하면 사용하지 않음 (잘못된 polygon 으로
+      // 정상 박스를 적층으로 오인식 방지).
+      double min_kp_conf = 1.0;
+      for (size_t ki = 0; ki < 4; ++ki) {
+        const size_t base = static_cast<size_t>(keypoint_order_[ki]) * 3;
+        min_kp_conf = std::min(min_kp_conf, static_cast<double>(det.keypoints[base + 2]));
+      }
+      if (min_kp_conf >= min_keypoint_confidence_) {
+        cup_image_polygon = std::move(poly);
+        break;
+      }
+    }
+
     for (const auto & det : sample.detections) {                                // 이 sample 의 모든 detection 순회 (다중 객체)
       auto sample_opt = process_detection(det, tf_stamped);                     // ray-plane intersection 으로 (x,y,[yaw]) 산출
       if (!sample_opt.has_value()) {continue;}                                  // conf 미달 / 광선 수평 / 카메라 뒤 등 → drop
-      const auto & s = sample_opt.value();                                      // 유효 DetectionSample (color,x,y,yaw_world,has_yaw,confs)
+      auto & s = sample_opt.value();                                            // 유효 DetectionSample (color,x,y,yaw_world,has_yaw,confs)
+
+      // image-space cup polygon 검사: box detection 의 image center 가 cup
+      // polygon 안이면 카메라 광선이 컵 위/안을 통과 → 적층 박스 후보로 마킹.
+      // cup detection 자체나 cup polygon 부재 시 skip.
+      if (s.class_id == omx_interfaces::msg::KeypointDetection::CLASS_BOX &&
+          !cup_image_polygon.empty())
+      {
+        auto box_poly = extract_keypoint_image_polygon(det, keypoint_order_);
+        if (!box_poly.empty()) {
+          const cv::Point2f box_center = image_polygon_centroid(box_poly);
+          if (point_in_polygon_image(box_center, cup_image_polygon)) {
+            s.in_cup_image_polygon = true;
+            RCLCPP_DEBUG(get_logger(),
+              "sample %zu: box color='%s' image center (%.1f, %.1f) inside "
+              "cup image polygon → in_cup vote",
+              sample_idx, s.color.c_str(), box_center.x, box_center.y);
+          }
+        }
+      }
 
       // 같은 color + XY 거리 < tolerance 인 가장 가까운 cluster 에 join.
       int best_idx = -1;                                                        // 매칭된 cluster 인덱스 (없으면 -1)
@@ -374,6 +488,15 @@ void BoxCupWorldPoseNode::handle_get_block_poses(
         if (s.has_yaw) {
           c.yaws_norm.push_back(wrap_yaw_zero_pi_over_2(s.yaw_world));          // 박스만 yaw 누적, [0,π/2) 로 정규화 후
         }
+        if (!s.corners_world.empty()) {                                         // cup sample 의 corner 누적 시작
+          c.corners_xs.assign(s.corners_world.size(), {});
+          c.corners_ys.assign(s.corners_world.size(), {});
+          for (size_t k = 0; k < s.corners_world.size(); ++k) {
+            c.corners_xs[k].push_back(s.corners_world[k].x);
+            c.corners_ys[k].push_back(s.corners_world[k].y);
+          }
+        }
+        if (s.in_cup_image_polygon) {c.in_cup_votes = 1;}                       // 첫 sample 에서부터 적층 vote
         clusters.push_back(std::move(c));                                       // cluster 모음에 추가 (move 로 복사 회피)
       } else {                                                                  // 기존 cluster 에 합치는 경로
         auto & c = clusters[best_idx];                                          // best cluster 참조 (수정 위해 reference)
@@ -384,6 +507,15 @@ void BoxCupWorldPoseNode::handle_get_block_poses(
         if (s.has_yaw) {
           c.yaws_norm.push_back(wrap_yaw_zero_pi_over_2(s.yaw_world));          // 박스 yaw 추가 누적
         }
+        if (!s.corners_world.empty() &&
+            s.corners_world.size() == c.corners_xs.size())                      // corner 개수 일치할 때만 누적
+        {
+          for (size_t k = 0; k < s.corners_world.size(); ++k) {
+            c.corners_xs[k].push_back(s.corners_world[k].x);
+            c.corners_ys[k].push_back(s.corners_world[k].y);
+          }
+        }
+        if (s.in_cup_image_polygon) {++c.in_cup_votes;}                         // 적층 vote 누적
         c.latest_stamp = tf_stamped.header.stamp;                               // 가장 최근 관측 시각으로 갱신
       }
     }
@@ -403,6 +535,25 @@ void BoxCupWorldPoseNode::handle_get_block_poses(
         "cluster color=%s dropped: %zu < min_valid_samples=%d",
         clusters[ci].color.c_str(), clusters[ci].xs.size(), min_valid_samples_);
       continue;
+    }
+    // image-space cup polygon 필터: box cluster 의 sample 중 일정 비율 이상이
+    // cup image polygon 안이면 적층된 컵 안 박스로 보고 응답에서 제외한다.
+    // world-z 가정에 무관하므로 cup 안에 적층되어 z 가 높아진 박스의 XY shift
+    // 로 인한 오탈출(컵 polygon 바깥으로 보임 → 잡으러 감)을 방지한다.
+    if (clusters[ci].class_id == omx_interfaces::msg::KeypointDetection::CLASS_BOX &&
+        cup_image_polygon_vote_threshold_ > 0.0)
+    {
+      const double n_samples = static_cast<double>(clusters[ci].xs.size());
+      const double ratio = static_cast<double>(clusters[ci].in_cup_votes) /
+        std::max(1.0, n_samples);
+      if (ratio >= cup_image_polygon_vote_threshold_) {
+        RCLCPP_INFO(get_logger(),
+          "cluster color=%s dropped: in_cup image-polygon vote %d/%zu = %.2f "
+          ">= threshold %.2f (likely stacked inside cup)",
+          clusters[ci].color.c_str(), clusters[ci].in_cup_votes,
+          clusters[ci].xs.size(), ratio, cup_image_polygon_vote_threshold_);
+        continue;
+      }
     }
     float conf_median = static_cast<float>(median_sorted(                       // detection conf 의 median 계산
       std::vector<double>(clusters[ci].det_confs.begin(),                       // float→double 변환 위한 임시 vector
@@ -447,6 +598,22 @@ void BoxCupWorldPoseNode::handle_get_block_poses(
     }
     block.confidence = conf_median;                                             // detection conf 의 median 을 종합 신뢰도로
     block.grasp_pose = block.pose;                                              // 별도 grasp 보정 없이 pose 와 동일 (필요시 추후 분리)
+
+    // cup polygon 채움. box 는 빈 채로 둠.
+    if (!c.corners_xs.empty()) {
+      block.polygon.reserve(c.corners_xs.size());
+      for (size_t k = 0; k < c.corners_xs.size(); ++k) {
+        if (c.corners_xs[k].empty()) {continue;}                                // sample 없는 corner 는 skip
+        geometry_msgs::msg::Point pt;
+        pt.x = median_sorted(c.corners_xs[k]);                                  // corner-별 X median (robust)
+        pt.y = median_sorted(c.corners_ys[k]);                                  // corner-별 Y median
+        pt.z = block.pose.pose.position.z;                                      // cup 입구 z 와 동일하게 채움 (사용 안 함)
+        block.polygon.push_back(pt);
+      }
+      if (block.polygon.size() < 3) {                                           // 3 점 미만이면 polygon 의미 없음
+        block.polygon.clear();
+      }
+    }
 
     response->blocks.push_back(block);                                          // 최종 응답에 추가
   }
@@ -602,6 +769,13 @@ BoxCupWorldPoseNode::process_detection(
     sample.yaw_world = 0.0;
     sample.yaw_confidence = 0.0f;
     sample.color = "cup";
+    // cup 4 모서리(world XY) 보존. world_offset_*_m 을 동일하게 더해
+    // centroid 와 일관된 frame 으로 맞춤. skill 측 polygon-inside 판정에 사용.
+    sample.corners_world.reserve(world_pts.size());
+    for (const auto & p : world_pts) {
+      sample.corners_world.emplace_back(
+        p.x + world_offset_x_m_, p.y + world_offset_y_m_);
+    }
   }
 
   return sample;

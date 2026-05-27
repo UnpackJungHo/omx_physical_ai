@@ -37,3 +37,9 @@ box_cup_world_pose:
     num_samples: 5
     min_valid_samples: 2
     cluster_match_tolerance_m: 0.03
+    # image-space cup polygon 필터: 박스 cluster 의 sample 중 이 비율 이상이
+    # cup keypoint 4 점이 만드는 image polygon 안에 박스 image center 가 들어가면
+    # 적층된 "컵 안 박스" 로 보고 응답에서 제외. 카메라 광선이 컵 prism 을 통과
+    # 하면 박스의 실제 z 와 무관하게 잡힌다 (적층되어 z 가 0.03 가정에서 벗어나
+    # XY 가 옆으로 밀린 박스를 안전하게 거른다). 0.0 이면 필터 비활성.
+    cup_image_polygon_vote_threshold: 0.5
