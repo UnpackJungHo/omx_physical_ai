@@ -194,9 +194,9 @@ public:
     //   - workspace_guard : Planning Scene 의 floor / ceiling 충돌 평면 (trajectory 보간 단계)
     // 아래 default 는 yaml 미주입 시의 fallback 이며, 실제 운용 값은 yaml 에서 관리한다.
     if (!has_parameter("workspace.x_abs_max"))
-      declare_parameter<double>("workspace.x_abs_max", 0.28);
+      declare_parameter<double>("workspace.x_abs_max", 0.3);
     if (!has_parameter("workspace.y_abs_max"))
-      declare_parameter<double>("workspace.y_abs_max", 0.28);
+      declare_parameter<double>("workspace.y_abs_max", 0.3);
     if (!has_parameter("workspace.z_min"))
       declare_parameter<double>("workspace.z_min", 0.0);
     if (!has_parameter("workspace.z_max"))

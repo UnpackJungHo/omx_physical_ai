@@ -16,8 +16,8 @@
   ros__parameters:
     workspace:
       # motion_server: 사전 거부 한계 (world frame 기준)
-      x_abs_max: 0.28
-      y_abs_max: 0.28
+      x_abs_max: 0.30
+      y_abs_max: 0.30
       z_min: 0.0
       z_max: 0.45
       frame: world
