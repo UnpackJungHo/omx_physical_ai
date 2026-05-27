@@ -4,8 +4,10 @@ from __future__ import annotations
 import math
 
 from omx_skill_executor.pick_place_geometry import (
+    is_box_in_cup,
     jaw_axis_yaw_from_quaternion,
     joint5_target,
+    point_in_polygon_xy,
     wrap_to_pm45,
     wrap_yaw_zero_pi_over_2,
     yaw_from_quaternion,
@@ -151,3 +153,51 @@ def test_jaw_axis_yaw_well_defined_when_gripper_points_down():
             math.radians(90.0) - phi,
             abs_tol=1e-6,
         )
+
+
+# ---------- point_in_polygon_xy / is_box_in_cup ----------
+
+# 0.1 m × 0.1 m 정사각형 cup, 중심 (0.3, 0.0). 모서리 시계 순서 무관.
+_CUP_SQUARE = [
+    (0.25, -0.05),
+    (0.35, -0.05),
+    (0.35, 0.05),
+    (0.25, 0.05),
+]
+
+
+def test_point_in_polygon_center_inside():
+    assert point_in_polygon_xy(0.30, 0.00, _CUP_SQUARE) is True
+
+
+def test_point_in_polygon_outside_x():
+    assert point_in_polygon_xy(0.50, 0.00, _CUP_SQUARE) is False
+
+
+def test_point_in_polygon_outside_y():
+    assert point_in_polygon_xy(0.30, 0.10, _CUP_SQUARE) is False
+
+
+def test_point_in_polygon_returns_false_for_degenerate():
+    assert point_in_polygon_xy(0.30, 0.00, []) is False
+    assert point_in_polygon_xy(0.30, 0.00, [(0.0, 0.0), (1.0, 1.0)]) is False
+
+
+def test_is_box_in_cup_inside():
+    assert is_box_in_cup((0.30, 0.00), _CUP_SQUARE) is True
+
+
+def test_is_box_in_cup_outside():
+    assert is_box_in_cup((0.40, 0.00), _CUP_SQUARE) is False
+
+
+def test_is_box_in_cup_empty_polygon_returns_false():
+    # cup polygon 미가용 시 보수적으로 '바깥' 판정. (잡으러 가도록)
+    assert is_box_in_cup((0.30, 0.00), []) is False
+
+
+def test_point_in_polygon_rotated_square():
+    # 45° 회전한 사각형(다이아몬드): 꼭짓점 4 개.
+    diamond = [(0.30, -0.07), (0.37, 0.00), (0.30, 0.07), (0.23, 0.00)]
+    assert point_in_polygon_xy(0.30, 0.00, diamond) is True
+    assert point_in_polygon_xy(0.36, 0.05, diamond) is False

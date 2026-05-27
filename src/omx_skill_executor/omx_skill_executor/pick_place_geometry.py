@@ -66,6 +66,52 @@ def wrap_to_pm45(angle_rad: float) -> float:
     return wrapped
 
 
+def point_in_polygon_xy(
+    px: float,
+    py: float,
+    polygon_xy: list[tuple[float, float]],
+) -> bool:
+    """XY 평면에서 점 (px, py) 가 polygon 내부인지 판정 (ray casting).
+
+    polygon_xy 는 시계/반시계 어느 방향이든 무방하다. 경계 위 점은
+    구현 안정성에 의존하지만 '안' 으로 간주한다. 3점 미만이면 항상 False.
+    """
+    n = len(polygon_xy)
+    if n < 3:
+        return False
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = polygon_xy[i]
+        xj, yj = polygon_xy[j]
+        # ray = +X 방향 무한선과 edge (i,j) 의 교차 여부.
+        # 경계와의 교차 처리는 horizontal edge 를 skip 하기 위해
+        # (yi > py) != (yj > py) 사용.
+        if ((yi > py) != (yj > py)):
+            denom = (yj - yi)
+            if abs(denom) < 1e-12:
+                j = i
+                continue
+            x_intersect = (xj - xi) * (py - yi) / denom + xi
+            if px < x_intersect:
+                inside = not inside
+        j = i
+    return inside
+
+
+def is_box_in_cup(
+    box_xy: tuple[float, float],
+    cup_polygon_xy: list[tuple[float, float]],
+) -> bool:
+    """박스 중심 XY 가 cup polygon (4 corners, world XY) 내부에 있는지.
+
+    cup_polygon_xy 가 비어 있거나 3점 미만이면 False (보수적으로 '바깥' 으로
+    판정해 박스를 잡으러 가도록 둔다). cup 4 점 순서는 perception 의
+    keypoint_order 를 그대로 따르며, 사각형이면 ray casting 으로 충분하다.
+    """
+    return point_in_polygon_xy(box_xy[0], box_xy[1], cup_polygon_xy)
+
+
 def joint5_target(
     joint5_current: float,
     box_yaw: float,

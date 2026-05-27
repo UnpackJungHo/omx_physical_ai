@@ -37,6 +37,8 @@ setup(
     entry_points={
         "console_scripts": [
             "pick_place_server = omx_skill_executor.pick_place_server:main",
+            "pick_place_all_server = "
+            "omx_skill_executor.pick_place_all_server:main",
         ],
     },
 )

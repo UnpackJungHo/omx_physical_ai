@@ -1,0 +1,99 @@
+# pick_place / pick_place_all 두 서버가 동일한 worker 파라미터 스키마를
+# 공유한다. 노드명만 다르고 값은 동일하게 두며, 필요 시 서버별로 일부만
+# override 한다 (ROS2 parameter 적용 시 가장 구체적인 노드명 항목이 우선).
+
+pick_place_server:
+  ros__parameters:
+    scan_joint_positions_deg: [0.0, -65.0, 0.0, 90.0, 0.0]
+    arm_joint_names: ["joint1", "joint2", "joint3", "joint4", "joint5"]
+
+    sweep_joint_index: 0
+    sweep_step_deg: 10.0
+    sweep_positive_max_deg: 90.0
+    sweep_negative_min_deg: -90.0
+
+    detect_wait_after_motion_sec: 0.8
+    service_call_timeout_sec: 15.0
+    world_poses_service_name: "/perception/get_box_cup_world_poses"
+
+    approach_frame_id: "world"
+    hover_z: 0.15
+    grasp_z: 0.032
+    move_velocity_scale: 0.2
+    hover_settle_sec: 0.5
+
+    refine_at_hover: true
+    refine_match_tolerance_m: 0.05
+
+    drop_clearance_m: 0.028
+
+    world_frame: "world"
+    gripper_link: "end_effector_link"
+    joint_states_topic: "/joint_states"
+    yaw_min_corner_confidence: 0.30
+    joint5_yaw_sign: -1.0
+    require_yaw: false
+
+    yaw_align_max_iterations: 4
+    yaw_align_tolerance_deg: 0.5
+    yaw_align_max_total_correction_deg: 60.0
+    yaw_align_iter_settle_sec: 0.1
+
+    gripper_open_position: 1.0
+    gripper_closed_position: 0.1
+    gripper_max_effort: 0.0
+
+    action_goal_timeout_sec: 5.0
+    action_result_timeout_sec: 60.0
+
+    max_grasp_retries: 2
+    check_grasp_service_name: "/gripper/check_grasp"
+    grasp_settle_sec: 0.3
+
+pick_place_all_server:
+  ros__parameters:
+    scan_joint_positions_deg: [0.0, -65.0, 0.0, 90.0, 0.0]
+    arm_joint_names: ["joint1", "joint2", "joint3", "joint4", "joint5"]
+
+    sweep_joint_index: 0
+    sweep_step_deg: 10.0
+    sweep_positive_max_deg: 90.0
+    sweep_negative_min_deg: -90.0
+
+    detect_wait_after_motion_sec: 0.8
+    service_call_timeout_sec: 15.0
+    world_poses_service_name: "/perception/get_box_cup_world_poses"
+
+    approach_frame_id: "world"
+    hover_z: 0.15
+    grasp_z: 0.032
+    move_velocity_scale: 0.2
+    hover_settle_sec: 0.5
+
+    refine_at_hover: true
+    refine_match_tolerance_m: 0.05
+
+    drop_clearance_m: 0.028
+
+    world_frame: "world"
+    gripper_link: "end_effector_link"
+    joint_states_topic: "/joint_states"
+    yaw_min_corner_confidence: 0.30
+    joint5_yaw_sign: -1.0
+    require_yaw: false
+
+    yaw_align_max_iterations: 4
+    yaw_align_tolerance_deg: 0.5
+    yaw_align_max_total_correction_deg: 60.0
+    yaw_align_iter_settle_sec: 0.1
+
+    gripper_open_position: 1.0
+    gripper_closed_position: 0.1
+    gripper_max_effort: 0.0
+
+    action_goal_timeout_sec: 5.0
+    action_result_timeout_sec: 60.0
+
+    max_grasp_retries: 2
+    check_grasp_service_name: "/gripper/check_grasp"
+    grasp_settle_sec: 0.3
