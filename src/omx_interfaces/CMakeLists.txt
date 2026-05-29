@@ -20,6 +20,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/AlignGripperYaw.action"
   "action/PickPlace.action"
   "action/PickPlaceAll.action"
+  "action/ExecuteCommand.action"
   "msg/BlockPose.msg"
   "msg/KeypointDetection.msg"
   "msg/KeypointSample.msg"
