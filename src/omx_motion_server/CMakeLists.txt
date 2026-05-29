@@ -15,6 +15,8 @@ find_package(control_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
 
 # miniconda libcurl/libssl 충돌 방지: 시스템 curl/ssl 명시 링크
 find_library(SYSTEM_CURL curl HINTS /usr/lib/x86_64-linux-gnu NO_DEFAULT_PATH)
@@ -37,7 +39,10 @@ ament_target_dependencies(motion_server
   moveit_ros_planning_interface
   geometry_msgs
   control_msgs
-  trajectory_msgs)
+  trajectory_msgs
+  sensor_msgs
+  tf2
+  tf2_ros)
 
 # 시스템 curl/ssl 명시 링크 (miniconda 라이브러리 오염 방지)
 if(SYSTEM_CURL)

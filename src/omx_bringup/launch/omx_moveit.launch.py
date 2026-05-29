@@ -126,11 +126,17 @@ def generate_launch_description():
     )
 
     # workspace_guard 노드
-    # Planning Scene에 충돌 오브젝트 추가 (floor, 작업 영역 경계)
+    # Planning Scene 에 floor / ceiling 충돌 평면 등록.
+    # workspace.yaml 은 motion_server 와 공유하는 단일 설정 소스이다.
+    workspace_yaml = os.path.join(
+        get_package_share_directory('omx_bringup'),
+        'config', 'omx_f', 'workspace.yaml',
+    )
     workspace_guard_node = Node(
         package='omx_bringup',
         executable='workspace_guard',
         output='screen',
+        parameters=[workspace_yaml],
     )
 
     return LaunchDescription(

@@ -1,0 +1,45 @@
+box_cup_world_pose:
+  ros__parameters:
+    camera_intrinsics_path: ""
+    keypoints_service_name: "/perception/get_box_cup_keypoints"
+    world_service_name: "/perception/get_box_cup_world_poses"
+    target_frame: "world"
+    camera_frame: "default_cam"
+    # Ray-plane intersection: 각 detection 의 keypoint 4점이 world z = *_top_z_m
+    # 평면 위에 있다고 가정한다. 객체 모델 크기에 의존하지 않는다. 박스 윗면 z
+    # (= 테이블 + 큐브 한 변), 컵 입구 z (= 컵 높이) 를 실측해서 채울 것.
+    box_top_z_m: 0.030
+    box_output_z_m: 0.015
+    cup_top_z_m: 0.080
+    cup_output_z_m: 0.080
+    # eye-in-hand 카메라(link5 마운트) 의 URDF rpy 추정 오차로 생기는 systematic
+    # XY bias 보정. 측정 방법: 같은 scan pose 에서 박스를 여러 위치에 놓고
+    # perception (x,y) - EE-touched (x,y) 의 평균이 (dx, dy) 라면 여기에 (-dx, -dy)
+    # 를 넣는다. scan pose 가 바뀌면 재교정 필요. 근본 해결은 URDF camera_mount
+    # rpy/xyz 미세조정 또는 hand-eye calibration.
+    world_offset_x_m: 0.000
+    world_offset_y_m: 0.015
+    min_keypoint_confidence: 0.10
+    # 키포인트 서비스 응답 상한. pick_place 의 service_call_timeout_sec(15.0)
+    # 보다 짧게 두어 client 가 먼저 끊기지 않도록 한다. timeout 시 client 에
+    # nullopt(=빈 BlockPose[]) 응답을 보내 client 가 sweep 으로 넘어가게 한다.
+    keypoints_timeout_sec: 12.0
+    tf_lookup_timeout_sec: 0.5
+    keypoint_order: [0, 1, 2, 3]
+    # multi-frame fusion: 같은 자세에서 N개의 서로 다른 image frame 으로 추론한 결과를
+    # cluster median 으로 융합. 키포인트 노드가 새 frame 도착 신호 기반으로 N회
+    # inference 후 한 응답에 담아 보내므로, 본 노드 측에는 시간 sleep 이 없다.
+    # 같은 color + XY 거리 < cluster_match_tolerance_m 인 detection 을 한 cluster 로
+    # 묶어 axis-wise median(position) / circular median(yaw) 로 융합한다.
+    # min_valid_samples 는 (1) 키포인트 서버의 "부분 성공" 임계값 및 (2) cluster 별
+    # 최소 sample 수, 양쪽으로 사용된다. server 가 N개 다 못 모아도 ≥ min_valid 면
+    # success=true 로 부분 응답한다.
+    num_samples: 5
+    min_valid_samples: 2
+    cluster_match_tolerance_m: 0.03
+    # image-space cup polygon 필터: 박스 cluster 의 sample 중 이 비율 이상이
+    # cup keypoint 4 점이 만드는 image polygon 안에 박스 image center 가 들어가면
+    # 적층된 "컵 안 박스" 로 보고 응답에서 제외. 카메라 광선이 컵 prism 을 통과
+    # 하면 박스의 실제 z 와 무관하게 잡힌다 (적층되어 z 가 0.03 가정에서 벗어나
+    # XY 가 옆으로 밀린 박스를 안전하게 거른다). 0.0 이면 필터 비활성.
+    cup_image_polygon_vote_threshold: 0.5

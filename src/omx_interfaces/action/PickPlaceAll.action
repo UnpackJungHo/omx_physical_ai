@@ -1,0 +1,18 @@
+# Goal
+# 한 호출에서 진행할 최대 iter 수. attempt cap (성공+실패 합) — 무한 루프 방지용.
+# 0 또는 음수는 default 10 으로 clamp; 양수는 1~10 범위로 clamp.
+int32 max_boxes
+bool retry_on_fail
+---
+# Result
+bool success
+string message
+int32 placed_count       # cup 에 성공적으로 넣은 box 수
+int32 attempted_count    # 실행한 iter 수 (성공+실패 합)
+int32 max_boxes          # 실제 적용된 cap (echo)
+---
+# Feedback
+string phase             # "iter_start"|"detecting"|"approaching"|"aligning"|"grasping"|"placing"|"returning"
+string status
+int32 iteration          # 1-based 현재 iter
+int32 placed_so_far

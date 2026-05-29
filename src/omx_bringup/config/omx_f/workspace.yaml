@@ -1,0 +1,31 @@
+# OMX workspace 한계 정의 (단일 설정 소스).
+#
+# motion_server (C++) 와 workspace_guard (Python) 가 동일 파일을 참조한다.
+# 두 노드는 책임 레이어가 다르다.
+#   - motion_server : 클라이언트가 보낸 goal pose 의 x/y/z 한계를 사전 거부.
+#                     EE 가 멀리 뻗으면 shoulder dxl12 의 중력 모멘트가 급증해
+#                     Overload Hardware Error 로 모터가 차단되므로 영역 자체를 막는다.
+#   - workspace_guard: MoveIt2 Planning Scene 에 floor / ceiling 충돌 평면을 등록해
+#                     planner 가 생성한 trajectory 중간 지점이 z 한계 밖으로
+#                     빠지는 것을 차단한다.
+#
+# /** 와일드카드로 두 노드 모두에 동일 값이 주입된다.
+# 각 노드는 declare_parameter 로 자신이 쓰는 키만 선언하므로,
+# 사용하지 않는 키가 있어도 무시된다.
+/**:
+  ros__parameters:
+    workspace:
+      # motion_server: 사전 거부 한계 (world frame 기준)
+      x_abs_max: 0.30
+      y_abs_max: 0.30
+      z_min: 0.0
+      z_max: 0.45
+      frame: world
+
+      # workspace_guard: Planning Scene 충돌 평면 파라미터
+      #   floor 상면은 z_min 에 정확히 맞춘다 (테이블 침범 절대 금지).
+      #   ceiling 하면은 z_max 위로 guard_ceiling_margin 만큼 띄운다.
+      #   (정상 trajectory 가 보간 중 z_max 를 잠깐 넘는 경우를 충돌로 잡지 않기 위함.)
+      guard_ceiling_margin: 0.05
+      guard_plane_thickness: 0.04
+      guard_plane_extent: 2.0

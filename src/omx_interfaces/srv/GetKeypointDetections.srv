@@ -1,7 +1,16 @@
-# Publish an annotated debug image for this service call.
+# 같은 자세에서 N개의 서로 다른 image frame 을 신호 기반으로 기다려 추론한다.
+# 시간 sleep 없이 monotonic frame counter + Event 로 새 frame 도착을 trigger 로
+# 사용하므로 카메라 fps 변화에 자동 적응한다.
+# num_samples < 1 이면 서버가 1 로 clamp.
+int32 num_samples
+# 부분 성공 허용 임계값. N개 다 모으기 전에 새 frame 이 timeout 되어도, 이미
+# 모은 sample 수가 min_valid_samples 이상이면 success=true 로 부분 응답한다.
+# < 1 이면 서버가 1 로, > num_samples 이면 num_samples 로 clamp.
+int32 min_valid_samples
+# Publish an annotated debug image for the last sample only.
 bool publish_debug
 ---
 std_msgs/Header header
 bool success
 string message
-omx_interfaces/KeypointDetection[] detections
+omx_interfaces/KeypointSample[] samples

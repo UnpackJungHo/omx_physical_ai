@@ -47,12 +47,7 @@ setup(
     extras_require={
         "test": ["pytest"],
     },
-    entry_points={
-        "console_scripts": [
-            "camera_control_node = omx_perception.camera_control_node:main",
-            "box_cup_pose_node = omx_perception.box_cup_pose_node:main",
-            "box_cup_world_pose_node = omx_perception.box_cup_world_pose_node:main",
-            "box_color_calibrate = omx_perception.box_color_calibrate:main",
-        ],
-    },
+    entry_points={"console_scripts": [
+            "box_cup_keypoint_node = omx_perception.box_cup_keypoint_node:main",
+        ]},
 )

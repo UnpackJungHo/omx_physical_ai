@@ -46,6 +46,13 @@
 #include <omx_interfaces/action/move_to_pose.hpp>
 #include <omx_interfaces/action/move_to_joints.hpp>
 #include <omx_interfaces/action/gripper_command.hpp>
+#include <omx_interfaces/action/align_gripper_yaw.hpp>
+
+#include <sensor_msgs/msg/joint_state.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2/exceptions.h>
 
 // ── 워크스페이스 한계 (workspace_guard 와 일치) ───────────────────────────
 static constexpr double WS_Z_MIN = 0.01;
@@ -130,6 +137,28 @@ static std::string execute_failure_message(
   return prefix + " (code=" + moveit_error_name(code) + ", val=" + std::to_string(code.val) + ")";
 }
 
+// ── AlignGripperYaw 기하 헬퍼 ────────────────────────────────────────────
+
+// end_effector_link +y 축의 world XY heading (rad). gimbal-lock 없음.
+static double jaw_axis_yaw_from_quaternion(double qx, double qy, double qz, double qw)
+{
+  const double axis_x = 2.0 * (qx * qy - qw * qz);
+  const double axis_y = 1.0 - 2.0 * (qx * qx + qz * qz);
+  return std::atan2(axis_y, axis_x);
+}
+
+// 박스 90° 대칭을 이용해 각도를 (-π/4, π/4] 범위로 접는다.
+static double wrap_to_pm45(double angle_rad)
+{
+  constexpr double quarter = M_PI / 2.0;
+  double wrapped = std::fmod(angle_rad, quarter);
+  if (wrapped > M_PI / 4.0)
+    wrapped -= quarter;
+  else if (wrapped <= -M_PI / 4.0)
+    wrapped += quarter;
+  return wrapped;
+}
+
 // ── named pose → SRDF group_state 매핑 ───────────────────────────────────
 // SRDF(omx_f.srdf) 에 등록된 arm 그룹 named state 목록:
 //   "init" : 모든 조인트 0
@@ -149,19 +178,31 @@ public:
   using MoveToPose = omx_interfaces::action::MoveToPose;
   using MoveToJoints = omx_interfaces::action::MoveToJoints;
   using GripperCmd = omx_interfaces::action::GripperCommand;
+  using AlignGripperYaw = omx_interfaces::action::AlignGripperYaw;
 
   explicit MotionServer(const rclcpp::NodeOptions &options)
       : Node("motion_server", options), node_options_(options)
   {
     declare_parameter<std::string>("arm_tip_link", "end_effector_link");
-    // Workspace 안전 제한 (world frame 기준).
+    // Workspace 사전 거부 한계 (world frame 기준).
     // EE 가 x,y 방향으로 멀리 뻗으면 dxl12 (shoulder) 의 중력 모멘트가 급증해
-    // Overload Hardware Error 로 모터가 차단된다. 그 영역을 사전에 거부한다.
-    declare_parameter<double>("workspace.x_abs_max", 0.26);
-    declare_parameter<double>("workspace.y_abs_max", 0.26);
-    declare_parameter<double>("workspace.z_min", 0.0);
-    declare_parameter<double>("workspace.z_max", 0.45);
-    declare_parameter<std::string>("workspace.frame", "world");
+    // Overload Hardware Error 로 모터가 차단된다. 그 영역의 goal pose 를 사전에 거부한다.
+    //
+    // 같은 workspace 값은 omx_bringup 의 workspace_guard 와 공유한다.
+    // 단일 설정 소스: omx_bringup/config/omx_f/workspace.yaml.
+    //   - motion_server   : goal pose 사전 거부 (요청 단계)
+    //   - workspace_guard : Planning Scene 의 floor / ceiling 충돌 평면 (trajectory 보간 단계)
+    // 아래 default 는 yaml 미주입 시의 fallback 이며, 실제 운용 값은 yaml 에서 관리한다.
+    if (!has_parameter("workspace.x_abs_max"))
+      declare_parameter<double>("workspace.x_abs_max", 0.3);
+    if (!has_parameter("workspace.y_abs_max"))
+      declare_parameter<double>("workspace.y_abs_max", 0.3);
+    if (!has_parameter("workspace.z_min"))
+      declare_parameter<double>("workspace.z_min", 0.0);
+    if (!has_parameter("workspace.z_max"))
+      declare_parameter<double>("workspace.z_max", 0.45);
+    if (!has_parameter("workspace.frame"))
+      declare_parameter<std::string>("workspace.frame", "world");
     // 액션 서버들은 Reentrant callback group 에 배치한다.
     // arm_busy_ / gripper_busy_ 로 실제 직렬 실행을 보장하므로
     // MoveGroupInterface 의 공유 상태 경쟁을 방지한다.
@@ -193,6 +234,33 @@ public:
         std::bind(&MotionServer::handle_gripper_goal, this, std::placeholders::_1, std::placeholders::_2),
         std::bind(&MotionServer::handle_gripper_cancel, this, std::placeholders::_1),
         std::bind(&MotionServer::handle_gripper_accepted, this, std::placeholders::_1),
+        rcl_action_server_get_default_options(), cb_group_);
+
+    // AlignGripperYaw 파라미터
+    declare_parameter<std::string>("align_world_frame", "world");
+    declare_parameter<double>("joint5_yaw_sign", 1.0);
+    declare_parameter<std::vector<std::string>>("arm_joint_names",
+        std::vector<std::string>{"joint1", "joint2", "joint3", "joint4", "joint5"});
+
+    // TF
+    tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+
+    // Joint states 구독 (best_effort — 센서 스트림)
+    joint_state_sub_ = create_subscription<sensor_msgs::msg::JointState>(
+        "/joint_states",
+        rclcpp::SensorDataQoS(),
+        [this](sensor_msgs::msg::JointState::SharedPtr msg) {
+          std::lock_guard<std::mutex> lk(joint_state_mutex_);
+          latest_joint_state_ = msg;
+        });
+
+    // AlignGripperYaw 액션 서버
+    align_gripper_yaw_server_ = rclcpp_action::create_server<AlignGripperYaw>(
+        this, "/omx/align_gripper_yaw",
+        std::bind(&MotionServer::handle_align_goal, this, std::placeholders::_1, std::placeholders::_2),
+        std::bind(&MotionServer::handle_align_cancel, this, std::placeholders::_1),
+        std::bind(&MotionServer::handle_align_accepted, this, std::placeholders::_1),
         rcl_action_server_get_default_options(), cb_group_);
 
     RCLCPP_INFO(get_logger(), "MotionServer: action servers created, waiting for MoveIt...");
@@ -272,6 +340,10 @@ public:
         get_logger(),
         "MotionServer arm tip link override: '%s'",
         arm_tip_link_.c_str());
+
+    align_world_frame_ = get_parameter("align_world_frame").as_string();
+    joint5_yaw_sign_ = get_parameter("joint5_yaw_sign").as_double();
+    arm_joint_names_ = get_parameter("arm_joint_names").as_string_array();
   }
 
   void create_moveit_helper_node()
@@ -382,11 +454,22 @@ private:
   std::thread gripper_thread_;
   std::string arm_tip_link_;
   // workspace 제한 (world frame 기준)
-  double ws_x_abs_max_{0.26};
-  double ws_y_abs_max_{0.26};
+  double ws_x_abs_max_{0.28};
+  double ws_y_abs_max_{0.28};
   double ws_z_min_{0.0};
   double ws_z_max_{0.45};
   std::string ws_frame_{"world"};
+
+  // ── AlignGripperYaw 멤버 ──────────────────────────────────────────────
+  rclcpp_action::Server<AlignGripperYaw>::SharedPtr align_gripper_yaw_server_;
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+  std::mutex joint_state_mutex_;
+  sensor_msgs::msg::JointState::SharedPtr latest_joint_state_;
+  std::string align_world_frame_{"world"};
+  double joint5_yaw_sign_{1.0};
+  std::vector<std::string> arm_joint_names_{"joint1", "joint2", "joint3", "joint4", "joint5"};
 
   // ── RAII 헬퍼 ─────────────────────────────────────────────────────────
 
@@ -1127,6 +1210,192 @@ private:
     {
       goal_handle->abort(result);
       RCLCPP_WARN(get_logger(), "GripperCommand: %s", result->message.c_str());
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════
+  // AlignGripperYaw  →  joint5 를 box yaw 에 정렬 (90° 대칭 적용)
+  // ══════════════════════════════════════════════════════════════════════
+
+  rclcpp_action::GoalResponse handle_align_goal(
+      const rclcpp_action::GoalUUID &,
+      std::shared_ptr<const AlignGripperYaw::Goal> goal)
+  {
+    RCLCPP_INFO(get_logger(), "AlignGripperYaw: box_yaw=%.1f°", goal->box_yaw_deg);
+    bool expected = false;
+    if (!arm_busy_.compare_exchange_strong(
+            expected, true, std::memory_order_acquire, std::memory_order_relaxed))
+    {
+      RCLCPP_WARN(get_logger(), "AlignGripperYaw: arm is busy, rejecting goal");
+      return rclcpp_action::GoalResponse::REJECT;
+    }
+    return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+  }
+
+  rclcpp_action::CancelResponse handle_align_cancel(
+      const std::shared_ptr<rclcpp_action::ServerGoalHandle<AlignGripperYaw>>)
+  {
+    RCLCPP_INFO(get_logger(), "AlignGripperYaw: cancel requested");
+    if (arm_group_)
+      arm_group_->stop();
+    return rclcpp_action::CancelResponse::ACCEPT;
+  }
+
+  void handle_align_accepted(
+      const std::shared_ptr<rclcpp_action::ServerGoalHandle<AlignGripperYaw>> goal_handle)
+  {
+    if (arm_thread_.joinable())
+      arm_thread_.join();
+    arm_thread_ = std::thread([this, goal_handle]()
+                              { execute_align(goal_handle); });
+  }
+
+  void execute_align(
+      const std::shared_ptr<rclcpp_action::ServerGoalHandle<AlignGripperYaw>> goal_handle)
+  {
+    BusyGuard busy_guard{arm_busy_};
+    VelScaleGuard vel_guard{arm_group_.get()};
+
+    auto result = std::make_shared<AlignGripperYaw::Result>();
+    auto feedback = std::make_shared<AlignGripperYaw::Feedback>();
+
+    if (!arm_group_)
+    {
+      result->success = false;
+      result->message = "MoveGroupInterface not initialized";
+      goal_handle->abort(result);
+      vel_guard.grp = nullptr;
+      return;
+    }
+
+    feedback->status = "computing";
+    feedback->progress = 0.0f;
+    goal_handle->publish_feedback(feedback);
+
+    // 1. joint_states 스냅샷
+    sensor_msgs::msg::JointState::SharedPtr js;
+    {
+      std::lock_guard<std::mutex> lk(joint_state_mutex_);
+      js = latest_joint_state_;
+    }
+    if (!js)
+    {
+      result->success = false;
+      result->message = "joint_states not received";
+      goal_handle->abort(result);
+      return;
+    }
+
+    std::map<std::string, double> joint_pos;
+    for (std::size_t i = 0; i < js->name.size() && i < js->position.size(); ++i)
+      joint_pos[js->name[i]] = js->position[i];
+
+    for (const auto & jn : arm_joint_names_)
+    {
+      if (joint_pos.find(jn) == joint_pos.end())
+      {
+        result->success = false;
+        result->message = "joint '" + jn + "' not in joint_states";
+        goal_handle->abort(result);
+        return;
+      }
+    }
+    double j5_before = joint_pos.at("joint5");
+
+    // 2. TF 로 jaw yaw 조회
+    geometry_msgs::msg::TransformStamped tf_stamped;
+    try
+    {
+      tf_stamped = tf_buffer_->lookupTransform(
+          align_world_frame_, arm_tip_link_,
+          tf2::TimePointZero,
+          tf2::durationFromSec(0.5));
+    }
+    catch (const tf2::TransformException & ex)
+    {
+      result->success = false;
+      result->message = std::string("TF lookup failed: ") + ex.what();
+      goal_handle->abort(result);
+      return;
+    }
+
+    const auto & q = tf_stamped.transform.rotation;
+    double jaw_yaw = jaw_axis_yaw_from_quaternion(q.x, q.y, q.z, q.w);
+
+    // 3. joint5 목표 계산
+    double box_yaw_rad = static_cast<double>(goal_handle->get_goal()->box_yaw_deg) * M_PI / 180.0;
+    double delta = wrap_to_pm45(box_yaw_rad - jaw_yaw);
+    double j5_target_val = j5_before + joint5_yaw_sign_ * delta;
+
+    RCLCPP_INFO(get_logger(),
+        "align_gripper_yaw: box_yaw=%.1f° jaw_yaw=%.1f° delta=%.1f° joint5 %.1f°→%.1f°",
+        goal_handle->get_goal()->box_yaw_deg,
+        jaw_yaw * 180.0 / M_PI,
+        delta * 180.0 / M_PI,
+        j5_before * 180.0 / M_PI,
+        j5_target_val * 180.0 / M_PI);
+
+    // 4. arm 전체 joint target (joint5 만 변경, 나머지 현재 유지)
+    std::map<std::string, double> arm_target;
+    for (const auto & jn : arm_joint_names_)
+      arm_target[jn] = joint_pos.at(jn);
+    arm_target["joint5"] = j5_target_val;
+
+    feedback->status = "executing";
+    feedback->progress = 0.3f;
+    goal_handle->publish_feedback(feedback);
+
+    // 5. MoveIt plan + execute
+    arm_group_->setStartStateToCurrentState();
+    if (!arm_group_->setJointValueTarget(arm_target))
+    {
+      result->success = false;
+      result->message = "Joint target out of limits";
+      goal_handle->abort(result);
+      return;
+    }
+
+    moveit::planning_interface::MoveGroupInterface::Plan plan;
+    bool planned = (arm_group_->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
+    if (!planned)
+    {
+      result->success = false;
+      result->message = "Planning failed";
+      goal_handle->abort(result);
+      return;
+    }
+
+    const auto exec_code = arm_group_->execute(plan);
+    bool executed = (exec_code == moveit::core::MoveItErrorCode::SUCCESS);
+
+    if (goal_handle->is_canceling())
+    {
+      result->success = false;
+      result->message = "Cancelled";
+      goal_handle->canceled(result);
+      return;
+    }
+
+    result->success = executed;
+    result->message = executed
+        ? ""
+        : execute_failure_message("AlignGripperYaw execution failed", exec_code);
+    result->jaw_yaw_deg = static_cast<float>(jaw_yaw * 180.0 / M_PI);
+    result->joint5_before_deg = static_cast<float>(j5_before * 180.0 / M_PI);
+    result->joint5_after_deg = static_cast<float>(j5_target_val * 180.0 / M_PI);
+    result->wrapped_delta_deg = static_cast<float>(delta * 180.0 / M_PI);
+
+    if (executed)
+    {
+      feedback->progress = 1.0f;
+      goal_handle->publish_feedback(feedback);
+      goal_handle->succeed(result);
+      RCLCPP_INFO(get_logger(), "AlignGripperYaw: succeeded");
+    }
+    else
+    {
+      goal_handle->abort(result);
+      RCLCPP_WARN(get_logger(), "AlignGripperYaw: %s", result->message.c_str());
     }
   }
 };

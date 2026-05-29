@@ -1,28 +1,29 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>omx_motion_server</name>
+  <name>omx_perception_world_pose</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>OMX perception world pose node - ray-plane intersection + TF2 to compute box/cup world coordinates</description>
   <maintainer email="kjhgfd6632@gmail.com">kjhz</maintainer>
-  <license>TODO: License declaration</license>
+  <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <depend>rclcpp</depend>
-  <depend>rclcpp_action</depend>
-  <depend>omx_interfaces</depend>
-  <depend>moveit_ros_planning_interface</depend>
-  <depend>geometry_msgs</depend>
-  <depend>control_msgs</depend>
-  <depend>trajectory_msgs</depend>
-  <depend>sensor_msgs</depend>
-  <depend>std_msgs</depend>
   <depend>tf2</depend>
   <depend>tf2_ros</depend>
+  <depend>geometry_msgs</depend>
+  <depend>builtin_interfaces</depend>
+  <depend>omx_interfaces</depend>
+  <depend>opencv2</depend>
+  <depend>yaml-cpp</depend>
 
+  <build_depend>ament_cmake_gtest</build_depend>
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

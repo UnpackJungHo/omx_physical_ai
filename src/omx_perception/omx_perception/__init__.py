@@ -1,1 +1,1 @@
-"""Utilities for OMX perception calibration and geometry."""
+"""OMX perception package."""
