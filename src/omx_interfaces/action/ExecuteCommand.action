@@ -1,0 +1,16 @@
+# Goal
+string command            # 한국어 자연어 명령 원문
+bool dry_run              # true 면 plan 생성/검증까지만, 실행 안 함
+---
+# Result
+bool success
+string message
+string plan_json          # 생성된 plan (감사/로그용)
+int32 steps_total
+int32 steps_completed
+---
+# Feedback
+string phase              # "planning"|"validating"|"executing"|"done"
+int32 step_index          # 1-based 현재 step
+int32 steps_total
+string step_desc          # 현재 step 설명

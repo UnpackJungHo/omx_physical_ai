@@ -1,56 +1,44 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, LogInfo, OpaqueFunction
+from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
-from launch_ros.actions import Node
+from launch_ros.actions import Node, PushRosNamespace
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
-from omx_perception.camera_device import (
-    apply_v4l2_controls,
-    load_camera_parameters,
-    resolve_video_device,
-)
-
-
-def _launch_camera(context, *args, **kwargs):
-    camera = resolve_video_device(
-        LaunchConfiguration("camera_name_match").perform(context),
-        explicit_device=LaunchConfiguration("video_device").perform(context),
-        sysfs_dir=LaunchConfiguration("video_sysfs_dir").perform(context),
-    )
-    camera_params = PathJoinSubstitution([
-        FindPackageShare("omx_perception"),
-        "config",
-        "camera_params.yaml",
-    ])
-    camera_params_path = camera_params.perform(context)
-    applied_controls = apply_v4l2_controls(
-        camera.path,
-        load_camera_parameters(camera_params_path),
-    )
-
-    return [
-        LogInfo(msg=f"omx_perception selected camera: {camera.name} -> {camera.path}"),
-        LogInfo(msg=f"omx_perception applied camera controls: {', '.join(applied_controls)}"),
-        Node(
-            package="usb_cam",
-            executable="usb_cam_node_exe",
-            name="usb_cam",
-            output="screen",
-            parameters=[
-                camera_params_path,
-                {"video_device": camera.path},
-                {"image_raw.enable_pub_plugins": ["image_transport/raw"]},
-            ],
-            remappings=[
-                ("image_raw", "/image/raw"),
-                ("camera_info", "/camera/info"),
-            ],
-        ),
-    ]
-
 
 def generate_launch_description():
+    # usb_cam 은 자체 reconnect 가 없어 arm 장착 카메라의 재enumeration 에 취약하다.
+    # camera_supervisor 가 usb_cam 을 자식 프로세스로 띄우고 image/raw staleness 를
+    # 감시하여 끊기면 안정 by-id 경로로 재시작한다. (omx_perception/camera_supervisor.py)
+    camera_supervisor = Node(
+        package="omx_perception",
+        executable="camera_supervisor",
+        name="camera_supervisor",
+        output="screen",
+        emulate_tty=True,
+        parameters=[
+            {
+                "camera_name_match": LaunchConfiguration("camera_name_match"),
+                "video_device": LaunchConfiguration("video_device"),
+                "video_sysfs_dir": LaunchConfiguration("video_sysfs_dir"),
+                "camera_params_path": PathJoinSubstitution([
+                    FindPackageShare("omx_perception"),
+                    "config", "camera_params.yaml",
+                ]),
+                "image_topic": "image/raw",
+                "stale_timeout_sec": ParameterValue(
+                    LaunchConfiguration("camera_stale_timeout_sec"), value_type=float
+                ),
+                "startup_grace_sec": ParameterValue(
+                    LaunchConfiguration("camera_startup_grace_sec"), value_type=float
+                ),
+                "restart_min_interval_sec": ParameterValue(
+                    LaunchConfiguration("camera_restart_min_interval_sec"), value_type=float
+                ),
+            }
+        ],
+    )
+
     yolo_keypoint = Node(
         package="omx_perception",
         executable="box_cup_keypoint_node",
@@ -60,7 +48,7 @@ def generate_launch_description():
         parameters=[
             {
                 "model_path": LaunchConfiguration("box_cup_model_path"),
-                "image_topic": "/image/raw",
+                "image_topic": "image/raw",
                 "output_dir": LaunchConfiguration("box_cup_output_dir"),
                 "extra_pythonpath": LaunchConfiguration("box_cup_extra_pythonpath"),
                 "device": ParameterValue(LaunchConfiguration("box_cup_device"), value_type=str),
@@ -97,6 +85,12 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        DeclareLaunchArgument(
+            "namespace",
+            default_value="",
+            description="Namespace for ROS nodes.",
+        ),
+        PushRosNamespace(LaunchConfiguration("namespace")),
         DeclareLaunchArgument(
             "camera_name_match",
             default_value="Innomaker",
@@ -147,7 +141,22 @@ def generate_launch_description():
             default_value="2.0",
             description="Per-sample timeout while waiting for a new image frame.",
         ),
-        OpaqueFunction(function=_launch_camera),
+        DeclareLaunchArgument(
+            "camera_stale_timeout_sec",
+            default_value="3.0",
+            description="Restart usb_cam if image/raw delivers no frame for this long.",
+        ),
+        DeclareLaunchArgument(
+            "camera_startup_grace_sec",
+            default_value="10.0",
+            description="Grace period after (re)start before staleness is judged.",
+        ),
+        DeclareLaunchArgument(
+            "camera_restart_min_interval_sec",
+            default_value="5.0",
+            description="Minimum interval between usb_cam restarts (crash-loop guard).",
+        ),
+        camera_supervisor,
         yolo_keypoint,
         world_pose,
     ])

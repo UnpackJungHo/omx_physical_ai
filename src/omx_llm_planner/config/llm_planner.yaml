@@ -1,0 +1,30 @@
+llm_planner:
+  ros__parameters:
+    # LLM 서빙 (Ollama)
+    llm_endpoint: "http://127.0.0.1:11434"
+    llm_model_name: "qwen3-4b-omx"
+    llm_request_timeout_sec: 20.0
+    llm_max_retries: 1
+    # 실패 step 시 중단(false)/계속(true)
+    continue_on_fail: false
+    # sub-action 이름
+    pick_place_action: "omx/pick_place"
+    pick_place_all_action: "omx/pick_place_all"
+    move_to_named_action: "omx/move_to_named"
+    # sub-action timeout
+    server_wait_timeout_sec: 5.0
+    goal_response_timeout_sec: 5.0
+    result_timeout_sec: 120.0
+    # gripper / rotate_base
+    gripper_action: "omx/gripper_command"
+    move_to_joints_action: "omx/move_to_joints"
+    joint_states_topic: "joint_states"
+    rotate_joint_name: "joint1"
+    rotate_velocity_scale: 0.3
+    joint_state_max_age_sec: 1.0
+    rotate_sign_left: 1.0      # 하드웨어 검증 후 확정(부호 뒤집힐 수 있음)
+    rotate_sign_right: -1.0
+    joint1_lower: -2.8         # TODO: URDF joint1 limit 으로 확정
+    joint1_upper: 2.8
+    gripper_open_position: 1.0
+    gripper_close_position: 0.0

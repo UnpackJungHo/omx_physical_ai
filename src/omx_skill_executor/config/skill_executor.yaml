@@ -14,7 +14,7 @@ pick_place_server:
 
     detect_wait_after_motion_sec: 0.8
     service_call_timeout_sec: 15.0
-    world_poses_service_name: "/perception/get_box_cup_world_poses"
+    world_poses_service_name: "perception/get_box_cup_world_poses"
 
     approach_frame_id: "world"
     hover_z: 0.15
@@ -29,7 +29,7 @@ pick_place_server:
 
     world_frame: "world"
     gripper_link: "end_effector_link"
-    joint_states_topic: "/joint_states"
+    joint_states_topic: "joint_states"
     yaw_min_corner_confidence: 0.30
     joint5_yaw_sign: -1.0
     require_yaw: false
@@ -47,7 +47,7 @@ pick_place_server:
     action_result_timeout_sec: 60.0
 
     max_grasp_retries: 2
-    check_grasp_service_name: "/gripper/check_grasp"
+    check_grasp_service_name: "gripper/check_grasp"
     grasp_settle_sec: 0.3
 
 pick_place_all_server:
@@ -62,7 +62,7 @@ pick_place_all_server:
 
     detect_wait_after_motion_sec: 0.8
     service_call_timeout_sec: 15.0
-    world_poses_service_name: "/perception/get_box_cup_world_poses"
+    world_poses_service_name: "perception/get_box_cup_world_poses"
 
     approach_frame_id: "world"
     hover_z: 0.15
@@ -77,7 +77,7 @@ pick_place_all_server:
 
     world_frame: "world"
     gripper_link: "end_effector_link"
-    joint_states_topic: "/joint_states"
+    joint_states_topic: "joint_states"
     yaw_min_corner_confidence: 0.30
     joint5_yaw_sign: -1.0
     require_yaw: false
@@ -95,5 +95,5 @@ pick_place_all_server:
     action_result_timeout_sec: 60.0
 
     max_grasp_retries: 2
-    check_grasp_service_name: "/gripper/check_grasp"
+    check_grasp_service_name: "gripper/check_grasp"
     grasp_settle_sec: 0.3

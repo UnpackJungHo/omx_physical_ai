@@ -47,7 +47,14 @@ def resolve_video_device(
     root = Path(sysfs_dir.strip())
     matches = _matching_video_devices(camera_name_match, root)
     if matches:
-        return matches[0]
+        device = matches[0]
+        # arm 장착 USB 카메라는 모션 중 재enumeration 으로 /dev/videoN 번호가
+        # 바뀔 수 있다. udev 가 유지하는 /dev/v4l/by-id 안정 별칭이 있으면 그걸
+        # 우선 반환해, 재오픈 시점에 항상 올바른 capture 노드를 가리키게 한다.
+        stable = stable_by_id_path(Path(device.path))
+        if stable is not None:
+            return CameraDevice(name=device.name, path=stable)
+        return device
 
     available = []
     if root.exists():
@@ -113,6 +120,33 @@ def apply_v4l2_controls(video_device: str, parameters: dict[str, Any]) -> list[s
         applied.append(control)
 
     return applied
+
+
+def stable_by_id_path(
+    video_device: Path,
+    *,
+    by_id_dir: Path = Path("/dev/v4l/by-id"),
+) -> str | None:
+    """Return a stable /dev/v4l/by-id symlink that resolves to video_device.
+
+    udev recreates these symlinks on every (re-)enumeration so they always point
+    at the current node, unlike the volatile /dev/videoN number. Returns None when
+    no by-id alias exists (e.g. udev rule absent) so the caller can fall back.
+    """
+    if not by_id_dir.exists():
+        return None
+    try:
+        target = video_device.resolve()
+    except OSError:
+        return None
+
+    for link in sorted(by_id_dir.iterdir()):
+        try:
+            if link.resolve() == target:
+                return str(link)
+        except OSError:
+            continue
+    return None
 
 
 def _matching_video_devices(match_text: str, sysfs_dir: Path) -> list[CameraDevice]:

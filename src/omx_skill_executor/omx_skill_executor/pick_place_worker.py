@@ -140,19 +140,19 @@ class PickPlaceWorker:
 
         # 액션 클라이언트
         self._move_joints_cli = ActionClient(
-            node, MoveToJoints, "/omx/move_to_joints",
+            node, MoveToJoints, "omx/move_to_joints",
             callback_group=cb_group,
         )
         self._move_pose_cli = ActionClient(
-            node, MoveToPose, "/omx/move_to_pose",
+            node, MoveToPose, "omx/move_to_pose",
             callback_group=cb_group,
         )
         self._move_named_cli = ActionClient(
-            node, MoveToNamed, "/omx/move_to_named",
+            node, MoveToNamed, "omx/move_to_named",
             callback_group=cb_group,
         )
         self._gripper_cli = ActionClient(
-            node, GripperCommand, "/omx/gripper_command",
+            node, GripperCommand, "omx/gripper_command",
             callback_group=cb_group,
         )
         self._blocks_cli = node.create_client(
@@ -202,7 +202,7 @@ class PickPlaceWorker:
     # High-level orchestrations
     # ────────────────────────────────────────────────────────────────
 
-    def pick_one_box(self, phase_cb: PhaseCallback) -> PickResult:
+    def pick_one_box(self, phase_cb: PhaseCallback, target_color: str = "") -> PickResult:
         """detect → filter → (sweep) → pick → verify 의 한 box 사이클.
 
         성공 시 박스를 잡고 scan 자세까지 복귀한 상태. cup, target_box 도 유효.
@@ -242,12 +242,15 @@ class PickPlaceWorker:
             boxes, cup_local = self._detect_box_cup()
             result.attempts += 1
 
+            if target_color:
+                boxes = [b for b in boxes if b.color == target_color]
+
             # cup 내부에 있는 박스는 잡으러 가지 않는다 (이미 처리된 박스).
             filtered_boxes = self._filter_boxes_outside_cup(boxes, cup_local)
 
             if not (filtered_boxes and cup_local):
                 filtered_boxes, cup_local, result.attempts = self._sweep_for_box_cup(
-                    phase_cb, result.attempts
+                    phase_cb, result.attempts, target_color
                 )
 
             if not (filtered_boxes and cup_local):
@@ -425,6 +428,7 @@ class PickPlaceWorker:
         self,
         phase_cb: PhaseCallback,
         attempts_so_far: int,
+        target_color: str = "",
     ) -> tuple[list[BlockPose], Optional[BlockPose], int]:
         """joint1 절대각 스윕. 매번 cup-필터 적용한 결과로 판단."""
         cfg = self._config
@@ -459,6 +463,8 @@ class PickPlaceWorker:
                 continue
             attempts += 1
             boxes, cup = self._detect_box_cup()
+            if target_color:
+                boxes = [b for b in boxes if b.color == target_color]
             outside = self._filter_boxes_outside_cup(boxes, cup)
             if outside and cup:
                 return outside, cup, attempts
@@ -992,7 +998,7 @@ def build_worker_config_from_node(node: Node) -> WorkerConfig:
         ),
         world_poses_service_name=str(
             p("world_poses_service_name",
-              "/perception/get_box_cup_world_poses").value
+              "perception/get_box_cup_world_poses").value
         ),
         approach_frame_id=str(p("approach_frame_id", "world").value),
         hover_z=float(p("hover_z", 0.15).value),
@@ -1006,7 +1012,7 @@ def build_worker_config_from_node(node: Node) -> WorkerConfig:
         drop_clearance_m=float(p("drop_clearance_m", 0.10).value),
         world_frame=str(p("world_frame", "world").value),
         gripper_link=str(p("gripper_link", "end_effector_link").value),
-        joint_states_topic=str(p("joint_states_topic", "/joint_states").value),
+        joint_states_topic=str(p("joint_states_topic", "joint_states").value),
         yaw_min_corner_confidence=float(
             p("yaw_min_corner_confidence", 0.30).value
         ),
@@ -1021,7 +1027,7 @@ def build_worker_config_from_node(node: Node) -> WorkerConfig:
         ),
         max_grasp_retries=int(p("max_grasp_retries", 2).value),
         check_grasp_service_name=str(
-            p("check_grasp_service_name", "/gripper/check_grasp").value
+            p("check_grasp_service_name", "gripper/check_grasp").value
         ),
         grasp_settle_sec=float(p("grasp_settle_sec", 0.3).value),
         yaw_align_max_iterations=int(

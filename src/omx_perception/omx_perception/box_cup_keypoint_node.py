@@ -44,7 +44,7 @@ class BoxCupKeypointNode(Node):
         super().__init__("box_cup_keypoint")
 
         self.declare_parameter("model_path", "")
-        self.declare_parameter("image_topic", "/image/raw")
+        self.declare_parameter("image_topic", "image/raw")
         self.declare_parameter("output_dir", "tmp_kjh/box_cup_pose_image")
         self.declare_parameter(
             "extra_pythonpath",
@@ -59,7 +59,7 @@ class BoxCupKeypointNode(Node):
         # 기본값은 omx_perception_world_pose 와 일치시킨다.
         self.declare_parameter("target_frame", "world")
         self.declare_parameter("camera_frame", "default_cam")
-        self.declare_parameter("camera_info_topic", "/camera/info")
+        self.declare_parameter("camera_info_topic", "camera/info")
         self.declare_parameter("tf_lookup_timeout_sec", 0.5)
         # GetKeypointDetections 처리 시 새 image frame 도착을 기다리는 단위 timeout.
         # 시간 sleep 이 아니라 condition signal 의 fallback 상한값이다 (카메라 hang
@@ -119,20 +119,20 @@ class BoxCupKeypointNode(Node):
 
         self._debug_pub = None
         if self._publish_debug:
-            self._debug_pub = self.create_publisher(Image, "/perception/debug_image", 1)
+            self._debug_pub = self.create_publisher(Image, "perception/debug_image", 1)
 
         self._service_cb_group = MutuallyExclusiveCallbackGroup()
         self._client_cb_group = ReentrantCallbackGroup()
         self._srv = self.create_service(
             GetKeypointDetections,
-            "/perception/get_box_cup_keypoints",
+            "perception/get_box_cup_keypoints",
             self._handle_get_keypoints,
             callback_group=self._service_cb_group,
         )
 
         self._world_pose_client = self.create_client(
             GetBlockPoses,
-            "/perception/get_box_cup_world_poses",
+            "perception/get_box_cup_world_poses",
             callback_group=self._client_cb_group,
         )
 
@@ -154,7 +154,7 @@ class BoxCupKeypointNode(Node):
         self._start_keyboard_listener()
 
         self.get_logger().info(
-            "box/cup keypoint node ready: service=/perception/get_box_cup_keypoints, "
+            "box/cup keypoint node ready: services=perception/get_box_cup_keypoints, "
             "press 'p' to save snapshot "
             f"(model={self._model_path}, image_topic={image_topic})"
         )
@@ -245,7 +245,7 @@ class BoxCupKeypointNode(Node):
                 response.message = f"YOLO inference error: {exc}"
                 return response
 
-            raw_detections = self._extract_detections(result)
+            raw_detections = self._extract_detections(frame, result)
             sample = KeypointSample()
             if stamp is not None:
                 sample.stamp = stamp
@@ -315,7 +315,7 @@ class BoxCupKeypointNode(Node):
             kd.class_id = int(det["class_id"])
             kd.class_name = str(det["class_name"]).lower()
             kd.detection_confidence = float(det["confidence"])
-            kd.color = kd.class_name  # "box" | "cup"
+            kd.color = str(det.get("color_name", kd.class_name)).lower()
             kd.color_confidence = 0.0
             flat: list[float] = []
             for kp_x, kp_y, kp_conf in det["keypoints"]:
@@ -375,23 +375,30 @@ class BoxCupKeypointNode(Node):
             stamp = self._latest_stamp
 
         if frame is None:
-            self.get_logger().warning("cannot save YOLO snapshot: no /image/raw frame received yet")
+            self.get_logger().warning("cannot save YOLO snapshot: no image/raw frame received yet")
             return
 
-        result = self._predict_frame(frame)
-        detections = self._extract_detections(result)
-        annotated = frame.copy()
-        self._draw_detections(annotated, detections)
+        # 추론/저장 중 예외(예: CUDA out of memory)가 keyboard listener 스레드를
+        # 죽이지 않도록 가드한다. 실패 시 로그만 남기고 스레드는 유지되어, 원인
+        # (GPU 메모리 등)이 해소되면 다음 'p' 입력부터 다시 정상 동작한다.
+        try:
+            result = self._predict_frame(frame)
+            detections = self._extract_detections(frame, result)
+            annotated = frame.copy()
+            self._draw_detections(annotated, detections)
 
-        # world pose overlay (best-effort: world_pose node가 없으면 생략)
-        block_poses = self._fetch_world_poses_sync()
-        if block_poses is not None:
-            self._draw_world_poses(annotated, detections, block_poses)
+            # world pose overlay (best-effort: world_pose node가 없으면 생략)
+            block_poses = self._fetch_world_poses_sync()
+            if block_poses is not None:
+                self._draw_world_poses(annotated, detections, block_poses)
 
-        filename = self._build_filename(stamp)
-        output_path = self._output_dir / filename
-        if not cv2.imwrite(str(output_path), annotated):
-            self.get_logger().error(f"failed to write YOLO snapshot: {output_path}")
+            filename = self._build_filename(stamp)
+            output_path = self._output_dir / filename
+            if not cv2.imwrite(str(output_path), annotated):
+                self.get_logger().error(f"failed to write YOLO snapshot: {output_path}")
+                return
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(f"YOLO snapshot failed: {exc}")
             return
 
         self.get_logger().info(
@@ -667,7 +674,48 @@ class BoxCupKeypointNode(Node):
             return f"box_cup_pose_{now}.jpg"
         return f"box_cup_pose_{stamp.sec}_{stamp.nanosec}_{now}.jpg"
 
-    def _extract_detections(self, result) -> list[dict[str, Any]]:
+    def _determine_box_color(self, frame: np.ndarray, points: list[tuple[float, float, float]]) -> str:
+        """HSV 색상 공간을 이용하여 중심 영역의 색상을 판별한다."""
+        kps = [(x, y) for x, y, conf in points if x > 0 or y > 0]
+        if not kps:
+            return "box"
+            
+        cx = int(round(sum(p[0] for p in kps) / len(kps)))
+        cy = int(round(sum(p[1] for p in kps) / len(kps)))
+        
+        h, w = frame.shape[:2]
+        if cx < 0 or cx >= w or cy < 0 or cy >= h:
+            return "box"
+            
+        roi_size = 10
+        x1 = max(0, cx - roi_size // 2)
+        x2 = min(w, cx + roi_size // 2)
+        y1 = max(0, cy - roi_size // 2)
+        y2 = min(h, cy + roi_size // 2)
+        
+        if x1 >= x2 or y1 >= y2:
+            return "box"
+            
+        roi = frame[y1:y2, x1:x2]
+        hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        
+        hue = np.median(hsv_roi[:, :, 0])
+        sat = np.median(hsv_roi[:, :, 1])
+        val = np.median(hsv_roi[:, :, 2])
+        
+        if sat > 50 and val > 50:
+            if hue <= 10 or hue >= 160:
+                return "red"
+            elif 35 <= hue <= 85:
+                return "green"
+            elif 100 <= hue <= 140:
+                return "blue"
+            elif 15 <= hue <= 35:
+                return "yellow"
+                
+        return "box"
+
+    def _extract_detections(self, frame: np.ndarray, result) -> list[dict[str, Any]]:
         if result.boxes is None or len(result.boxes) == 0 or result.keypoints is None:
             return []
 
@@ -694,10 +742,16 @@ class BoxCupKeypointNode(Node):
                     confidence = float(keypoints_conf[idx][keypoint_index])
                 keypoints.append((float(point[0]), float(point[1]), confidence))
 
+            class_name = CLASS_NAMES.get(class_id, f"class_{class_id}")
+            color_name = class_name.lower()
+            if class_id == 0:  # Box
+                color_name = self._determine_box_color(frame, keypoints)
+
             detections.append(
                 {
                     "class_id": class_id,
-                    "class_name": CLASS_NAMES.get(class_id, f"class_{class_id}"),
+                    "class_name": class_name,
+                    "color_name": color_name,
                     "confidence": float(boxes_conf[idx]),
                     "keypoints": keypoints,
                 }
@@ -748,9 +802,11 @@ class BoxCupKeypointNode(Node):
                     cv2.line(image, points[start], points[end], color, 2, lineType=cv2.LINE_AA)
 
             if points:
+                color_name = str(detection.get("color_name", class_name))
+                label = f"{color_name} {det_index}: {float(detection['confidence']):.2f}"
                 cv2.putText(
                     image,
-                    f"{class_name} {det_index}: {float(detection['confidence']):.2f}",
+                    label,
                     (points[0][0], max(18, points[0][1] - 24)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.55,

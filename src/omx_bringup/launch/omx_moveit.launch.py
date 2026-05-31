@@ -28,7 +28,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
-from launch_ros.actions import Node
+from launch_ros.actions import Node, PushRosNamespace
 from launch_ros.substitutions import FindPackageShare
 from moveit_configs_utils import MoveItConfigsBuilder
 
@@ -36,6 +36,11 @@ from moveit_configs_utils import MoveItConfigsBuilder
 def generate_launch_description():
 
     declared_arguments = [
+        DeclareLaunchArgument(
+            'namespace',
+            default_value='',
+            description='Namespace for ROS nodes.',
+        ),
         DeclareLaunchArgument(
             'start_rviz',
             default_value='false',
@@ -141,6 +146,7 @@ def generate_launch_description():
 
     return LaunchDescription(
         declared_arguments + [
+            PushRosNamespace(LaunchConfiguration('namespace')),
             move_group_node,
             rviz_node,
             workspace_guard_node,

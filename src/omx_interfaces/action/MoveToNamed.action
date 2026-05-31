@@ -1,5 +1,5 @@
 # Goal
-string name          # "home" | "ready" | "pre_grasp" | "stow"
+string name          # "home" | "init"
 ---
 # Result
 bool success
