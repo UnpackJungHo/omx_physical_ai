@@ -1,8 +1,8 @@
-box_cup_world_pose:
+/**:
   ros__parameters:
     camera_intrinsics_path: ""
-    keypoints_service_name: "/perception/get_box_cup_keypoints"
-    world_service_name: "/perception/get_box_cup_world_poses"
+    keypoints_service_name: "perception/get_box_cup_keypoints"
+    world_service_name: "perception/get_box_cup_world_poses"
     target_frame: "world"
     camera_frame: "default_cam"
     # Ray-plane intersection: 각 detection 의 keypoint 4점이 world z = *_top_z_m

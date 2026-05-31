@@ -249,8 +249,8 @@ BoxCupWorldPoseNode::BoxCupWorldPoseNode(const rclcpp::NodeOptions & options)
 : Node("box_cup_world_pose", options)
 {
   declare_parameter("camera_intrinsics_path", "");
-  declare_parameter("keypoints_service_name", "/perception/get_box_cup_keypoints");
-  declare_parameter("world_service_name", "/perception/get_box_cup_world_poses");
+  declare_parameter("keypoints_service_name", "perception/get_box_cup_keypoints");
+  declare_parameter("world_service_name", "perception/get_box_cup_world_poses");
   declare_parameter("target_frame", "world");
   declare_parameter("camera_frame", "default_cam");
   declare_parameter("box_top_z_m", 0.030);
