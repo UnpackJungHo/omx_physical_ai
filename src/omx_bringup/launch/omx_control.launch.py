@@ -17,13 +17,18 @@ from launch.actions import DeclareLaunchArgument, RegisterEventHandler
 from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessStart
 from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution, PythonExpression
-from launch_ros.actions import Node
+from launch_ros.actions import Node, PushRosNamespace
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
 
     declared_arguments = [
+        DeclareLaunchArgument(
+            'namespace',
+            default_value='',
+            description='Namespace for ROS nodes.',
+        ),
         DeclareLaunchArgument(
             'start_rviz',
             default_value='true',
@@ -141,7 +146,17 @@ def generate_launch_description():
     joint_trajectory_executor = Node(
         package='open_manipulator_bringup',
         executable='joint_trajectory_executor',
-        parameters=[initial_positions_config],
+        parameters=[{
+            # Inline parameters keep overrides valid after PushRosNamespace.
+            'joint_names': ['joint1', 'joint2', 'joint3', 'joint4', 'joint5'],
+            'step_names': ['step1', 'step2'],
+            'step1': [0.0, 0.0, 0.0, 0.0, 0.0],
+            'step2': [0.0, -1.57, 1.57, 1.57, 0.0],
+            'duration': 5.0,
+            'epsilon': 0.15,
+            'action_topic': 'arm_controller/follow_joint_trajectory',
+            'joint_states_topic': 'joint_states',
+        }],
         output='screen',
     )
 
@@ -166,6 +181,7 @@ def generate_launch_description():
 
     return LaunchDescription(
         declared_arguments + [
+            PushRosNamespace(LaunchConfiguration('namespace')),
             robot_state_publisher_node,
             delayed_control_node,
             controller_spawner,
