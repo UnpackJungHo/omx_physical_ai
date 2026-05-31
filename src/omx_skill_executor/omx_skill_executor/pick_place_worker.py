@@ -140,19 +140,19 @@ class PickPlaceWorker:
 
         # 액션 클라이언트
         self._move_joints_cli = ActionClient(
-            node, MoveToJoints, "/omx/move_to_joints",
+            node, MoveToJoints, "omx/move_to_joints",
             callback_group=cb_group,
         )
         self._move_pose_cli = ActionClient(
-            node, MoveToPose, "/omx/move_to_pose",
+            node, MoveToPose, "omx/move_to_pose",
             callback_group=cb_group,
         )
         self._move_named_cli = ActionClient(
-            node, MoveToNamed, "/omx/move_to_named",
+            node, MoveToNamed, "omx/move_to_named",
             callback_group=cb_group,
         )
         self._gripper_cli = ActionClient(
-            node, GripperCommand, "/omx/gripper_command",
+            node, GripperCommand, "omx/gripper_command",
             callback_group=cb_group,
         )
         self._blocks_cli = node.create_client(
@@ -998,7 +998,7 @@ def build_worker_config_from_node(node: Node) -> WorkerConfig:
         ),
         world_poses_service_name=str(
             p("world_poses_service_name",
-              "/perception/get_box_cup_world_poses").value
+              "perception/get_box_cup_world_poses").value
         ),
         approach_frame_id=str(p("approach_frame_id", "world").value),
         hover_z=float(p("hover_z", 0.15).value),
@@ -1012,7 +1012,7 @@ def build_worker_config_from_node(node: Node) -> WorkerConfig:
         drop_clearance_m=float(p("drop_clearance_m", 0.10).value),
         world_frame=str(p("world_frame", "world").value),
         gripper_link=str(p("gripper_link", "end_effector_link").value),
-        joint_states_topic=str(p("joint_states_topic", "/joint_states").value),
+        joint_states_topic=str(p("joint_states_topic", "joint_states").value),
         yaw_min_corner_confidence=float(
             p("yaw_min_corner_confidence", 0.30).value
         ),
@@ -1027,7 +1027,7 @@ def build_worker_config_from_node(node: Node) -> WorkerConfig:
         ),
         max_grasp_retries=int(p("max_grasp_retries", 2).value),
         check_grasp_service_name=str(
-            p("check_grasp_service_name", "/gripper/check_grasp").value
+            p("check_grasp_service_name", "gripper/check_grasp").value
         ),
         grasp_settle_sec=float(p("grasp_settle_sec", 0.3).value),
         yaw_align_max_iterations=int(

@@ -49,5 +49,6 @@ setup(
     },
     entry_points={"console_scripts": [
             "box_cup_keypoint_node = omx_perception.box_cup_keypoint_node:main",
+            "camera_supervisor = omx_perception.camera_supervisor:main",
         ]},
 )

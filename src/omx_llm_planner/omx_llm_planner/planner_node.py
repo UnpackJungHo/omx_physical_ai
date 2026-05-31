@@ -69,13 +69,13 @@ class PlannerNode(Node):
         self._server = ActionServer(
             self,
             ExecuteCommand,
-            "/omx/execute_command",
+            "omx/execute_command",
             execute_callback=self._execute_callback,
             callback_group=self._cb_group,
             goal_callback=self._goal_callback,
             cancel_callback=self._cancel_callback,
         )
-        self.get_logger().info("PlannerNode ready (/omx/execute_command)")
+        self.get_logger().info("PlannerNode ready (omx/execute_command)")
 
     # ── parameters ────────────────────────────────────────────────
     def _declare_params(self) -> None:
@@ -85,15 +85,15 @@ class PlannerNode(Node):
         self.declare_parameter("llm_request_timeout_sec", 20.0)
         self.declare_parameter("llm_max_retries", 1)
         self.declare_parameter("continue_on_fail", False)
-        self.declare_parameter("pick_place_action", "/omx/pick_place")
-        self.declare_parameter("pick_place_all_action", "/omx/pick_place_all")
-        self.declare_parameter("move_to_named_action", "/omx/move_to_named")
+        self.declare_parameter("pick_place_action", "omx/pick_place")
+        self.declare_parameter("pick_place_all_action", "omx/pick_place_all")
+        self.declare_parameter("move_to_named_action", "omx/move_to_named")
         self.declare_parameter("server_wait_timeout_sec", 5.0)
         self.declare_parameter("goal_response_timeout_sec", 5.0)
         self.declare_parameter("result_timeout_sec", 120.0)
-        self.declare_parameter("gripper_action", "/omx/gripper_command")
-        self.declare_parameter("move_to_joints_action", "/omx/move_to_joints")
-        self.declare_parameter("joint_states_topic", "/joint_states")
+        self.declare_parameter("gripper_action", "omx/gripper_command")
+        self.declare_parameter("move_to_joints_action", "omx/move_to_joints")
+        self.declare_parameter("joint_states_topic", "joint_states")
         self.declare_parameter("rotate_joint_name", "joint1")
         self.declare_parameter("rotate_velocity_scale", 0.3)
         self.declare_parameter("joint_state_max_age_sec", 1.0)

@@ -48,7 +48,7 @@ class PickPlaceAllServer(Node):
         self._server = ActionServer(
             self,
             PickPlaceAll,
-            "/omx/pick_place_all",
+            "omx/pick_place_all",
             execute_callback=self._execute_callback,
             callback_group=self._cb_group,
             goal_callback=self._goal_callback,
