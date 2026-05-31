@@ -4,8 +4,11 @@ from __future__ import annotations
 import pytest
 
 from omx_llm_planner.plan_schema import (
+    ANGLE_DEG_HI,
+    GRIPPER_STATES,
     NAMED_POSES,
     PICK_COLORS,
+    ROTATE_DIRS,
     Plan,
     PlanError,
     PlanStep,
@@ -80,4 +83,34 @@ def test_missing_steps_key_raises():
 
 def test_enums_are_exposed():
     assert PICK_COLORS == ("red", "blue", "green")
-    assert NAMED_POSES == ("home", "ready", "pre_grasp", "stow")
+    assert NAMED_POSES == ("home", "init")
+
+
+def test_gripper_open_close_ok():
+    p = build_plan({"steps": [{"action": "gripper", "args": {"state": "open"}}]})
+    assert p.steps[0] == PlanStep("gripper", {"state": "open"})
+
+
+def test_gripper_invalid_state_raises():
+    with pytest.raises(PlanError):
+        build_plan({"steps": [{"action": "gripper", "args": {"state": "half"}}]})
+
+
+def test_rotate_base_ok_and_enums():
+    p = build_plan({"steps": [{"action": "rotate_base",
+                               "args": {"direction": "left", "angle_deg": 10}}]})
+    assert p.steps[0] == PlanStep("rotate_base", {"direction": "left", "angle_deg": 10})
+    assert GRIPPER_STATES == ("open", "close")
+    assert ROTATE_DIRS == ("left", "right")
+
+
+def test_rotate_base_clamps_angle():
+    p = build_plan({"steps": [{"action": "rotate_base",
+                               "args": {"direction": "right", "angle_deg": 999}}]})
+    assert p.steps[0].args["angle_deg"] == ANGLE_DEG_HI
+
+
+def test_rotate_base_invalid_direction_raises():
+    with pytest.raises(PlanError):
+        build_plan({"steps": [{"action": "rotate_base",
+                               "args": {"direction": "up", "angle_deg": 10}}]})

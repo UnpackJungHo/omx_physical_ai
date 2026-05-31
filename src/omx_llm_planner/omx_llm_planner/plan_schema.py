@@ -13,11 +13,16 @@ from dataclasses import dataclass
 from typing import Any
 
 PICK_COLORS: tuple[str, ...] = ("red", "blue", "green")
-NAMED_POSES: tuple[str, ...] = ("home", "ready", "pre_grasp", "stow")
+NAMED_POSES: tuple[str, ...] = ("home", "init")
 
 # PickPlaceAll.action 의 cap 정책과 동일: 1..10, 0/음수/과대는 default 10.
 MAX_BOXES_DEFAULT = 10
 MAX_BOXES_HI = 10
+
+GRIPPER_STATES: tuple[str, ...] = ("open", "close")
+ROTATE_DIRS: tuple[str, ...] = ("left", "right")
+ANGLE_DEG_LO = 1
+ANGLE_DEG_HI = 180
 
 
 class PlanError(Exception):
@@ -77,6 +82,13 @@ def _build_step(index: int, step: Any) -> PlanStep:
             "max_boxes": _clamp_max_boxes(args.get("max_boxes")),
             "retry_on_fail": bool(args.get("retry_on_fail", False)),
         })
+    if action == "gripper":
+        return PlanStep(action, {"state": _enum(index, args, "state", GRIPPER_STATES)})
+    if action == "rotate_base":
+        return PlanStep(action, {
+            "direction": _enum(index, args, "direction", ROTATE_DIRS),
+            "angle_deg": _clamp_angle(args.get("angle_deg")),
+        })
     raise PlanError(f"step[{index}] 미지원 action: '{action}'")
 
 
@@ -91,3 +103,9 @@ def _clamp_max_boxes(value: Any) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         return MAX_BOXES_DEFAULT
     return min(value, MAX_BOXES_HI)
+
+
+def _clamp_angle(value: Any) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < ANGLE_DEG_LO:
+        raise PlanError(f"angle_deg 가 정수(>= {ANGLE_DEG_LO}) 가 아닙니다: {value!r}")
+    return min(value, ANGLE_DEG_HI)

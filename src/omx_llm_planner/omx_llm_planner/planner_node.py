@@ -25,10 +25,14 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
+from sensor_msgs.msg import JointState
+
 from omx_interfaces.action import ExecuteCommand
 
+from omx_llm_planner.joint_state_cache import JointStateCache
 from omx_llm_planner.llm_client import LLMClient, LLMUnavailable, OllamaLLMClient
 from omx_llm_planner.plan_schema import Plan, PlanError
+from omx_llm_planner.rotate_math import RotateConfig
 from omx_llm_planner.skill_clients import DispatcherConfig, SkillDispatcher
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -36,7 +40,9 @@ DEFAULT_SYSTEM_PROMPT = (
     "응답한다: {\"steps\":[{\"action\":..., \"args\":{...}}]}. "
     "action 은 pick_place(args.object_color: red|blue|green), "
     "pick_place_all(args.max_boxes:1-10, args.retry_on_fail:bool), "
-    "move_to_named(args.name: home|ready|pre_grasp|stow) 만 사용한다. "
+    "move_to_named(args.name: home|init), "
+    "gripper(args.state: open|close), "
+    "rotate_base(args.direction: left|right, args.angle_deg:1-180) 만 사용한다. "
     "이해할 수 없으면 {\"steps\":[]} 로 응답한다."
 )
 
@@ -47,7 +53,14 @@ class PlannerNode(Node):
         self._cb_group = ReentrantCallbackGroup()
         self._declare_params()
         self._llm_client = llm_client or self._build_ollama_client()
-        self._dispatcher = SkillDispatcher(self, self._cb_group, self._dispatcher_config())
+        self._joint_cache = JointStateCache(
+            max_age_sec=self.get_parameter("joint_state_max_age_sec").value,
+            clock_now=lambda: self.get_clock().now().nanoseconds * 1e-9)
+        self._joint_sub = self.create_subscription(
+            JointState, self.get_parameter("joint_states_topic").value,
+            self._on_joint_state, 10, callback_group=self._cb_group)
+        self._dispatcher = SkillDispatcher(
+            self, self._cb_group, self._dispatcher_config(), self._joint_cache)
         self._continue_on_fail = self.get_parameter("continue_on_fail").value
 
         self._busy_lock = threading.Lock()
@@ -78,6 +91,21 @@ class PlannerNode(Node):
         self.declare_parameter("server_wait_timeout_sec", 5.0)
         self.declare_parameter("goal_response_timeout_sec", 5.0)
         self.declare_parameter("result_timeout_sec", 120.0)
+        self.declare_parameter("gripper_action", "/omx/gripper_command")
+        self.declare_parameter("move_to_joints_action", "/omx/move_to_joints")
+        self.declare_parameter("joint_states_topic", "/joint_states")
+        self.declare_parameter("rotate_joint_name", "joint1")
+        self.declare_parameter("rotate_velocity_scale", 0.3)
+        self.declare_parameter("joint_state_max_age_sec", 1.0)
+        self.declare_parameter("rotate_sign_left", 1.0)    # 하드웨어 검증 후 확정
+        self.declare_parameter("rotate_sign_right", -1.0)
+        self.declare_parameter("joint1_lower", -2.8)       # URDF limit 으로 교체
+        self.declare_parameter("joint1_upper", 2.8)
+        self.declare_parameter("gripper_open_position", 1.0)
+        self.declare_parameter("gripper_close_position", 0.0)
+
+    def _on_joint_state(self, msg) -> None:
+        self._joint_cache.update(msg, stamp=self.get_clock().now().nanoseconds * 1e-9)
 
     def _build_ollama_client(self) -> OllamaLLMClient:
         return OllamaLLMClient(
@@ -96,6 +124,17 @@ class PlannerNode(Node):
             server_wait_timeout_sec=self.get_parameter("server_wait_timeout_sec").value,
             goal_response_timeout_sec=self.get_parameter("goal_response_timeout_sec").value,
             result_timeout_sec=self.get_parameter("result_timeout_sec").value,
+            gripper_action=self.get_parameter("gripper_action").value,
+            move_to_joints_action=self.get_parameter("move_to_joints_action").value,
+            rotate_joint_name=self.get_parameter("rotate_joint_name").value,
+            rotate_velocity_scale=self.get_parameter("rotate_velocity_scale").value,
+            rotate=RotateConfig(
+                sign={"left": self.get_parameter("rotate_sign_left").value,
+                      "right": self.get_parameter("rotate_sign_right").value},
+                joint_lower=self.get_parameter("joint1_lower").value,
+                joint_upper=self.get_parameter("joint1_upper").value),
+            gripper_open_position=self.get_parameter("gripper_open_position").value,
+            gripper_close_position=self.get_parameter("gripper_close_position").value,
         )
 
     # ── action callbacks ──────────────────────────────────────────

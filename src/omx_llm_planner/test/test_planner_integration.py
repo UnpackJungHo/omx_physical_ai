@@ -13,10 +13,18 @@ from rclpy.action import ActionClient, ActionServer
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 
-from omx_interfaces.action import ExecuteCommand, MoveToNamed, PickPlace, PickPlaceAll
+from omx_interfaces.action import (
+    ExecuteCommand,
+    GripperCommand,
+    MoveToJoints,
+    MoveToNamed,
+    PickPlace,
+    PickPlaceAll,
+)
 from omx_llm_planner.llm_client import MockLLMClient
 from omx_llm_planner.planner_node import PlannerNode
 from rclpy.node import Node
+from sensor_msgs.msg import JointState
 
 
 class FakeSkillServers(Node):
@@ -36,6 +44,12 @@ class FakeSkillServers(Node):
             self, PickPlaceAll, "/omx/pick_place_all", self._pick_place_all, callback_group=cb)
         self._mtn = ActionServer(
             self, MoveToNamed, "/omx/move_to_named", self._move_to_named, callback_group=cb)
+        self._gripper = ActionServer(
+            self, GripperCommand, "/omx/gripper_command", self._gripper_command,
+            callback_group=cb)
+        self._joints = ActionServer(
+            self, MoveToJoints, "/omx/move_to_joints", self._move_to_joints,
+            callback_group=cb)
 
     def _pick_place(self, gh):
         color = gh.request.object_color
@@ -55,6 +69,20 @@ class FakeSkillServers(Node):
         self.calls.append(f"move_to_named:{gh.request.name}")
         gh.succeed()
         return MoveToNamed.Result(success=True, message="fake")
+
+    def _gripper_command(self, gh):
+        self.calls.append(f"gripper:{gh.request.position:.1f}")
+        gh.succeed()
+        return GripperCommand.Result(
+            success=True, position=gh.request.position, message="fake")
+
+    def _move_to_joints(self, gh):
+        joint = gh.request.joint_names[0] if gh.request.joint_names else "<empty>"
+        position = gh.request.positions[0] if gh.request.positions else 0.0
+        self.calls.append(
+            f"rotate_base:{joint}:{position:.3f}:{gh.request.velocity_scale:.1f}")
+        gh.succeed()
+        return MoveToJoints.Result(success=True, message="fake")
 
 
 @pytest.fixture
@@ -82,6 +110,11 @@ def _send_command(command: str, dry_run: bool = False, cancel_after_sec: float |
         ),
         "다 정리해": '{"steps": [{"action": "pick_place_all", "args": {"max_boxes": 5}}]}',
         "집에 가": '{"steps": [{"action": "move_to_named", "args": {"name": "home"}}]}',
+        "그리퍼 열어": '{"steps": [{"action": "gripper", "args": {"state": "open"}}]}',
+        "왼쪽 90도 돌아": (
+            '{"steps": [{"action": "rotate_base", '
+            '"args": {"direction": "left", "angle_deg": 90}}]}'
+        ),
     }
     fail_colors = ("red",) if command == "__fail_red__" else ()
     if command == "__fail_red__":
@@ -97,6 +130,17 @@ def _send_command(command: str, dry_run: bool = False, cancel_after_sec: float |
 
     client_node = Node("test_client")
     executor.add_node(client_node)
+    joint_pub = client_node.create_publisher(JointState, "/joint_states", 10)
+    deadline = time.time() + 1.0
+    while joint_pub.get_subscription_count() == 0 and time.time() < deadline:
+        time.sleep(0.02)
+    joint_state = JointState()
+    joint_state.name = ["joint1"]
+    joint_state.position = [0.0]
+    for _ in range(5):
+        joint_pub.publish(joint_state)
+        time.sleep(0.02)
+
     ac = ActionClient(client_node, ExecuteCommand, "/omx/execute_command")
     assert ac.wait_for_server(timeout_sec=10.0)
 
@@ -143,6 +187,18 @@ def test_pick_place_all_clamped(ros_env):
     result, calls = _send_command("다 정리해")
     assert result.success is True
     assert calls == ["pick_place_all"]
+
+
+def test_gripper_action_executes(ros_env):
+    result, calls = _send_command("그리퍼 열어")
+    assert result.success is True
+    assert calls == ["gripper:1.0"]
+
+
+def test_rotate_base_action_executes_from_joint_state(ros_env):
+    result, calls = _send_command("왼쪽 90도 돌아")
+    assert result.success is True
+    assert calls == ["rotate_base:joint1:1.571:0.3"]
 
 
 def test_step_failure_stops_sequence(ros_env):
