@@ -160,15 +160,11 @@ static double wrap_to_pm45(double angle_rad)
 }
 
 // ── named pose → SRDF group_state 매핑 ───────────────────────────────────
-// SRDF(omx_f.srdf) 에 등록된 arm 그룹 named state 목록:
-//   "init" : 모든 조인트 0
-//   "home" : joint2=-1.57, joint3=1.57, joint4=1.57
+// MoveToNamed 공개 허용값은 "home", "init" 두 개로 제한한다.
+// SRDF(omx_f.srdf)의 arm group_state로 직접 매핑한다.
 static const std::unordered_map<std::string, std::string> NAMED_POSE_MAP = {
     {"home", "home"},
     {"init", "init"},
-    {"ready", "home"},     // home 자세를 ready 로 사용
-    {"stow", "init"},      // 모든 조인트 0 → 안전 접힘
-    {"pre_grasp", "home"}, // 그리핑 전 준비 → home 근사값
 };
 
 class MotionServer : public rclcpp::Node
@@ -184,6 +180,7 @@ public:
       : Node("motion_server", options), node_options_(options)
   {
     declare_parameter<std::string>("arm_tip_link", "end_effector_link");
+    declare_parameter<bool>("moveit_ready", false);
     // Workspace 사전 거부 한계 (world frame 기준).
     // EE 가 x,y 방향으로 멀리 뻗으면 dxl12 (shoulder) 의 중력 모멘트가 급증해
     // Overload Hardware Error 로 모터가 차단된다. 그 영역의 goal pose 를 사전에 거부한다.
@@ -209,28 +206,28 @@ public:
     cb_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
 
     move_to_named_server_ = rclcpp_action::create_server<MoveToNamed>(
-        this, "/omx/move_to_named",
+        this, "omx/move_to_named",
         std::bind(&MotionServer::handle_named_goal, this, std::placeholders::_1, std::placeholders::_2),
         std::bind(&MotionServer::handle_named_cancel, this, std::placeholders::_1),
         std::bind(&MotionServer::handle_named_accepted, this, std::placeholders::_1),
         rcl_action_server_get_default_options(), cb_group_);
 
     move_to_pose_server_ = rclcpp_action::create_server<MoveToPose>(
-        this, "/omx/move_to_pose",
+        this, "omx/move_to_pose",
         std::bind(&MotionServer::handle_pose_goal, this, std::placeholders::_1, std::placeholders::_2),
         std::bind(&MotionServer::handle_pose_cancel, this, std::placeholders::_1),
         std::bind(&MotionServer::handle_pose_accepted, this, std::placeholders::_1),
         rcl_action_server_get_default_options(), cb_group_);
 
     move_to_joints_server_ = rclcpp_action::create_server<MoveToJoints>(
-        this, "/omx/move_to_joints",
+        this, "omx/move_to_joints",
         std::bind(&MotionServer::handle_joints_goal, this, std::placeholders::_1, std::placeholders::_2),
         std::bind(&MotionServer::handle_joints_cancel, this, std::placeholders::_1),
         std::bind(&MotionServer::handle_joints_accepted, this, std::placeholders::_1),
         rcl_action_server_get_default_options(), cb_group_);
 
     gripper_server_ = rclcpp_action::create_server<GripperCmd>(
-        this, "/omx/gripper_command",
+        this, "omx/gripper_command",
         std::bind(&MotionServer::handle_gripper_goal, this, std::placeholders::_1, std::placeholders::_2),
         std::bind(&MotionServer::handle_gripper_cancel, this, std::placeholders::_1),
         std::bind(&MotionServer::handle_gripper_accepted, this, std::placeholders::_1),
@@ -248,7 +245,7 @@ public:
 
     // Joint states 구독 (best_effort — 센서 스트림)
     joint_state_sub_ = create_subscription<sensor_msgs::msg::JointState>(
-        "/joint_states",
+        "joint_states",
         rclcpp::SensorDataQoS(),
         [this](sensor_msgs::msg::JointState::SharedPtr msg) {
           std::lock_guard<std::mutex> lk(joint_state_mutex_);
@@ -257,7 +254,7 @@ public:
 
     // AlignGripperYaw 액션 서버
     align_gripper_yaw_server_ = rclcpp_action::create_server<AlignGripperYaw>(
-        this, "/omx/align_gripper_yaw",
+        this, "omx/align_gripper_yaw",
         std::bind(&MotionServer::handle_align_goal, this, std::placeholders::_1, std::placeholders::_2),
         std::bind(&MotionServer::handle_align_cancel, this, std::placeholders::_1),
         std::bind(&MotionServer::handle_align_accepted, this, std::placeholders::_1),
@@ -283,8 +280,14 @@ public:
       create_moveit_helper_node();
     }
 
+    const std::string move_group_namespace = resolved_move_group_namespace();
+    const rclcpp::Duration wait_for_move_group = rclcpp::Duration::from_seconds(10.0);
+    moveit::planning_interface::MoveGroupInterface::Options arm_options(
+        "arm",
+        moveit::planning_interface::MoveGroupInterface::ROBOT_DESCRIPTION,
+        move_group_namespace);
     arm_group_ = std::make_shared<moveit::planning_interface::MoveGroupInterface>(
-        moveit_node_, "arm");
+        moveit_node_, arm_options, std::shared_ptr<tf2_ros::Buffer>(), wait_for_move_group);
     arm_group_->setMaxVelocityScalingFactor(DEFAULT_VEL_SCALE);
     arm_group_->setMaxAccelerationScalingFactor(DEFAULT_ACC_SCALE);
     arm_group_->setPlanningTime(5.0);
@@ -294,8 +297,12 @@ public:
     arm_group_->setGoalOrientationTolerance(0.01); // ~0.57°, position_only_ik 라 큰 영향 없음
     arm_group_->setGoalJointTolerance(0.001);      // ~0.057°, encoder 1 step 보다 작음
 
+    moveit::planning_interface::MoveGroupInterface::Options gripper_options(
+        "gripper",
+        moveit::planning_interface::MoveGroupInterface::ROBOT_DESCRIPTION,
+        move_group_namespace);
     gripper_group_ = std::make_shared<moveit::planning_interface::MoveGroupInterface>(
-        moveit_node_, "gripper");
+        moveit_node_, gripper_options, std::shared_ptr<tf2_ros::Buffer>(), wait_for_move_group);
     gripper_group_->setMaxVelocityScalingFactor(DEFAULT_VEL_SCALE);
     gripper_group_->setMaxAccelerationScalingFactor(DEFAULT_ACC_SCALE);
     gripper_group_->setPlanningTime(3.0);
@@ -346,6 +353,12 @@ public:
     arm_joint_names_ = get_parameter("arm_joint_names").as_string_array();
   }
 
+  std::string resolved_move_group_namespace() const
+  {
+    const std::string ns = this->get_namespace();
+    return ns == "/" ? std::string() : ns;
+  }
+
   void create_moveit_helper_node()
   {
     if (moveit_node_)
@@ -366,7 +379,7 @@ public:
     }
 
     moveit_node_ = std::make_shared<rclcpp::Node>(
-        "motion_server_moveit", helper_options);
+        "motion_server_moveit", this->get_namespace(), helper_options);
 
     RCLCPP_INFO(
         get_logger(),
@@ -383,6 +396,11 @@ public:
   bool is_moveit_ready() const
   {
     return arm_group_ && !arm_group_->getPlanningFrame().empty() && gripper_group_ && !gripper_group_->getPlanningFrame().empty();
+  }
+
+  void publish_moveit_ready(bool ready)
+  {
+    set_parameter(rclcpp::Parameter("moveit_ready", ready));
   }
 
   // execute 직전/직후 조인트 상태 스냅샷.
@@ -1433,6 +1451,7 @@ int main(int argc, char **argv)
     constexpr auto kPollAttempts = 50;                 // 약 10초
     constexpr auto kRetryInterval = std::chrono::seconds(2);
     while (rclcpp::ok()) {
+      node->publish_moveit_ready(false);
       try {
         node->init_moveit();
       } catch (const std::exception & e) {
@@ -1445,6 +1464,7 @@ int main(int argc, char **argv)
       // 잠깐 시간이 걸릴 수 있으므로 짧게 폴링한다.
       for (int i = 0; i < kPollAttempts && rclcpp::ok(); ++i) {
         if (node->is_moveit_ready()) {
+          node->publish_moveit_ready(true);
           RCLCPP_INFO(node->get_logger(),
             "MoveGroupInterface ready — MotionServer running");
           return;
