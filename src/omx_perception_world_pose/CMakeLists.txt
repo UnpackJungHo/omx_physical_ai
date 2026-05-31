@@ -52,9 +52,11 @@ install(DIRECTORY config/
   DESTINATION share/${PROJECT_NAME}/config
 )
 
-install(DIRECTORY launch/
-  DESTINATION share/${PROJECT_NAME}/launch
-)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/launch")
+  install(DIRECTORY launch/
+    DESTINATION share/${PROJECT_NAME}/launch
+  )
+endif()
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)

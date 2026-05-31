@@ -19,14 +19,25 @@ find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 
 # miniconda libcurl/libssl 충돌 방지: 시스템 curl/ssl 명시 링크
-find_library(SYSTEM_CURL curl HINTS /usr/lib/x86_64-linux-gnu NO_DEFAULT_PATH)
-find_library(SYSTEM_SSL ssl HINTS /usr/lib/x86_64-linux-gnu NO_DEFAULT_PATH)
-find_library(SYSTEM_CRYPTO crypto HINTS /usr/lib/x86_64-linux-gnu NO_DEFAULT_PATH)
+set(SYSTEM_LIBRARY_DIRS /usr/lib /usr/local/lib)
+if(CMAKE_LIBRARY_ARCHITECTURE)
+  list(PREPEND SYSTEM_LIBRARY_DIRS "/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}")
+endif()
+find_library(SYSTEM_CURL curl HINTS ${SYSTEM_LIBRARY_DIRS} NO_DEFAULT_PATH)
+find_library(SYSTEM_SSL ssl HINTS ${SYSTEM_LIBRARY_DIRS} NO_DEFAULT_PATH)
+find_library(SYSTEM_CRYPTO crypto HINTS ${SYSTEM_LIBRARY_DIRS} NO_DEFAULT_PATH)
+
+set(SYSTEM_RPATH_DIRS /opt/ros/jazzy/lib /usr/lib)
+if(CMAKE_LIBRARY_ARCHITECTURE)
+  list(PREPEND SYSTEM_RPATH_DIRS "/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}")
+endif()
+list(REMOVE_DUPLICATES SYSTEM_RPATH_DIRS)
+string(JOIN ";" SYSTEM_RPATH ${SYSTEM_RPATH_DIRS})
 
 add_executable(motion_server src/motion_server.cpp)
 # miniconda 라이브러리가 런타임에 끼어들지 못하도록 시스템 경로를 RPATH 에 명시
 set_target_properties(motion_server PROPERTIES
-  INSTALL_RPATH "/usr/lib/x86_64-linux-gnu;/opt/ros/jazzy/lib"
+  INSTALL_RPATH "${SYSTEM_RPATH}"
   BUILD_WITH_INSTALL_RPATH TRUE)
 target_include_directories(motion_server PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

@@ -15,7 +15,7 @@
   <depend>geometry_msgs</depend>
   <depend>builtin_interfaces</depend>
   <depend>omx_interfaces</depend>
-  <depend>opencv2</depend>
+  <depend>libopencv-dev</depend>
   <depend>yaml-cpp</depend>
 
   <build_depend>ament_cmake_gtest</build_depend>
