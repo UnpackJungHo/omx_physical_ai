@@ -12,6 +12,7 @@
 
 사용:
   ros2 launch omx_skill_executor skill_executor.launch.py
+  ros2 launch omx_skill_executor skill_executor.launch.py namespace:=robot1
 """
 
 from __future__ import annotations
@@ -20,7 +21,21 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch_ros.actions import Node
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node, PushRosNamespace
+import yaml
+
+
+def _load_ros_parameters(config_path: str, node_name: str) -> dict:
+    with open(config_path, "r", encoding="utf-8") as stream:
+        data = yaml.safe_load(stream) or {}
+    try:
+        return data[node_name]["ros__parameters"]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"{config_path} does not contain ros__parameters for {node_name}"
+        ) from exc
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -34,7 +49,7 @@ def generate_launch_description() -> LaunchDescription:
         package="omx_skill_executor",
         executable="pick_place_server",
         name="pick_place_server",
-        parameters=[config_path],
+        parameters=[_load_ros_parameters(config_path, "pick_place_server")],
         output="screen",
         emulate_tty=True,
     )
@@ -43,12 +58,18 @@ def generate_launch_description() -> LaunchDescription:
         package="omx_skill_executor",
         executable="pick_place_all_server",
         name="pick_place_all_server",
-        parameters=[config_path],
+        parameters=[_load_ros_parameters(config_path, "pick_place_all_server")],
         output="screen",
         emulate_tty=True,
     )
 
     return LaunchDescription([
+        DeclareLaunchArgument(
+            "namespace",
+            default_value="",
+            description="Namespace for ROS nodes.",
+        ),
+        PushRosNamespace(LaunchConfiguration("namespace")),
         pick_place_server,
         pick_place_all_server,
     ])

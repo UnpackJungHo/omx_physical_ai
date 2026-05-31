@@ -1,7 +1,7 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, LogInfo, OpaqueFunction
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
-from launch_ros.actions import Node
+from launch_ros.actions import Node, PushRosNamespace
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
@@ -43,8 +43,8 @@ def _launch_camera(context, *args, **kwargs):
                 {"image_raw.enable_pub_plugins": ["image_transport/raw"]},
             ],
             remappings=[
-                ("image_raw", "/image/raw"),
-                ("camera_info", "/camera/info"),
+                ("image_raw", "image/raw"),
+                ("camera_info", "camera/info"),
             ],
         ),
     ]
@@ -60,7 +60,7 @@ def generate_launch_description():
         parameters=[
             {
                 "model_path": LaunchConfiguration("box_cup_model_path"),
-                "image_topic": "/image/raw",
+                "image_topic": "image/raw",
                 "output_dir": LaunchConfiguration("box_cup_output_dir"),
                 "extra_pythonpath": LaunchConfiguration("box_cup_extra_pythonpath"),
                 "device": ParameterValue(LaunchConfiguration("box_cup_device"), value_type=str),
@@ -97,6 +97,12 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        DeclareLaunchArgument(
+            "namespace",
+            default_value="",
+            description="Namespace for ROS nodes.",
+        ),
+        PushRosNamespace(LaunchConfiguration("namespace")),
         DeclareLaunchArgument(
             "camera_name_match",
             default_value="Innomaker",
