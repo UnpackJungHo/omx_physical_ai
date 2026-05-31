@@ -74,7 +74,7 @@ public:
     rclcpp::QoS latched_qos(1);
     latched_qos.reliable();
     latched_qos.transient_local();
-    is_grasping_pub_ = create_publisher<std_msgs::msg::Bool>("/gripper/is_grasping", latched_qos);
+    is_grasping_pub_ = create_publisher<std_msgs::msg::Bool>("gripper/is_grasping", latched_qos);
 
     // 힘 추정값은 일반 sensor 스트림 — best effort, depth 10.
     // omx_web_ws 차트가 이 토픽을 직접 구독하므로 이름/타입/QoS/발행 주기를
@@ -82,18 +82,18 @@ public:
     rclcpp::QoS sensor_qos(10);
     sensor_qos.best_effort();
     force_pub_ = create_publisher<std_msgs::msg::Float32>(
-      "/gripper/grasp_force_estimate", sensor_qos);
+      "gripper/grasp_force_estimate", sensor_qos);
 
     // ── subscriptions ──────────────────────────────────────────────
     rclcpp::QoS js_qos(rclcpp::KeepLast(50));
     js_qos.best_effort();
     joint_state_sub_ = create_subscription<sensor_msgs::msg::JointState>(
-      "/joint_states", js_qos,
+      "joint_states", js_qos,
       std::bind(&GraspDetector::on_joint_state, this, std::placeholders::_1));
 
     // ── service ────────────────────────────────────────────────────
     check_grasp_srv_ = create_service<omx_interfaces::srv::CheckGrasp>(
-      "/gripper/check_grasp",
+      "gripper/check_grasp",
       std::bind(&GraspDetector::on_check_grasp, this,
         std::placeholders::_1, std::placeholders::_2));
 

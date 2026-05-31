@@ -202,7 +202,7 @@ class PickPlaceWorker:
     # High-level orchestrations
     # ────────────────────────────────────────────────────────────────
 
-    def pick_one_box(self, phase_cb: PhaseCallback) -> PickResult:
+    def pick_one_box(self, phase_cb: PhaseCallback, target_color: str = "") -> PickResult:
         """detect → filter → (sweep) → pick → verify 의 한 box 사이클.
 
         성공 시 박스를 잡고 scan 자세까지 복귀한 상태. cup, target_box 도 유효.
@@ -242,12 +242,15 @@ class PickPlaceWorker:
             boxes, cup_local = self._detect_box_cup()
             result.attempts += 1
 
+            if target_color:
+                boxes = [b for b in boxes if b.color == target_color]
+
             # cup 내부에 있는 박스는 잡으러 가지 않는다 (이미 처리된 박스).
             filtered_boxes = self._filter_boxes_outside_cup(boxes, cup_local)
 
             if not (filtered_boxes and cup_local):
                 filtered_boxes, cup_local, result.attempts = self._sweep_for_box_cup(
-                    phase_cb, result.attempts
+                    phase_cb, result.attempts, target_color
                 )
 
             if not (filtered_boxes and cup_local):
@@ -425,6 +428,7 @@ class PickPlaceWorker:
         self,
         phase_cb: PhaseCallback,
         attempts_so_far: int,
+        target_color: str = "",
     ) -> tuple[list[BlockPose], Optional[BlockPose], int]:
         """joint1 절대각 스윕. 매번 cup-필터 적용한 결과로 판단."""
         cfg = self._config
@@ -459,6 +463,8 @@ class PickPlaceWorker:
                 continue
             attempts += 1
             boxes, cup = self._detect_box_cup()
+            if target_color:
+                boxes = [b for b in boxes if b.color == target_color]
             outside = self._filter_boxes_outside_cup(boxes, cup)
             if outside and cup:
                 return outside, cup, attempts

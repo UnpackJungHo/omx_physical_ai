@@ -74,13 +74,15 @@ class PickPlaceServer(Node):
         result = PickPlace.Result(success=False, message="", attempts=0)
         self._active_goal_handle = goal_handle
         self._worker.begin_goal(goal_handle)
+        
+        target_color = goal_handle.request.object_color.strip().lower()
 
         def phase_cb(phase: str, status: str) -> None:
             fb = PickPlace.Feedback(phase=phase, status=status)
             goal_handle.publish_feedback(fb)
             self.get_logger().info(f"[{phase}] {status}")
 
-        pick = self._worker.pick_one_box(phase_cb)
+        pick = self._worker.pick_one_box(phase_cb, target_color=target_color)
         result.attempts = pick.attempts
         if not pick.success:
             return self._fail(goal_handle, result, pick.error)
