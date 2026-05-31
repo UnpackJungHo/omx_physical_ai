@@ -185,7 +185,7 @@ def _is_capture_device(video_device: Path) -> bool:
     except OSError:
         return False
 
-    capabilities, device_caps = struct.unpack_from("II", querycap, 80)
+    capabilities, device_caps = struct.unpack_from("II", querycap, 84)
     active_caps = device_caps if capabilities & V4L2_CAP_DEVICE_CAPS else capabilities
     capture_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_VIDEO_CAPTURE_MPLANE
     return bool(active_caps & capture_caps)
