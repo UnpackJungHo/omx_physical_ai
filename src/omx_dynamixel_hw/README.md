@@ -27,7 +27,7 @@ MoveIt2 → JointTrajectoryController → controller_manager
 
 | 파일 | 역할 |
 |------|------|
-| `control_table.{hpp,cpp}` | X-series 2.0 레지스터 주소(프로토콜 상수) + tick↔rad / current↔mA / velocity↔rad·s⁻¹ / voltage 단위 변환(순수 함수, 단위 테스트) |
+| `control_table.{hpp,cpp}` | X-series 2.0 레지스터 주소(프로토콜 상수) + tick↔rad / current↔mA / velocity↔rad·s⁻¹ / voltage 단위 변환(순수 함수, 단위 테스트). current 단위는 ping model 번호로 모델별 결정(XL430-W250=2.69, XL330-M288=1.0 mA/unit) |
 | `dxl_bus.{hpp,cpp}` | `dynamixel_sdk` 호출 격리. ping / read·write1·2·4 / GroupSyncRead(현재 current·velocity·position 연속 블록) / GroupSyncWrite(goal position) |
 | `dynamixel_system.{hpp,cpp}` | `OmxDynamixelSystem : SystemInterface`. joint↔gpio 1:1 매핑, operating mode/PID/profile/limit/goal current 초기화, 진단 round-robin read + RealtimePublisher |
 | `watchdog_logic.hpp` | 안전정지 임계 판정 순수 함수(header-only, 단위 테스트) |

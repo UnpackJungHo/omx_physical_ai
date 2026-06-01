@@ -35,6 +35,7 @@ struct JointConfig {
   bool has_current{false};   // mode 5 (current-based position)
   int goal_current{0}, current_limit{0};
   bool expose_effort{false}; // gripper present current -> effort state
+  double current_ma_per_unit{2.69};  // model 별 current 단위 (on_configure 의 ping model 로 설정)
 };
 
 // 모터별 진단 스냅샷 (round-robin 으로 갱신).

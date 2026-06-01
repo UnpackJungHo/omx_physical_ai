@@ -121,8 +121,8 @@ hardware_interface::CallbackReturn OmxDynamixelSystem::on_configure(
     RCLCPP_ERROR(get_logger(), "포트 open 실패: %s @ %d", port_.c_str(), baud_);
     return hardware_interface::CallbackReturn::ERROR;
   }
-  // 6 모터 ping 확인 (실패 시 명시적 ERROR)
-  for (const auto & jc : joints_) {
+  // 6 모터 ping 확인 (실패 시 명시적 ERROR). model 번호로 current 단위를 모델별로 확정.
+  for (auto & jc : joints_) {
     uint16_t model = 0;
     std::string err;
     if (!bus_->ping(jc.id, model, err)) {
@@ -130,7 +130,14 @@ hardware_interface::CallbackReturn OmxDynamixelSystem::on_configure(
       bus_->close();
       return hardware_interface::CallbackReturn::ERROR;
     }
-    RCLCPP_INFO(get_logger(), "ping OK ID %u model=%u", jc.id, model);
+    jc.current_ma_per_unit = current_ma_per_unit_for_model(model);
+    if (model != model::XL430_W250 && model != model::XL330_M288) {
+      RCLCPP_WARN(get_logger(),
+                  "ID %u model=%u 는 미등록 모델 - current 단위 기본값 %.2f mA/unit 사용", jc.id,
+                  model, jc.current_ma_per_unit);
+    }
+    RCLCPP_INFO(get_logger(), "ping OK ID %u model=%u (current %.2f mA/unit)", jc.id, model,
+                jc.current_ma_per_unit);
   }
 
   // 별도 노드: 진단 publish + 운영 서비스
@@ -307,7 +314,8 @@ hardware_interface::return_type OmxDynamixelSystem::read(
     set_state(jc.name + "/" + hardware_interface::HW_IF_POSITION, rad);
     set_state(jc.name + "/" + hardware_interface::HW_IF_VELOCITY, radps);
     if (jc.expose_effort) {
-      const double ma = current_unit_to_ma(decode_present_current(it->second.current));
+      const double ma =
+        current_unit_to_ma(decode_present_current(it->second.current), jc.current_ma_per_unit);
       health_[i].present_current_ma = ma;
       set_state(jc.name + "/" + hardware_interface::HW_IF_EFFORT, ma);
     }

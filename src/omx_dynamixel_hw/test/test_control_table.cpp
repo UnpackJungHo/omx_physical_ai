@@ -35,6 +35,17 @@ TEST(ControlTable, CurrentUnitToMilliAmp) {
   EXPECT_NEAR(current_unit_to_ma(0), 0.0, 1e-9);
 }
 
+TEST(ControlTable, CurrentUnitPerModel) {
+  // model 1060 = XL430 (2.69 mA/unit), 1200 = XL330 (1.0 mA/unit)
+  EXPECT_NEAR(current_ma_per_unit_for_model(1060), 2.69, 1e-9);
+  EXPECT_NEAR(current_ma_per_unit_for_model(1200), 1.00, 1e-9);
+  // 미지 모델은 기본값(2.69)으로 폴백
+  EXPECT_NEAR(current_ma_per_unit_for_model(9999), 2.69, 1e-9);
+  // model 인지 변환: XL330 그리퍼 100 unit -> 100 mA
+  EXPECT_NEAR(current_unit_to_ma(100, current_ma_per_unit_for_model(1200)), 100.0, 1e-9);
+  EXPECT_NEAR(current_unit_to_ma(100, current_ma_per_unit_for_model(1060)), 269.0, 1e-9);
+}
+
 TEST(ControlTable, SignedCurrentDecode) {
   // Present Current는 int16. 0xFFFF -> -1 unit
   EXPECT_EQ(decode_present_current(0xFFFF), -1);
