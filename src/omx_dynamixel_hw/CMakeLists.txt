@@ -17,6 +17,7 @@ find_package(omx_interfaces REQUIRED)
 # 플러그인 라이브러리 (소스는 Task 2,4,6에서 채운다)
 add_library(omx_dynamixel_hw SHARED
   src/control_table.cpp
+  src/dxl_bus.cpp
 )
 target_include_directories(omx_dynamixel_hw PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -28,6 +29,12 @@ ament_target_dependencies(omx_dynamixel_hw
 
 # pluginlib export 는 Task 6 에서 클래스가 생긴 뒤 활성화한다.
 # pluginlib_export_plugin_description_file(hardware_interface omx_dynamixel_hw.xml)
+
+# 실HW ping/scan 스모크 도구
+add_executable(dxl_ping_tool src/dxl_ping_tool.cpp)
+target_link_libraries(dxl_ping_tool omx_dynamixel_hw)
+ament_target_dependencies(dxl_ping_tool dynamixel_sdk)
+install(TARGETS dxl_ping_tool DESTINATION lib/${PROJECT_NAME})
 
 install(TARGETS omx_dynamixel_hw
   ARCHIVE DESTINATION lib
