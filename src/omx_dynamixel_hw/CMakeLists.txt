@@ -43,6 +43,10 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_control_table test/test_control_table.cpp src/control_table.cpp)
   target_include_directories(test_control_table PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+  ament_add_gtest(test_watchdog_logic test/test_watchdog_logic.cpp)
+  target_include_directories(test_watchdog_logic PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_features(test_watchdog_logic PRIVATE cxx_std_20)  # designated initializers in test
 endif()
 
 ament_package()
