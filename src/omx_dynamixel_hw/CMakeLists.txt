@@ -13,6 +13,7 @@ find_package(rclcpp_lifecycle REQUIRED)
 find_package(dynamixel_sdk REQUIRED)
 find_package(realtime_tools REQUIRED)
 find_package(omx_interfaces REQUIRED)
+find_package(controller_manager_msgs REQUIRED)
 
 # 플러그인 라이브러리 (소스는 Task 2,4,6에서 채운다)
 add_library(omx_dynamixel_hw SHARED
@@ -35,6 +36,12 @@ add_executable(dxl_ping_tool src/dxl_ping_tool.cpp)
 target_link_libraries(dxl_ping_tool omx_dynamixel_hw)
 ament_target_dependencies(dxl_ping_tool dynamixel_sdk)
 install(TARGETS dxl_ping_tool DESTINATION lib/${PROJECT_NAME})
+
+# 진단 구독 + 안전정지 watchdog 노드
+add_executable(dxl_watchdog_node src/dxl_watchdog_node.cpp)
+ament_target_dependencies(dxl_watchdog_node rclcpp omx_interfaces controller_manager_msgs)
+target_include_directories(dxl_watchdog_node PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+install(TARGETS dxl_watchdog_node DESTINATION lib/${PROJECT_NAME})
 
 install(TARGETS omx_dynamixel_hw
   ARCHIVE DESTINATION lib

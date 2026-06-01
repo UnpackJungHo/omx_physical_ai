@@ -176,6 +176,19 @@ def generate_launch_description():
         condition=IfCondition(start_rviz),
     )
 
+    # dxl_watchdog: 커스텀 HW(use_custom_hw) 사용 시에만 진단 구독 + 안전정지
+    dxl_watchdog_config = PathJoinSubstitution([
+        FindPackageShare('omx_dynamixel_hw'),
+        'config', 'dxl_watchdog.yaml',
+    ])
+    dxl_watchdog_node = Node(
+        package='omx_dynamixel_hw',
+        executable='dxl_watchdog_node',
+        parameters=[dxl_watchdog_config],
+        output='screen',
+        condition=IfCondition(use_custom_hw),
+    )
+
     # robot_state_publisher 가 시작된 뒤에 ros2_control_node 를 띄운다.
     # ros2_control 4.x 는 /robot_description 토픽을 받아야 초기화가 시작된다.
     # 동시에 뜨면 FastDDS discovery 타이밍 문제로 토픽을 못 받는 경우가 있다.
@@ -194,5 +207,6 @@ def generate_launch_description():
             controller_spawner,
             joint_trajectory_executor,
             rviz_node,
+            dxl_watchdog_node,
         ]
     )
