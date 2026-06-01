@@ -54,6 +54,11 @@ def generate_launch_description():
             default_value='/dev/ttyACM0',
             description='Dynamixel USB 시리얼 포트 (실제 하드웨어 전용)',
         ),
+        DeclareLaunchArgument(
+            'use_custom_hw',
+            default_value='false',
+            description='true: 직접 구현한 omx_dynamixel_hw SystemInterface 사용 (opt-in)',
+        ),
     ]
 
     start_rviz = LaunchConfiguration('start_rviz')
@@ -61,6 +66,7 @@ def generate_launch_description():
     use_mock_hardware = LaunchConfiguration('use_mock_hardware')
     use_hardware_mock = LaunchConfiguration('use_hardware_mock')
     port_name = LaunchConfiguration('port_name')
+    use_custom_hw = LaunchConfiguration('use_custom_hw')
     mock_hardware_enabled = PythonExpression([
         "'true' if '",
         use_mock_hardware,
@@ -81,6 +87,7 @@ def generate_launch_description():
             ' prefix:=', prefix,
             ' use_mock_hardware:=', mock_hardware_enabled,
             ' port_name:=', port_name,
+            ' use_custom_hw:=', use_custom_hw,
         ]),
         value_type=str,
     )
