@@ -24,6 +24,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/BlockPose.msg"
   "msg/KeypointDetection.msg"
   "msg/KeypointSample.msg"
+  "msg/DynamixelDiagnostics.msg"
   "srv/GetBlockPoses.srv"
   "srv/GetKeypointDetections.srv"
   "srv/CheckGrasp.srv"
