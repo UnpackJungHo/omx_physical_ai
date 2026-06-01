@@ -4,12 +4,18 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 #include "omx_dynamixel_hw/control_table.hpp"
 #include "pluginlib/class_list_macros.hpp"
+
+namespace {
+constexpr char kSetTorqueService[] = "~/set_torque";
+constexpr char kRebootService[] = "~/reboot";
+}  // namespace
 
 namespace omx_dynamixel_hw {
 
@@ -109,6 +115,7 @@ hardware_interface::CallbackReturn OmxDynamixelSystem::on_init(
 
 hardware_interface::CallbackReturn OmxDynamixelSystem::on_configure(
   const rclcpp_lifecycle::State &) {
+  stop_service_thread();  // 재구성 시 기존 스레드가 옛 bus_ 를 만지지 않도록 먼저 정리
   bus_ = std::make_unique<DxlBus>(port_, baud_);
   if (!bus_->open()) {
     RCLCPP_ERROR(get_logger(), "포트 open 실패: %s @ %d", port_.c_str(), baud_);
@@ -126,14 +133,76 @@ hardware_interface::CallbackReturn OmxDynamixelSystem::on_configure(
     RCLCPP_INFO(get_logger(), "ping OK ID %u model=%u", jc.id, model);
   }
 
-  // 진단 publisher (publish-only, spin 불필요)
+  // 별도 노드: 진단 publish + 운영 서비스
   diag_node_ = std::make_shared<rclcpp::Node>("omx_dxl_hw_diag");
   auto pub = diag_node_->create_publisher<omx_interfaces::msg::DynamixelDiagnostics>(
     "~/dynamixel_diagnostics", rclcpp::QoS(10));
   diag_pub_ = std::make_shared<
     realtime_tools::RealtimePublisher<omx_interfaces::msg::DynamixelDiagnostics>>(pub);
 
+  set_torque_srv_ = diag_node_->create_service<std_srvs::srv::SetBool>(
+    kSetTorqueService,
+    std::bind(&OmxDynamixelSystem::on_set_torque, this, std::placeholders::_1,
+              std::placeholders::_2));
+  reboot_srv_ = diag_node_->create_service<omx_interfaces::srv::RebootDxl>(
+    kRebootService,
+    std::bind(&OmxDynamixelSystem::on_reboot, this, std::placeholders::_1,
+              std::placeholders::_2));
+
+  start_service_thread();
+  RCLCPP_INFO(get_logger(), "운영 서비스 준비: %s/set_torque, %s/reboot",
+              diag_node_->get_name(), diag_node_->get_name());
   return hardware_interface::CallbackReturn::SUCCESS;
+}
+
+void OmxDynamixelSystem::start_service_thread() {
+  if (svc_running_.exchange(true)) return;
+  svc_exec_ = std::make_unique<rclcpp::executors::SingleThreadedExecutor>();
+  svc_exec_->add_node(diag_node_);
+  svc_thread_ = std::thread([this]() { svc_exec_->spin(); });
+}
+
+void OmxDynamixelSystem::stop_service_thread() {
+  if (!svc_running_.exchange(false)) return;
+  if (svc_exec_) svc_exec_->cancel();
+  if (svc_thread_.joinable()) svc_thread_.join();
+  svc_exec_.reset();
+}
+
+OmxDynamixelSystem::~OmxDynamixelSystem() { stop_service_thread(); }
+
+void OmxDynamixelSystem::on_set_torque(
+  const std::shared_ptr<std_srvs::srv::SetBool::Request> req,
+  std::shared_ptr<std_srvs::srv::SetBool::Response> res) {
+  std::lock_guard<std::mutex> lock(bus_mtx_);  // RT read/write 와 버스 직렬화
+  if (!bus_) { res->success = false; res->message = "bus not open"; return; }
+  bool all_ok = true;
+  for (const auto & jc : joints_) {
+    all_ok &= bus_->write1(jc.id, reg::TORQUE_ENABLE, req->data ? 1 : 0);
+  }
+  res->success = all_ok;
+  res->message = std::string("torque ") + (req->data ? "enable" : "disable") +
+                 (all_ok ? " OK" : " 일부 실패");
+  RCLCPP_WARN(get_logger(), "[service] %s", res->message.c_str());
+}
+
+void OmxDynamixelSystem::on_reboot(
+  const std::shared_ptr<omx_interfaces::srv::RebootDxl::Request> req,
+  std::shared_ptr<omx_interfaces::srv::RebootDxl::Response> res) {
+  std::lock_guard<std::mutex> lock(bus_mtx_);
+  if (!bus_) { res->success = false; res->message = "bus not open"; return; }
+  bool all_ok = true;
+  std::string targets;
+  for (const auto & jc : joints_) {
+    if (req->id != 0 && jc.id != req->id) continue;
+    const bool ok = bus_->reboot(jc.id);
+    all_ok &= ok;
+    targets += " " + std::to_string(jc.id) + (ok ? "(ok)" : "(fail)");
+  }
+  if (targets.empty()) { res->success = false; res->message = "no matching id"; return; }
+  res->success = all_ok;
+  res->message = "reboot:" + targets;
+  RCLCPP_WARN(get_logger(), "[service] %s", res->message.c_str());
 }
 
 bool OmxDynamixelSystem::apply_servo_config(const JointConfig & jc) {
@@ -161,6 +230,7 @@ bool OmxDynamixelSystem::apply_servo_config(const JointConfig & jc) {
 
 hardware_interface::CallbackReturn OmxDynamixelSystem::on_activate(
   const rclcpp_lifecycle::State &) {
+  std::lock_guard<std::mutex> lock(bus_mtx_);  // 서비스 스레드와 버스 직렬화
   // 1) torque disable -> config write -> torque enable
   for (const auto & jc : joints_) {
     if (!bus_->write1(jc.id, reg::TORQUE_ENABLE, 0)) {
@@ -203,6 +273,7 @@ hardware_interface::CallbackReturn OmxDynamixelSystem::on_activate(
 
 hardware_interface::CallbackReturn OmxDynamixelSystem::on_deactivate(
   const rclcpp_lifecycle::State &) {
+  std::lock_guard<std::mutex> lock(bus_mtx_);
   if (disable_torque_at_deactivate_) {
     for (const auto & jc : joints_) {
       bus_->write1(jc.id, reg::TORQUE_ENABLE, 0);
@@ -217,6 +288,7 @@ hardware_interface::CallbackReturn OmxDynamixelSystem::on_deactivate(
 hardware_interface::return_type OmxDynamixelSystem::read(
   const rclcpp::Time & time, const rclcpp::Duration & /*period*/) {
   ++read_cycle_;
+  std::lock_guard<std::mutex> lock(bus_mtx_);  // 서비스 스레드와 버스 직렬화 (RT 경로, ~1-2ms)
 
   // 1) position/velocity/current 일괄 GroupSyncRead
   std::map<uint8_t, PresentState> states;
@@ -291,6 +363,7 @@ hardware_interface::return_type OmxDynamixelSystem::write(
     }
     goals[jc.id] = static_cast<uint32_t>(tick);
   }
+  std::lock_guard<std::mutex> lock(bus_mtx_);  // 서비스 스레드와 버스 직렬화
   if (!goals.empty() && !bus_->sync_write_goal_position(goals)) {
     // 죽은 버스의 에스컬레이션은 read() 가 담당. 여기선 침묵하지 않게 throttled 경고만.
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,

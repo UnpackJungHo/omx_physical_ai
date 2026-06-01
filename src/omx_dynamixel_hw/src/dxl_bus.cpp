@@ -39,6 +39,12 @@ bool DxlBus::ping(uint8_t id, uint16_t & model_number, std::string & err) {
   return true;
 }
 
+bool DxlBus::reboot(uint8_t id) {
+  uint8_t dxl_err = 0;
+  int rc = packet_h_->reboot(port_h_, id, &dxl_err);
+  return rc == COMM_SUCCESS && dxl_err == 0;
+}
+
 bool DxlBus::write1(uint8_t id, const Reg & r, uint8_t v) {
   uint8_t e = 0;
   return packet_h_->write1ByteTxRx(port_h_, id, r.address, v, &e) == COMM_SUCCESS && e == 0;

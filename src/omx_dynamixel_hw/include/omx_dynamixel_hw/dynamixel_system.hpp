@@ -1,18 +1,24 @@
 // include/omx_dynamixel_hw/dynamixel_system.hpp
 #pragma once
+#include <atomic>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "hardware_interface/system_interface.hpp"
 #include "hardware_interface/types/hardware_interface_return_values.hpp"
 #include "rclcpp/macros.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "rclcpp/executors/single_threaded_executor.hpp"
 #include "rclcpp_lifecycle/state.hpp"
 #include "realtime_tools/realtime_publisher.hpp"
+#include "std_srvs/srv/set_bool.hpp"
 
 #include "omx_interfaces/msg/dynamixel_diagnostics.hpp"
+#include "omx_interfaces/srv/reboot_dxl.hpp"
 #include "omx_dynamixel_hw/dxl_bus.hpp"
 
 namespace omx_dynamixel_hw {
@@ -44,6 +50,8 @@ class OmxDynamixelSystem : public hardware_interface::SystemInterface {
 public:
   RCLCPP_SHARED_PTR_DEFINITIONS(OmxDynamixelSystem)
 
+  ~OmxDynamixelSystem() override;
+
   hardware_interface::CallbackReturn on_init(
     const hardware_interface::HardwareComponentInterfaceParams & params) override;
   hardware_interface::CallbackReturn on_configure(const rclcpp_lifecycle::State &) override;
@@ -57,11 +65,18 @@ public:
 private:
   bool apply_servo_config(const JointConfig & jc);  // write 실패 시 false
   void publish_diagnostics(const rclcpp::Time & time);
+  void start_service_thread();
+  void stop_service_thread();
+  void on_set_torque(const std::shared_ptr<std_srvs::srv::SetBool::Request> req,
+                     std::shared_ptr<std_srvs::srv::SetBool::Response> res);
+  void on_reboot(const std::shared_ptr<omx_interfaces::srv::RebootDxl::Request> req,
+                 std::shared_ptr<omx_interfaces::srv::RebootDxl::Response> res);
 
   std::vector<JointConfig> joints_;
   std::vector<uint8_t> ids_;
   std::vector<MotorHealth> health_;
   std::unique_ptr<DxlBus> bus_;
+  std::mutex bus_mtx_;   // 모든 bus_ 접근 직렬화 (시리얼 단일회선 - 동시접근 시 패킷 손상)
 
   // hardware_parameters (URDF) 에서 읽는 설정
   std::string port_{"/dev/ttyACM1"};
@@ -71,10 +86,16 @@ private:
   int read_error_max_cycles_{50};    // 버스 전면 실패가 N 사이클 연속이면 read() ERROR 에스컬레이션
   bool disable_torque_at_deactivate_{true};
 
-  // 진단 publisher (별도 노드, spin 불필요 - publish-only)
+  // 별도 노드: 진단 publish + 운영 서비스(reboot/torque). RT 경로(read/write)와 분리된
+  // 전용 executor 스레드에서 spin 한다 (로보티즈처럼 read() 안에서 spin 하지 않음).
   std::shared_ptr<rclcpp::Node> diag_node_;
   std::shared_ptr<realtime_tools::RealtimePublisher<omx_interfaces::msg::DynamixelDiagnostics>>
     diag_pub_;
+  rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr set_torque_srv_;
+  rclcpp::Service<omx_interfaces::srv::RebootDxl>::SharedPtr reboot_srv_;
+  std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> svc_exec_;
+  std::thread svc_thread_;
+  std::atomic<bool> svc_running_{false};
 
   size_t diag_rr_index_{0};   // round-robin 으로 한 사이클에 한 모터 진단 read
   int read_cycle_{0};

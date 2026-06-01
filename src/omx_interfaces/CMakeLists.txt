@@ -28,6 +28,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/GetBlockPoses.srv"
   "srv/GetKeypointDetections.srv"
   "srv/CheckGrasp.srv"
+  "srv/RebootDxl.srv"
   DEPENDENCIES std_msgs geometry_msgs action_msgs builtin_interfaces
 )
 

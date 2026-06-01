@@ -14,6 +14,7 @@ find_package(dynamixel_sdk REQUIRED)
 find_package(realtime_tools REQUIRED)
 find_package(omx_interfaces REQUIRED)
 find_package(controller_manager_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 
 # 플러그인 라이브러리 (소스는 Task 2,4,6에서 채운다)
 add_library(omx_dynamixel_hw SHARED
@@ -27,7 +28,8 @@ target_include_directories(omx_dynamixel_hw PUBLIC
 )
 target_compile_features(omx_dynamixel_hw PUBLIC cxx_std_17)
 ament_target_dependencies(omx_dynamixel_hw
-  hardware_interface pluginlib rclcpp rclcpp_lifecycle dynamixel_sdk realtime_tools omx_interfaces)
+  hardware_interface pluginlib rclcpp rclcpp_lifecycle dynamixel_sdk realtime_tools omx_interfaces
+  std_srvs)
 
 pluginlib_export_plugin_description_file(hardware_interface omx_dynamixel_hw.xml)
 

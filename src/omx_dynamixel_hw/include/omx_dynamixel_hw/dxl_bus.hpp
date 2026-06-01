@@ -26,6 +26,7 @@ public:
   bool open();   // port open + baud 설정
   void close();
   bool ping(uint8_t id, uint16_t & model_number, std::string & err);
+  bool reboot(uint8_t id);   // DYNAMIXEL reboot (과부하/HW error latch 해제)
 
   bool write1(uint8_t id, const Reg & r, uint8_t v);
   bool write2(uint8_t id, const Reg & r, uint16_t v);

@@ -1,0 +1,6 @@
+# RebootDxl.srv
+# 실행 중 DYNAMIXEL 을 reboot 한다(과부하/HW error latch 해제).
+uint8 id    # 대상 DYNAMIXEL ID. 0 = 전 모터
+---
+bool success
+string message
