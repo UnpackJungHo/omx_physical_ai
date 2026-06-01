@@ -44,6 +44,16 @@ hardware_interface::CallbackReturn OmxDynamixelSystem::on_init(
     hw_param(info_.hardware_parameters, "diagnostics_publish_decimation",
              std::to_string(diag_publish_decimation_)));
   if (diag_publish_decimation_ < 1) diag_publish_decimation_ = 1;
+  diag_read_decimation_ = std::stoi(
+    hw_param(info_.hardware_parameters, "diagnostics_read_decimation",
+             std::to_string(diag_read_decimation_)));
+  if (diag_read_decimation_ < 1) diag_read_decimation_ = 1;
+  read_error_max_cycles_ = std::stoi(
+    hw_param(info_.hardware_parameters, "read_error_max_cycles",
+             std::to_string(read_error_max_cycles_)));
+  if (read_error_max_cycles_ < 1) read_error_max_cycles_ = 1;
+  disable_torque_at_deactivate_ =
+    hw_param(info_.hardware_parameters, "disable_torque_at_deactivate", "true") == "true";
 
   // joint <-> gpio 1:1 매핑 (이 로봇은 선언 순서로 정렬: joint1..gripper <-> dxl11..dxl16)
   if (info_.gpios.size() != info_.joints.size()) {
@@ -126,21 +136,27 @@ hardware_interface::CallbackReturn OmxDynamixelSystem::on_configure(
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
-void OmxDynamixelSystem::apply_servo_config(const JointConfig & jc) {
-  // operating mode 변경은 torque off 상태에서만 가능
-  bus_->write1(jc.id, reg::OPERATING_MODE, static_cast<uint8_t>(jc.operating_mode));
-  bus_->write2(jc.id, reg::POSITION_P_GAIN, static_cast<uint16_t>(jc.position_p));
-  bus_->write2(jc.id, reg::POSITION_I_GAIN, static_cast<uint16_t>(jc.position_i));
-  bus_->write2(jc.id, reg::POSITION_D_GAIN, static_cast<uint16_t>(jc.position_d));
+bool OmxDynamixelSystem::apply_servo_config(const JointConfig & jc) {
+  bool ok = true;
+  // operating mode / current limit 는 안전 직결 - 실패하면 false (on_activate 가 ERROR 처리).
+  // operating mode 변경은 torque off 상태에서만 가능.
+  ok &= bus_->write1(jc.id, reg::OPERATING_MODE, static_cast<uint8_t>(jc.operating_mode));
+  // PID/profile 은 gain 손실 가능성을 경고로 노출(치명적이진 않으나 침묵 금지).
+  if (!bus_->write2(jc.id, reg::POSITION_P_GAIN, static_cast<uint16_t>(jc.position_p)) ||
+      !bus_->write2(jc.id, reg::POSITION_I_GAIN, static_cast<uint16_t>(jc.position_i)) ||
+      !bus_->write2(jc.id, reg::POSITION_D_GAIN, static_cast<uint16_t>(jc.position_d))) {
+    RCLCPP_WARN(get_logger(), "PID gain write 일부 실패 ID %u - 모터 기본 gain 으로 동작할 수 있음", jc.id);
+  }
   if (jc.profile_velocity > 0)
     bus_->write4(jc.id, reg::PROFILE_VELOCITY, static_cast<uint32_t>(jc.profile_velocity));
   if (jc.profile_acceleration > 0)
     bus_->write4(jc.id, reg::PROFILE_ACCELERATION, static_cast<uint32_t>(jc.profile_acceleration));
   if (jc.has_current) {
     if (jc.current_limit > 0)
-      bus_->write2(jc.id, reg::CURRENT_LIMIT, static_cast<uint16_t>(jc.current_limit));
-    bus_->write2(jc.id, reg::GOAL_CURRENT, static_cast<uint16_t>(jc.goal_current));
+      ok &= bus_->write2(jc.id, reg::CURRENT_LIMIT, static_cast<uint16_t>(jc.current_limit));
+    ok &= bus_->write2(jc.id, reg::GOAL_CURRENT, static_cast<uint16_t>(jc.goal_current));
   }
+  return ok;
 }
 
 hardware_interface::CallbackReturn OmxDynamixelSystem::on_activate(
@@ -151,7 +167,11 @@ hardware_interface::CallbackReturn OmxDynamixelSystem::on_activate(
       RCLCPP_ERROR(get_logger(), "torque disable 실패 ID %u", jc.id);
       return hardware_interface::CallbackReturn::ERROR;
     }
-    apply_servo_config(jc);
+    if (!apply_servo_config(jc)) {
+      RCLCPP_ERROR(get_logger(),
+                   "servo config write 실패 ID %u (operating mode/current limit) - 활성화 중단", jc.id);
+      return hardware_interface::CallbackReturn::ERROR;
+    }
     if (!bus_->write1(jc.id, reg::TORQUE_ENABLE, 1)) {
       RCLCPP_ERROR(get_logger(), "torque enable 실패 ID %u", jc.id);
       return hardware_interface::CallbackReturn::ERROR;
@@ -183,23 +203,29 @@ hardware_interface::CallbackReturn OmxDynamixelSystem::on_activate(
 
 hardware_interface::CallbackReturn OmxDynamixelSystem::on_deactivate(
   const rclcpp_lifecycle::State &) {
-  for (const auto & jc : joints_) {
-    bus_->write1(jc.id, reg::TORQUE_ENABLE, 0);
+  if (disable_torque_at_deactivate_) {
+    for (const auto & jc : joints_) {
+      bus_->write1(jc.id, reg::TORQUE_ENABLE, 0);
+    }
+    RCLCPP_INFO(get_logger(), "OmxDynamixelSystem deactivated (torque off)");
+  } else {
+    RCLCPP_INFO(get_logger(), "OmxDynamixelSystem deactivated (torque 유지)");
   }
-  RCLCPP_INFO(get_logger(), "OmxDynamixelSystem deactivated (torque off)");
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
 hardware_interface::return_type OmxDynamixelSystem::read(
   const rclcpp::Time & time, const rclcpp::Duration & /*period*/) {
+  ++read_cycle_;
+
   // 1) position/velocity/current 일괄 GroupSyncRead
   std::map<uint8_t, PresentState> states;
-  const bool ok = bus_->sync_read_present_states(ids_, states);
+  bus_->sync_read_present_states(ids_, states);
   for (size_t i = 0; i < joints_.size(); ++i) {
     const auto & jc = joints_[i];
     auto it = states.find(jc.id);
     if (it == states.end()) {
-      health_[i].comm_ok = false;
+      health_[i].comm_ok = false;  // 개별 모터 드롭아웃 -> watchdog 로 위임
       continue;
     }
     health_[i].comm_ok = true;
@@ -214,10 +240,22 @@ hardware_interface::return_type OmxDynamixelSystem::read(
       set_state(jc.name + "/" + hardware_interface::HW_IF_EFFORT, ma);
     }
   }
-  (void)ok;
 
-  // 2) 진단(temperature/voltage/hw error)은 느린 레지스터 - 사이클당 1모터 round-robin
-  if (!joints_.empty()) {
+  // 결함1 수정: 2단계 실패 처리.
+  //  - 개별 모터 드롭아웃: 위에서 comm_ok=false -> 진단/watchdog 가 컨트롤러 deactivate
+  //  - 버스 전면 실패(한 모터도 못 읽음)가 연속 N 사이클: resource manager 에 ERROR 에스컬레이션
+  if (states.empty()) {
+    if (++read_fail_streak_ >= read_error_max_cycles_) {
+      RCLCPP_ERROR(get_logger(),
+                   "버스 read 가 %d 사이클 연속 전면 실패 - HW ERROR 에스컬레이션", read_fail_streak_);
+      return hardware_interface::return_type::ERROR;
+    }
+  } else {
+    read_fail_streak_ = 0;
+  }
+
+  // 결함3 수정: 진단(느린 개별 레지스터)은 매 사이클이 아니라 decimation 주기로만 read.
+  if (!joints_.empty() && (read_cycle_ % diag_read_decimation_) == 0) {
     const size_t idx = diag_rr_index_ % joints_.size();
     const uint8_t id = joints_[idx].id;
     uint8_t temp = 0, hwerr = 0;
@@ -234,8 +272,8 @@ hardware_interface::return_type OmxDynamixelSystem::read(
     diag_rr_index_ = (diag_rr_index_ + 1) % joints_.size();
   }
 
-  // 3) decimation 주기로 진단 발행
-  if ((++read_cycle_ % diag_publish_decimation_) == 0) {
+  // decimation 주기로 진단 발행
+  if ((read_cycle_ % diag_publish_decimation_) == 0) {
     publish_diagnostics(time);
   }
   return hardware_interface::return_type::OK;
@@ -253,8 +291,10 @@ hardware_interface::return_type OmxDynamixelSystem::write(
     }
     goals[jc.id] = static_cast<uint32_t>(tick);
   }
-  if (!goals.empty()) {
-    bus_->sync_write_goal_position(goals);
+  if (!goals.empty() && !bus_->sync_write_goal_position(goals)) {
+    // 죽은 버스의 에스컬레이션은 read() 가 담당. 여기선 침묵하지 않게 throttled 경고만.
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+                         "GroupSyncWrite goal position 실패");
   }
   return hardware_interface::return_type::OK;
 }

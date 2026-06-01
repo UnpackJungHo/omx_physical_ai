@@ -55,7 +55,7 @@ public:
     const rclcpp::Time & time, const rclcpp::Duration & period) override;
 
 private:
-  void apply_servo_config(const JointConfig & jc);
+  bool apply_servo_config(const JointConfig & jc);  // write 실패 시 false
   void publish_diagnostics(const rclcpp::Time & time);
 
   std::vector<JointConfig> joints_;
@@ -67,6 +67,9 @@ private:
   std::string port_{"/dev/ttyACM1"};
   int baud_{1000000};
   int diag_publish_decimation_{50};  // read 사이클 N 회마다 1회 진단 발행
+  int diag_read_decimation_{10};     // read 사이클 N 회마다 1모터 진단 read (버스 부하 절감)
+  int read_error_max_cycles_{50};    // 버스 전면 실패가 N 사이클 연속이면 read() ERROR 에스컬레이션
+  bool disable_torque_at_deactivate_{true};
 
   // 진단 publisher (별도 노드, spin 불필요 - publish-only)
   std::shared_ptr<rclcpp::Node> diag_node_;
@@ -75,6 +78,7 @@ private:
 
   size_t diag_rr_index_{0};   // round-robin 으로 한 사이클에 한 모터 진단 read
   int read_cycle_{0};
+  int read_fail_streak_{0};   // sync read 가 전 모터 실패한 연속 사이클 수
 };
 
 }  // namespace omx_dynamixel_hw
