@@ -130,6 +130,7 @@ hardware_interface::CallbackReturn OmxDynamixelSystem::on_configure(
       bus_->close();
       return hardware_interface::CallbackReturn::ERROR;
     }
+    jc.model = model;
     jc.current_ma_per_unit = current_ma_per_unit_for_model(model);
     if (model != model::XL430_W250 && model != model::XL330_M288) {
       RCLCPP_WARN(get_logger(),
@@ -348,6 +349,7 @@ hardware_interface::return_type OmxDynamixelSystem::read(
       health_[idx].temperature_c = static_cast<int>(temp);
       health_[idx].input_voltage_v = voltage_unit_to_v(static_cast<int>(volt));
       health_[idx].hardware_error_status = hwerr;
+      health_[idx].diag_valid = true;  // 이 모터는 이제 유효 샘플 보유
     }
     diag_rr_index_ = (diag_rr_index_ + 1) % joints_.size();
   }
@@ -386,18 +388,22 @@ void OmxDynamixelSystem::publish_diagnostics(const rclcpp::Time & time) {
   m.header.stamp = time;
   const size_t n = joints_.size();
   m.ids.resize(n);
+  m.model.resize(n);
   m.present_current_ma.resize(n);
   m.temperature_c.resize(n);
   m.input_voltage_v.resize(n);
   m.hardware_error_status.resize(n);
   m.comm_ok.resize(n);
+  m.diag_valid.resize(n);
   for (size_t i = 0; i < n; ++i) {
     m.ids[i] = joints_[i].id;
+    m.model[i] = joints_[i].model;
     m.present_current_ma[i] = health_[i].present_current_ma;
     m.temperature_c[i] = health_[i].temperature_c;
     m.input_voltage_v[i] = health_[i].input_voltage_v;
     m.hardware_error_status[i] = health_[i].hardware_error_status;
     m.comm_ok[i] = health_[i].comm_ok;
+    m.diag_valid[i] = health_[i].diag_valid;
   }
   diag_pub_->unlockAndPublish();
 }

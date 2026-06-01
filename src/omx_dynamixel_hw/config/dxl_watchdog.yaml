@@ -4,8 +4,13 @@
   ros__parameters:
     # 임계값 (X-series, 보수적 기본값)
     max_temperature_c: 70        # Present Temperature [C] 초과 시 정지
-    min_input_voltage_v: 9.5     # Present Input Voltage [V] 미만 시 정지
+    min_input_voltage_v: 9.5     # 전압 컷오프 폴백 (모델 미등록 시). 12V 계열 기준
     max_comm_fail_streak: 5      # 연속 통신 실패 횟수 초과 시 정지
+    # 모델별 전압 컷오프 (혼합 모델 버스). 진단 메시지의 model 번호로 선택.
+    #   1060 = XL430-W250 (12V, 컷오프 9.5V) / 1200 = XL330-M288 (5V, 동작 3.7-6.0V -> 3.7V)
+    # 미등록 모델은 위 min_input_voltage_v 로 폴백.
+    voltage_model_ids: [1060, 1200]
+    voltage_model_min_v: [9.5, 3.7]
     # 진단 토픽 (omx_dynamixel_hw 의 진단 노드가 발행)
     diagnostics_topic: "/omx_dxl_hw_diag/dynamixel_diagnostics"
     # 안전정지 경로: controller_manager 의 컨트롤러 deactivate (상대경로)

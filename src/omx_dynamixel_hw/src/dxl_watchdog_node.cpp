@@ -11,6 +11,7 @@
 #include "omx_dynamixel_hw/watchdog_logic.hpp"
 
 using omx_dynamixel_hw::JointHealth;
+using omx_dynamixel_hw::resolve_min_voltage;
 using omx_dynamixel_hw::should_safety_stop;
 using omx_dynamixel_hw::WatchdogThresholds;
 
@@ -20,6 +21,21 @@ public:
     th_.max_temperature_c = declare_parameter<int>("max_temperature_c", 70);
     th_.min_input_voltage_v = declare_parameter<double>("min_input_voltage_v", 9.5);
     th_.max_comm_fail_streak = declare_parameter<int>("max_comm_fail_streak", 5);
+
+    // 모델별 전압 컷오프 (혼합 모델 버스): 병렬 배열 voltage_model_ids/voltage_model_min_v.
+    // 진단 메시지의 model 번호로 임계를 선택하고, 미등록 모델은 min_input_voltage_v 폴백.
+    const auto v_model_ids =
+      declare_parameter<std::vector<int64_t>>("voltage_model_ids", std::vector<int64_t>{});
+    const auto v_model_min =
+      declare_parameter<std::vector<double>>("voltage_model_min_v", std::vector<double>{});
+    if (v_model_ids.size() != v_model_min.size()) {
+      RCLCPP_ERROR(get_logger(),
+                   "voltage_model_ids(%zu) 와 voltage_model_min_v(%zu) 길이 불일치 - 모델별 임계 무시",
+                   v_model_ids.size(), v_model_min.size());
+    } else {
+      for (size_t i = 0; i < v_model_ids.size(); ++i)
+        min_v_by_model_[static_cast<uint16_t>(v_model_ids[i])] = v_model_min[i];
+    }
     const auto topic = declare_parameter<std::string>(
       "diagnostics_topic", "/omx_dxl_hw_diag/dynamixel_diagnostics");
     // 상대경로 기본값: 네임스페이스 push 시 함께 따라가도록 (project_relative_names_namespace)
@@ -56,10 +72,25 @@ private:
       h.hardware_error_status =
         (i < m->hardware_error_status.size()) ? m->hardware_error_status[i] : 0;
       h.comm_fail_streak = comm_fail_streak_[id];
+      // 미샘플 모터(초기 0)는 temp/voltage/hwerr 평가에서 제외 (comm 은 항상 평가)
+      h.diag_valid = (i < m->diag_valid.size()) ? m->diag_valid[i] : false;
 
-      const auto d = should_safety_stop(h, th_);
+      // 모델별 전압 컷오프 적용 (혼합 모델 버스). model 미발행/미등록이면 기본값 유지.
+      WatchdogThresholds th = th_;
+      const uint16_t model = (i < m->model.size()) ? m->model[i] : 0;
+      th.min_input_voltage_v =
+        resolve_min_voltage(model, min_v_by_model_, th_.min_input_voltage_v);
+
+      const auto d = should_safety_stop(h, th);
       if (d.triggered) {
-        trigger_stop(id, d.reason);
+        // 실제 측정값을 로그에 포함 (오탐/실제 이상 구분용)
+        const std::string detail = d.reason + " (model=" + std::to_string(model) +
+                                   " V=" + std::to_string(h.input_voltage_v) +
+                                   " minV=" + std::to_string(th.min_input_voltage_v) +
+                                   " temp=" + std::to_string(h.temperature_c) +
+                                   " hwerr=" + std::to_string(h.hardware_error_status) +
+                                   " comm_streak=" + std::to_string(h.comm_fail_streak) + ")";
+        trigger_stop(id, detail);
         return;
       }
     }
@@ -80,6 +111,7 @@ private:
   }
 
   WatchdogThresholds th_{};
+  std::map<uint16_t, double> min_v_by_model_;  // model -> 전압 컷오프 (혼합 모델 버스)
   std::string switch_service_;
   std::vector<std::string> deactivate_controllers_;
   std::map<uint8_t, int> comm_fail_streak_;

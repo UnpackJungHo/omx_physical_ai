@@ -35,6 +35,7 @@ struct JointConfig {
   bool has_current{false};   // mode 5 (current-based position)
   int goal_current{0}, current_limit{0};
   bool expose_effort{false}; // gripper present current -> effort state
+  uint16_t model{0};         // ping 으로 확인한 DYNAMIXEL model number (진단 발행/모델별 임계용)
   double current_ma_per_unit{2.69};  // model 별 current 단위 (on_configure 의 ping model 로 설정)
 };
 
@@ -45,6 +46,7 @@ struct MotorHealth {
   double input_voltage_v{0.0};
   uint8_t hardware_error_status{0};
   bool comm_ok{true};
+  bool diag_valid{false};  // temp/voltage/hwerr 가 round-robin 으로 1회 이상 채워졌는지
 };
 
 class OmxDynamixelSystem : public hardware_interface::SystemInterface {
