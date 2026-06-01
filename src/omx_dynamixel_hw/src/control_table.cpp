@@ -16,4 +16,12 @@ double current_unit_to_ma(int unit) { return unit * CURRENT_MA_PER_UNIT; }
 
 int decode_present_current(uint16_t raw) { return static_cast<int16_t>(raw); }
 
+int decode_present_velocity(uint32_t raw) { return static_cast<int32_t>(raw); }
+
+double velocity_unit_to_rad_per_s(int unit) {
+  return unit * VELOCITY_RPM_PER_UNIT * (2.0 * M_PI / 60.0);
+}
+
+double voltage_unit_to_v(int unit) { return unit * VOLTAGE_V_PER_UNIT; }
+
 }  // namespace omx_dynamixel_hw

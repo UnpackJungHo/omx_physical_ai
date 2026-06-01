@@ -1,0 +1,7 @@
+<library path="omx_dynamixel_hw">
+  <class name="omx_dynamixel_hw/OmxDynamixelSystem"
+         type="omx_dynamixel_hw::OmxDynamixelSystem"
+         base_class_type="hardware_interface::SystemInterface">
+    <description>OMX DYNAMIXEL bus SystemInterface on dynamixel_sdk</description>
+  </class>
+</library>

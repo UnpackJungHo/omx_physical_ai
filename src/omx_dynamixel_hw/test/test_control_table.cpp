@@ -40,3 +40,12 @@ TEST(ControlTable, SignedCurrentDecode) {
   EXPECT_EQ(decode_present_current(0xFFFF), -1);
   EXPECT_EQ(decode_present_current(0x0064), 100);
 }
+
+TEST(ControlTable, VelocityDecodeAndConvert) {
+  // Present Velocity는 int32. 0xFFFFFFFF -> -1 unit
+  EXPECT_EQ(decode_present_velocity(0xFFFFFFFFu), -1);
+  EXPECT_EQ(decode_present_velocity(0x00000064u), 100);
+  // X-series: 0.229 rev/min per unit
+  EXPECT_NEAR(velocity_unit_to_rad_per_s(0), 0.0, 1e-9);
+  EXPECT_NEAR(velocity_unit_to_rad_per_s(100), 100 * 0.229 * 2.0 * M_PI / 60.0, 1e-6);
+}

@@ -1,0 +1,286 @@
+// src/dynamixel_system.cpp
+#include "omx_dynamixel_hw/dynamixel_system.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <string>
+#include <unordered_map>
+
+#include "hardware_interface/types/hardware_interface_type_values.hpp"
+#include "omx_dynamixel_hw/control_table.hpp"
+#include "pluginlib/class_list_macros.hpp"
+
+namespace omx_dynamixel_hw {
+
+namespace {
+// gpio 파라미터(map<string,string>) 헬퍼. 키가 없으면 default 반환.
+int param_int(const std::unordered_map<std::string, std::string> & p,
+              const std::string & key, int def) {
+  auto it = p.find(key);
+  return it != p.end() ? std::stoi(it->second) : def;
+}
+bool has_key(const std::unordered_map<std::string, std::string> & p, const std::string & key) {
+  return p.find(key) != p.end();
+}
+std::string hw_param(const std::unordered_map<std::string, std::string> & p,
+                     const std::string & key, const std::string & def) {
+  auto it = p.find(key);
+  return it != p.end() ? it->second : def;
+}
+}  // namespace
+
+hardware_interface::CallbackReturn OmxDynamixelSystem::on_init(
+  const hardware_interface::HardwareComponentInterfaceParams & params) {
+  if (hardware_interface::SystemInterface::on_init(params) !=
+      hardware_interface::CallbackReturn::SUCCESS) {
+    return hardware_interface::CallbackReturn::ERROR;
+  }
+
+  // hardware_parameters (URDF <param>) - 튜닝/설정값
+  port_ = hw_param(info_.hardware_parameters, "port_name", port_);
+  baud_ = std::stoi(hw_param(info_.hardware_parameters, "baud_rate", std::to_string(baud_)));
+  diag_publish_decimation_ = std::stoi(
+    hw_param(info_.hardware_parameters, "diagnostics_publish_decimation",
+             std::to_string(diag_publish_decimation_)));
+  if (diag_publish_decimation_ < 1) diag_publish_decimation_ = 1;
+
+  // joint <-> gpio 1:1 매핑 (이 로봇은 선언 순서로 정렬: joint1..gripper <-> dxl11..dxl16)
+  if (info_.gpios.size() != info_.joints.size()) {
+    RCLCPP_ERROR(
+      get_logger(), "joints(%zu) 와 gpios(%zu) 개수가 다릅니다. 커스텀 HW 는 1:1 매핑을 요구합니다.",
+      info_.joints.size(), info_.gpios.size());
+    return hardware_interface::CallbackReturn::ERROR;
+  }
+
+  joints_.clear();
+  ids_.clear();
+  for (size_t i = 0; i < info_.joints.size(); ++i) {
+    const auto & j = info_.joints[i];
+    const auto & g = info_.gpios[i].parameters;
+    JointConfig jc;
+    jc.name = j.name;
+    jc.id = static_cast<uint8_t>(param_int(g, "ID", 0));
+    jc.operating_mode = param_int(g, "Operating Mode", 3);
+    jc.position_p = param_int(g, "Position P Gain", 0);
+    jc.position_i = param_int(g, "Position I Gain", 0);
+    jc.position_d = param_int(g, "Position D Gain", 0);
+    jc.profile_velocity = param_int(g, "Profile Velocity", 0);
+    jc.profile_acceleration = param_int(g, "Profile Acceleration", 0);
+    jc.has_position_limit = has_key(g, "Min Position Limit") && has_key(g, "Max Position Limit");
+    jc.min_position_limit = param_int(g, "Min Position Limit", 0);
+    jc.max_position_limit = param_int(g, "Max Position Limit", 0);
+    jc.has_current = has_key(g, "Goal Current");
+    jc.goal_current = param_int(g, "Goal Current", 0);
+    jc.current_limit = param_int(g, "Current Limit", 0);
+    // gripper 는 effort state interface 를 선언했는지로 판별
+    jc.expose_effort = std::any_of(
+      j.state_interfaces.begin(), j.state_interfaces.end(),
+      [](const hardware_interface::InterfaceInfo & si) {
+        return si.name == hardware_interface::HW_IF_EFFORT;
+      });
+
+    if (jc.id == 0) {
+      RCLCPP_ERROR(get_logger(), "joint '%s' 에 대응하는 gpio 의 ID 파라미터가 없습니다.",
+                   jc.name.c_str());
+      return hardware_interface::CallbackReturn::ERROR;
+    }
+    RCLCPP_INFO(get_logger(), "map joint '%s' <-> dxl ID %u (mode %d%s)", jc.name.c_str(), jc.id,
+                jc.operating_mode, jc.expose_effort ? ", effort" : "");
+    joints_.push_back(jc);
+    ids_.push_back(jc.id);
+  }
+  health_.assign(joints_.size(), MotorHealth{});
+
+  RCLCPP_INFO(get_logger(), "OmxDynamixelSystem on_init: port=%s baud=%d joints=%zu", port_.c_str(),
+              baud_, joints_.size());
+  return hardware_interface::CallbackReturn::SUCCESS;
+}
+
+hardware_interface::CallbackReturn OmxDynamixelSystem::on_configure(
+  const rclcpp_lifecycle::State &) {
+  bus_ = std::make_unique<DxlBus>(port_, baud_);
+  if (!bus_->open()) {
+    RCLCPP_ERROR(get_logger(), "포트 open 실패: %s @ %d", port_.c_str(), baud_);
+    return hardware_interface::CallbackReturn::ERROR;
+  }
+  // 6 모터 ping 확인 (실패 시 명시적 ERROR)
+  for (const auto & jc : joints_) {
+    uint16_t model = 0;
+    std::string err;
+    if (!bus_->ping(jc.id, model, err)) {
+      RCLCPP_ERROR(get_logger(), "ping 실패 ID %u (%s): %s", jc.id, jc.name.c_str(), err.c_str());
+      bus_->close();
+      return hardware_interface::CallbackReturn::ERROR;
+    }
+    RCLCPP_INFO(get_logger(), "ping OK ID %u model=%u", jc.id, model);
+  }
+
+  // 진단 publisher (publish-only, spin 불필요)
+  diag_node_ = std::make_shared<rclcpp::Node>("omx_dxl_hw_diag");
+  auto pub = diag_node_->create_publisher<omx_interfaces::msg::DynamixelDiagnostics>(
+    "~/dynamixel_diagnostics", rclcpp::QoS(10));
+  diag_pub_ = std::make_shared<
+    realtime_tools::RealtimePublisher<omx_interfaces::msg::DynamixelDiagnostics>>(pub);
+
+  return hardware_interface::CallbackReturn::SUCCESS;
+}
+
+void OmxDynamixelSystem::apply_servo_config(const JointConfig & jc) {
+  // operating mode 변경은 torque off 상태에서만 가능
+  bus_->write1(jc.id, reg::OPERATING_MODE, static_cast<uint8_t>(jc.operating_mode));
+  bus_->write2(jc.id, reg::POSITION_P_GAIN, static_cast<uint16_t>(jc.position_p));
+  bus_->write2(jc.id, reg::POSITION_I_GAIN, static_cast<uint16_t>(jc.position_i));
+  bus_->write2(jc.id, reg::POSITION_D_GAIN, static_cast<uint16_t>(jc.position_d));
+  if (jc.profile_velocity > 0)
+    bus_->write4(jc.id, reg::PROFILE_VELOCITY, static_cast<uint32_t>(jc.profile_velocity));
+  if (jc.profile_acceleration > 0)
+    bus_->write4(jc.id, reg::PROFILE_ACCELERATION, static_cast<uint32_t>(jc.profile_acceleration));
+  if (jc.has_current) {
+    if (jc.current_limit > 0)
+      bus_->write2(jc.id, reg::CURRENT_LIMIT, static_cast<uint16_t>(jc.current_limit));
+    bus_->write2(jc.id, reg::GOAL_CURRENT, static_cast<uint16_t>(jc.goal_current));
+  }
+}
+
+hardware_interface::CallbackReturn OmxDynamixelSystem::on_activate(
+  const rclcpp_lifecycle::State &) {
+  // 1) torque disable -> config write -> torque enable
+  for (const auto & jc : joints_) {
+    if (!bus_->write1(jc.id, reg::TORQUE_ENABLE, 0)) {
+      RCLCPP_ERROR(get_logger(), "torque disable 실패 ID %u", jc.id);
+      return hardware_interface::CallbackReturn::ERROR;
+    }
+    apply_servo_config(jc);
+    if (!bus_->write1(jc.id, reg::TORQUE_ENABLE, 1)) {
+      RCLCPP_ERROR(get_logger(), "torque enable 실패 ID %u", jc.id);
+      return hardware_interface::CallbackReturn::ERROR;
+    }
+  }
+
+  if (!bus_->setup_groups(ids_)) {
+    RCLCPP_ERROR(get_logger(), "GroupSyncRead/Write 파라미터 등록 실패");
+    return hardware_interface::CallbackReturn::ERROR;
+  }
+
+  // 2) 현재 위치 1회 read -> command 를 현재 위치로 초기화(활성화 시 점프 방지)
+  std::map<uint8_t, PresentState> states;
+  if (bus_->sync_read_present_states(ids_, states)) {
+    for (const auto & jc : joints_) {
+      auto it = states.find(jc.id);
+      if (it == states.end()) continue;
+      const double rad = tick_to_rad(static_cast<int>(it->second.position));
+      set_state(jc.name + "/" + hardware_interface::HW_IF_POSITION, rad);
+      set_command(jc.name + "/" + hardware_interface::HW_IF_POSITION, rad);
+    }
+  } else {
+    RCLCPP_WARN(get_logger(), "on_activate: 초기 위치 read 실패 - command 초기화 생략");
+  }
+
+  RCLCPP_INFO(get_logger(), "OmxDynamixelSystem activated");
+  return hardware_interface::CallbackReturn::SUCCESS;
+}
+
+hardware_interface::CallbackReturn OmxDynamixelSystem::on_deactivate(
+  const rclcpp_lifecycle::State &) {
+  for (const auto & jc : joints_) {
+    bus_->write1(jc.id, reg::TORQUE_ENABLE, 0);
+  }
+  RCLCPP_INFO(get_logger(), "OmxDynamixelSystem deactivated (torque off)");
+  return hardware_interface::CallbackReturn::SUCCESS;
+}
+
+hardware_interface::return_type OmxDynamixelSystem::read(
+  const rclcpp::Time & time, const rclcpp::Duration & /*period*/) {
+  // 1) position/velocity/current 일괄 GroupSyncRead
+  std::map<uint8_t, PresentState> states;
+  const bool ok = bus_->sync_read_present_states(ids_, states);
+  for (size_t i = 0; i < joints_.size(); ++i) {
+    const auto & jc = joints_[i];
+    auto it = states.find(jc.id);
+    if (it == states.end()) {
+      health_[i].comm_ok = false;
+      continue;
+    }
+    health_[i].comm_ok = true;
+    const double rad = tick_to_rad(static_cast<int>(it->second.position));
+    const double radps =
+      velocity_unit_to_rad_per_s(decode_present_velocity(it->second.velocity));
+    set_state(jc.name + "/" + hardware_interface::HW_IF_POSITION, rad);
+    set_state(jc.name + "/" + hardware_interface::HW_IF_VELOCITY, radps);
+    if (jc.expose_effort) {
+      const double ma = current_unit_to_ma(decode_present_current(it->second.current));
+      health_[i].present_current_ma = ma;
+      set_state(jc.name + "/" + hardware_interface::HW_IF_EFFORT, ma);
+    }
+  }
+  (void)ok;
+
+  // 2) 진단(temperature/voltage/hw error)은 느린 레지스터 - 사이클당 1모터 round-robin
+  if (!joints_.empty()) {
+    const size_t idx = diag_rr_index_ % joints_.size();
+    const uint8_t id = joints_[idx].id;
+    uint8_t temp = 0, hwerr = 0;
+    uint16_t volt = 0;
+    bool dok = true;
+    dok &= bus_->read1(id, reg::PRESENT_TEMPERATURE, temp);
+    dok &= bus_->read2(id, reg::PRESENT_INPUT_VOLTAGE, volt);
+    dok &= bus_->read1(id, reg::HARDWARE_ERROR_STATUS, hwerr);
+    if (dok) {
+      health_[idx].temperature_c = static_cast<int>(temp);
+      health_[idx].input_voltage_v = voltage_unit_to_v(static_cast<int>(volt));
+      health_[idx].hardware_error_status = hwerr;
+    }
+    diag_rr_index_ = (diag_rr_index_ + 1) % joints_.size();
+  }
+
+  // 3) decimation 주기로 진단 발행
+  if ((++read_cycle_ % diag_publish_decimation_) == 0) {
+    publish_diagnostics(time);
+  }
+  return hardware_interface::return_type::OK;
+}
+
+hardware_interface::return_type OmxDynamixelSystem::write(
+  const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/) {
+  std::map<uint8_t, uint32_t> goals;
+  for (const auto & jc : joints_) {
+    const double rad = get_command(jc.name + "/" + hardware_interface::HW_IF_POSITION);
+    if (std::isnan(rad)) continue;  // 아직 명령 미설정
+    int tick = rad_to_tick(rad);
+    if (jc.has_position_limit) {
+      tick = std::clamp(tick, jc.min_position_limit, jc.max_position_limit);
+    }
+    goals[jc.id] = static_cast<uint32_t>(tick);
+  }
+  if (!goals.empty()) {
+    bus_->sync_write_goal_position(goals);
+  }
+  return hardware_interface::return_type::OK;
+}
+
+void OmxDynamixelSystem::publish_diagnostics(const rclcpp::Time & time) {
+  if (!diag_pub_ || !diag_pub_->trylock()) return;
+  auto & m = diag_pub_->msg_;
+  m.header.stamp = time;
+  const size_t n = joints_.size();
+  m.ids.resize(n);
+  m.present_current_ma.resize(n);
+  m.temperature_c.resize(n);
+  m.input_voltage_v.resize(n);
+  m.hardware_error_status.resize(n);
+  m.comm_ok.resize(n);
+  for (size_t i = 0; i < n; ++i) {
+    m.ids[i] = joints_[i].id;
+    m.present_current_ma[i] = health_[i].present_current_ma;
+    m.temperature_c[i] = health_[i].temperature_c;
+    m.input_voltage_v[i] = health_[i].input_voltage_v;
+    m.hardware_error_status[i] = health_[i].hardware_error_status;
+    m.comm_ok[i] = health_[i].comm_ok;
+  }
+  diag_pub_->unlockAndPublish();
+}
+
+}  // namespace omx_dynamixel_hw
+
+PLUGINLIB_EXPORT_CLASS(omx_dynamixel_hw::OmxDynamixelSystem, hardware_interface::SystemInterface)
