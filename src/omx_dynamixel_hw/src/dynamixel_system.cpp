@@ -113,6 +113,7 @@ hardware_interface::CallbackReturn OmxDynamixelSystem::on_init(
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
+// 포트 open + ping + 스레드 시작
 hardware_interface::CallbackReturn OmxDynamixelSystem::on_configure(
   const rclcpp_lifecycle::State &) {
   stop_service_thread();  // 재구성 시 기존 스레드가 옛 bus_ 를 만지지 않도록 먼저 정리
@@ -410,4 +411,7 @@ void OmxDynamixelSystem::publish_diagnostics(const rclcpp::Time & time) {
 
 }  // namespace omx_dynamixel_hw
 
+// ros2 control이 우리 클래스를 찾도록 해주는 코드
+// controller_manager 는 URDF의 <plugin> 이름을 보고 이 매크로로 등록된 클래스를 동적 로드(dlopen)
+// "OmxDynamixelSystem 은 SystemInterface 의 일종이다" 를 런타임 플러그인 시스템에 알리는 등록표
 PLUGINLIB_EXPORT_CLASS(omx_dynamixel_hw::OmxDynamixelSystem, hardware_interface::SystemInterface)
