@@ -21,6 +21,7 @@
 # clangd / IntelliSense
 /compile_commands.json
 /.cache/
+.clangd
 
 # Editors / OS
 .vscode/
@@ -36,7 +37,7 @@ venv/
 # Local agent state
 .claude/state/
 .claude/settings.local.json
-.claude/hooks/__pycache__/
+.claude/hooks/
 
 # User-local scratch files
 /1.mp4
