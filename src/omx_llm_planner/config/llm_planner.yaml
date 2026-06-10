@@ -22,9 +22,9 @@ llm_planner:
     rotate_joint_name: "joint1"
     rotate_velocity_scale: 0.3
     joint_state_max_age_sec: 1.0
-    rotate_sign_left: 1.0      # 하드웨어 검증 후 확정(부호 뒤집힐 수 있음)
+    rotate_sign_left: 1.0
     rotate_sign_right: -1.0
-    joint1_lower: -2.8         # TODO: URDF joint1 limit 으로 확정
+    joint1_lower: -2.8
     joint1_upper: 2.8
     gripper_open_position: 1.0
     gripper_close_position: 0.0

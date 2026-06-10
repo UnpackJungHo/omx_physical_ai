@@ -104,9 +104,7 @@ class PlannerNode(Node):
         self.declare_parameter("gripper_open_position", 1.0)
         self.declare_parameter("gripper_close_position", 0.0)
 
-    def _on_joint_state(self, msg) -> None:
-        self._joint_cache.update(msg, stamp=self.get_clock().now().nanoseconds * 1e-9)
-
+    # 초기 세팅
     def _build_ollama_client(self) -> OllamaLLMClient:
         return OllamaLLMClient(
             endpoint=self.get_parameter("llm_endpoint").value,
@@ -115,6 +113,9 @@ class PlannerNode(Node):
             request_timeout_sec=self.get_parameter("llm_request_timeout_sec").value,
             max_retries=self.get_parameter("llm_max_retries").value,
         )
+
+    def _on_joint_state(self, msg) -> None:
+        self._joint_cache.update(msg, stamp=self.get_clock().now().nanoseconds * 1e-9)
 
     def _dispatcher_config(self) -> DispatcherConfig:
         return DispatcherConfig(

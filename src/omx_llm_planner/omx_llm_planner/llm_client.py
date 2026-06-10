@@ -43,6 +43,8 @@ class OllamaLLMClient:
     무제한 retry/blocking 금지.
     """
 
+    # -> 는 이 함수가 무엇을 반환하는지 알려주는 타입 힌트
+    # -> None은 반환값이 없다는 의미
     def __init__(
         self,
         endpoint: str,
@@ -57,6 +59,7 @@ class OllamaLLMClient:
         self._timeout = request_timeout_sec
         self._max_retries = max(0, max_retries)
 
+    # 사용자가 omx_web_ws에서 보낸 채팅의 request를 처리해서 build_plan으로 넘겨주는 함수
     def generate_plan(self, command: str) -> Plan:
         payload = json.dumps({
             "model": self._model_name,

@@ -1,4 +1,5 @@
-"""LLM plan JSON 의 파싱/검증/정규화.
+"""
+LLM plan JSON 의 파싱/검증/정규화.
 
 ROS 의존이 전혀 없는 순수 모듈. 허용 action 과 enum 은 omx_interfaces 의
 PickPlace / PickPlaceAll / MoveToNamed action 계약과 1:1 로 대응한다.
@@ -48,6 +49,8 @@ def build_plan(raw: str | dict) -> Plan:
     data = _load(raw)
     if not isinstance(data, dict) or "steps" not in data:
         raise PlanError("plan 에 'steps' 키가 없습니다")
+    # steps에는 action, args 가 담겨져 있음
+    # ex. {"action": "move_to_named", "args": {"name": "home"}}
     raw_steps = data["steps"]
     if not isinstance(raw_steps, list) or len(raw_steps) == 0:
         raise PlanError("plan steps 가 비어 있습니다 (명령을 이해하지 못함)")
@@ -55,8 +58,9 @@ def build_plan(raw: str | dict) -> Plan:
     steps = [_build_step(i, s) for i, s in enumerate(raw_steps)]
     return Plan(steps=steps)
 
-
+# 넘어온 raw 가 dict 타입인지 아닌지 판단하여 파싱 해주는 함수
 def _load(raw: str | dict) -> Any:
+    # raw 가 dict 타입이냐?
     if isinstance(raw, dict):
         return raw
     try:
@@ -64,7 +68,7 @@ def _load(raw: str | dict) -> Any:
     except (json.JSONDecodeError, TypeError) as exc:
         raise PlanError(f"plan JSON 파싱 실패: {exc}") from exc
 
-
+# 실제 action을 수행하기 위한 PlanStep 리스트 담는 과정
 def _build_step(index: int, step: Any) -> PlanStep:
     if not isinstance(step, dict) or "action" not in step:
         raise PlanError(f"step[{index}] 에 'action' 이 없습니다")
@@ -91,7 +95,7 @@ def _build_step(index: int, step: Any) -> PlanStep:
         })
     raise PlanError(f"step[{index}] 미지원 action: '{action}'")
 
-
+# 헬퍼 함수들
 def _enum(index: int, args: dict, key: str, allowed: tuple[str, ...]) -> str:
     value = args.get(key)
     if value not in allowed:

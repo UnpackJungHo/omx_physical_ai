@@ -12,6 +12,7 @@ from sensor_msgs.msg import JointState
 
 
 class JointStateCache:
+    # Callable 함수 타입을 의미함,
     def __init__(self, max_age_sec: float, clock_now: Callable[[], float]) -> None:
         self._max_age = max_age_sec
         self._now = clock_now
@@ -19,6 +20,7 @@ class JointStateCache:
         self._pos: dict[str, float] = {}
         self._stamp: Optional[float] = None
 
+    # get, update가 동시에 쓰일 수 없도록 Lock()으로 제어
     def update(self, msg: JointState, stamp: float) -> None:
         with self._lock:
             self._pos = {n: p for n, p in zip(msg.name, msg.position)}
