@@ -46,13 +46,10 @@ from omx_interfaces.action import (
     MoveToPose,
 )
 from omx_interfaces.msg import BlockPose
-from omx_interfaces.srv import CheckGrasp, GetBlockPoses
+from omx_interfaces.srv import CheckGrasp, ComputeAlignYaw, GetBlockPoses
 
 from omx_skill_executor.pick_place_geometry import (
     is_box_in_cup,
-    jaw_axis_yaw_from_quaternion,
-    wrap_to_pm45,
-    wrap_yaw_zero_pi_over_2,
     yaw_from_quaternion,
 )
 
@@ -86,7 +83,6 @@ class WorkerConfig:
     gripper_link: str
     joint_states_topic: str
     yaw_min_corner_confidence: float
-    joint5_yaw_sign: float
     require_yaw: bool
     gripper_open_position: float
     gripper_closed_position: float
@@ -95,6 +91,7 @@ class WorkerConfig:
     action_result_timeout_sec: float
     max_grasp_retries: int
     check_grasp_service_name: str
+    compute_align_yaw_service_name: str
     grasp_settle_sec: float
     yaw_align_max_iterations: int
     yaw_align_tolerance_rad: float
@@ -161,6 +158,11 @@ class PickPlaceWorker:
         )
         self._check_grasp_cli = node.create_client(
             CheckGrasp, config.check_grasp_service_name,
+            callback_group=cb_group,
+        )
+        # yaw 정렬 기하 계산은 motion_server(C++) 의 단일 소스에 위임한다.
+        self._compute_align_cli = node.create_client(
+            ComputeAlignYaw, config.compute_align_yaw_service_name,
             callback_group=cb_group,
         )
 
@@ -629,7 +631,6 @@ class PickPlaceWorker:
 
         o = target_block.pose.pose.orientation
         box_yaw = yaw_from_quaternion(o.x, o.y, o.z, o.w)
-        box_yaw_norm = wrap_yaw_zero_pi_over_2(box_yaw)
 
         initial_joint5: Optional[float] = None
         last_delta_world: Optional[float] = None
@@ -640,16 +641,20 @@ class PickPlaceWorker:
             if joints is None:
                 return _skip_or_fail("joint states unavailable")
 
-            jaw_yaw = self._lookup_jaw_yaw()
-            if jaw_yaw is None:
-                return _skip_or_fail("gripper TF unavailable")
+            # jaw heading 측정 + delta/joint5 목표 계산은 motion_server 의
+            # compute_align_yaw service(C++ 단일 소스)에 위임한다.
+            resp = self._compute_align_yaw(box_yaw)
+            if resp is None:
+                return _skip_or_fail("compute_align_yaw service unavailable")
+            if not resp.valid:
+                return _skip_or_fail(f"compute_align_yaw: {resp.message}")
+
+            jaw_yaw = resp.jaw_yaw_rad
+            delta_world = resp.delta_rad
+            residual_rad = abs(delta_world)
 
             tilt_deg = self._lookup_approach_tilt_deg()
             tilt_str = f"{tilt_deg:.1f}°" if tilt_deg is not None else "n/a"
-
-            gripper_yaw_norm = wrap_yaw_zero_pi_over_2(jaw_yaw)
-            delta_world = wrap_to_pm45(box_yaw_norm - gripper_yaw_norm)
-            residual_rad = abs(delta_world)
 
             j5_cur = joints["joint5"]
             if initial_joint5 is None:
@@ -664,8 +669,6 @@ class PickPlaceWorker:
                 f"yaw align iter {iteration}/{cfg.yaw_align_max_iterations}: "
                 f"box_yaw={math.degrees(box_yaw):+.2f}° "
                 f"jaw_yaw={math.degrees(jaw_yaw):+.2f}° "
-                f"box_norm={math.degrees(box_yaw_norm):.2f}° "
-                f"jaw_norm={math.degrees(gripper_yaw_norm):.2f}° "
                 f"delta={math.degrees(delta_world):+.2f}° "
                 f"residual={math.degrees(residual_rad):.2f}° "
                 f"joint5_cur={math.degrees(j5_cur):+.2f}° "
@@ -686,7 +689,8 @@ class PickPlaceWorker:
 
             last_delta_world = delta_world
 
-            j5_tgt = j5_cur + cfg.joint5_yaw_sign * delta_world
+            # 부호(joint5_yaw_sign) 적용은 service(C++) 가 이미 수행한 절대 목표각.
+            j5_tgt = resp.joint5_target_rad
             projected_total = abs(j5_tgt - initial_joint5)
             if projected_total > cfg.yaw_align_max_total_correction_rad:
                 msg = (
@@ -714,15 +718,12 @@ class PickPlaceWorker:
                 ):
                     return False
 
-        final_jaw_yaw = self._lookup_jaw_yaw()
-        if final_jaw_yaw is not None:
-            final_residual = abs(wrap_to_pm45(
-                box_yaw_norm - wrap_yaw_zero_pi_over_2(final_jaw_yaw)
-            ))
+        final = self._compute_align_yaw(box_yaw)
+        if final is not None and final.valid:
             self._node.get_logger().warn(
                 f"yaw align did NOT converge after "
                 f"{cfg.yaw_align_max_iterations} iter: "
-                f"final residual {math.degrees(final_residual):.2f}° "
+                f"final residual {math.degrees(abs(final.delta_rad)):.2f}° "
                 f"(tol {math.degrees(cfg.yaw_align_tolerance_rad):.2f}°, "
                 f"last_pre_move_residual="
                 f"{math.degrees(last_logged_residual_rad):.2f}°)"
@@ -730,7 +731,7 @@ class PickPlaceWorker:
         else:
             self._node.get_logger().warn(
                 f"yaw align did NOT converge after "
-                f"{cfg.yaw_align_max_iterations} iter, final TF unavailable"
+                f"{cfg.yaw_align_max_iterations} iter, final residual unavailable"
             )
         return _skip_or_fail(
             f"did not converge after {cfg.yaw_align_max_iterations} iterations"
@@ -771,19 +772,17 @@ class PickPlaceWorker:
             out[jn] = float(positions[idx])
         return out
 
-    def _lookup_jaw_yaw(self) -> Optional[float]:
-        try:
-            tf = self._tf_buffer.lookup_transform(
-                self._config.world_frame,
-                self._config.gripper_link,
-                Time(),
-                timeout=Duration(seconds=0.5),
-            )
-        except TransformException as exc:
-            self._node.get_logger().warn(f"gripper TF lookup failed: {exc}")
+    def _compute_align_yaw(self, box_yaw_rad: float):
+        """motion_server 의 compute_align_yaw service 로 joint5 목표각을 계산한다.
+
+        jaw heading 측정(TF) 과 90deg 대칭 delta, joint5_yaw_sign 적용까지
+        C++ 단일 소스에서 수행한다. 응답(또는 service 미가용 시 None)을 반환한다.
+        """
+        if not self._wait_for_service(self._compute_align_cli, "ComputeAlignYaw"):
             return None
-        q = tf.transform.rotation
-        return jaw_axis_yaw_from_quaternion(q.x, q.y, q.z, q.w)
+        request = ComputeAlignYaw.Request(box_yaw_rad=float(box_yaw_rad))
+        future = self._compute_align_cli.call_async(request)
+        return self._wait_future(future, "ComputeAlignYaw")
 
     def _lookup_approach_tilt_deg(self) -> Optional[float]:
         try:
@@ -1016,7 +1015,6 @@ def build_worker_config_from_node(node: Node) -> WorkerConfig:
         yaw_min_corner_confidence=float(
             p("yaw_min_corner_confidence", 0.30).value
         ),
-        joint5_yaw_sign=float(p("joint5_yaw_sign", 1.0).value),
         require_yaw=bool(p("require_yaw", False).value),
         gripper_open_position=float(p("gripper_open_position", 1.0).value),
         gripper_closed_position=float(p("gripper_closed_position", 0.1).value),
@@ -1028,6 +1026,9 @@ def build_worker_config_from_node(node: Node) -> WorkerConfig:
         max_grasp_retries=int(p("max_grasp_retries", 2).value),
         check_grasp_service_name=str(
             p("check_grasp_service_name", "gripper/check_grasp").value
+        ),
+        compute_align_yaw_service_name=str(
+            p("compute_align_yaw_service_name", "omx/compute_align_yaw").value
         ),
         grasp_settle_sec=float(p("grasp_settle_sec", 0.3).value),
         yaw_align_max_iterations=int(

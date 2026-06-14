@@ -31,7 +31,6 @@ pick_place_server:
     gripper_link: "end_effector_link"
     joint_states_topic: "joint_states"
     yaw_min_corner_confidence: 0.30
-    joint5_yaw_sign: -1.0
     require_yaw: false
 
     yaw_align_max_iterations: 4
@@ -48,6 +47,7 @@ pick_place_server:
 
     max_grasp_retries: 2
     check_grasp_service_name: "gripper/check_grasp"
+    compute_align_yaw_service_name: "omx/compute_align_yaw"
     grasp_settle_sec: 0.3
 
 pick_place_all_server:
@@ -79,7 +79,6 @@ pick_place_all_server:
     gripper_link: "end_effector_link"
     joint_states_topic: "joint_states"
     yaw_min_corner_confidence: 0.30
-    joint5_yaw_sign: -1.0
     require_yaw: false
 
     yaw_align_max_iterations: 4
@@ -96,4 +95,5 @@ pick_place_all_server:
 
     max_grasp_retries: 2
     check_grasp_service_name: "gripper/check_grasp"
+    compute_align_yaw_service_name: "omx/compute_align_yaw"
     grasp_settle_sec: 0.3

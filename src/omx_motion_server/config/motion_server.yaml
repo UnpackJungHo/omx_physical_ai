@@ -1,0 +1,14 @@
+# motion_server 파라미터 (yaw 정렬 캘리브레이션).
+#
+# joint5_yaw_sign 은 box 면과 그리퍼를 평행하게 맞출 때 world yaw delta 를
+# joint5 회전 방향으로 변환하는 부호다. 자세에 따라 고정된 +1/-1 로 한 번
+# 캘리브레이션한다. 과거 skill_executor.yaml 에 있던 값을, 정렬 계산을
+# 단일 소스로 수행하는 compute_align_yaw service(이 노드) 로 이전했다.
+#
+# align_world_frame / arm_tip_link 는 C++ 기본값(world / end_effector_link)
+# 이 skill 측 world_frame / gripper_link 와 일치하므로 별도 주입하지 않는다.
+#
+# /** 와일드카드: 이 파일은 motion_server 노드에만 전달되므로 안전하다.
+/**:
+  ros__parameters:
+    joint5_yaw_sign: -1.0

@@ -46,6 +46,11 @@ def generate_launch_description():
         get_package_share_directory('omx_bringup'),
         'config', 'omx_f', 'workspace.yaml'
     )
+    # yaw 정렬 캘리브레이션 (joint5_yaw_sign). compute_align_yaw service 가 사용.
+    motion_server_yaml = os.path.join(
+        get_package_share_directory('omx_motion_server'),
+        'config', 'motion_server.yaml'
+    )
 
     moveit_config = (
         MoveItConfigsBuilder(
@@ -79,6 +84,7 @@ def generate_launch_description():
             moveit_config.robot_description_kinematics,
             moveit_config.joint_limits,
             workspace_yaml,
+            motion_server_yaml,
             {'use_sim_time': LaunchConfiguration('use_sim_time')},
         ],
     )

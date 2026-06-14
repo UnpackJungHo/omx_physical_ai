@@ -1,0 +1,12 @@
+# Request
+# 박스 yaw (world frame, rad). perception 결과 orientation 에서 추출해 전달한다.
+# jaw heading 측정(TF) 과 joint5 현재각(joint_states) 은 서버가 자체 조회한다.
+float64 box_yaw_rad
+---
+# Response
+bool valid                   # joint_states / TF 확보 및 계산 성공 여부
+string message               # valid=false 일 때 실패 사유
+float64 jaw_yaw_rad          # 측정된 gripper jaw 폐합축 heading (world, rad)
+float64 joint5_current_rad   # 계산 시점 joint5 현재각
+float64 joint5_target_rad    # joint5 목표각 (joint5_yaw_sign 적용, 절대각)
+float64 delta_rad            # 90deg 대칭 적용한 world 잔차 (수렴 판정용, 부호 포함)

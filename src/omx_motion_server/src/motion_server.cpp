@@ -46,7 +46,7 @@
 #include <omx_interfaces/action/move_to_pose.hpp>
 #include <omx_interfaces/action/move_to_joints.hpp>
 #include <omx_interfaces/action/gripper_command.hpp>
-#include <omx_interfaces/action/align_gripper_yaw.hpp>
+#include <omx_interfaces/srv/compute_align_yaw.hpp>
 
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -137,7 +137,10 @@ static std::string execute_failure_message(
   return prefix + " (code=" + moveit_error_name(code) + ", val=" + std::to_string(code.val) + ")";
 }
 
-// ── AlignGripperYaw 기하 헬퍼 ────────────────────────────────────────────
+// ── yaw 정렬 기하 헬퍼 (compute_align_yaw service 단일 소스) ──────────────
+// 과거 skill_executor(pick_place_geometry.py) 에 중복 구현돼 있던 jaw heading /
+// 90deg wrap 계산을 이 노드로 단일화했다. Python worker 는 omx/compute_align_yaw
+// service 로 위임한다.
 
 // end_effector_link +y 축의 world XY heading (rad). gimbal-lock 없음.
 static double jaw_axis_yaw_from_quaternion(double qx, double qy, double qz, double qw)
@@ -174,7 +177,7 @@ public:
   using MoveToPose = omx_interfaces::action::MoveToPose;
   using MoveToJoints = omx_interfaces::action::MoveToJoints;
   using GripperCmd = omx_interfaces::action::GripperCommand;
-  using AlignGripperYaw = omx_interfaces::action::AlignGripperYaw;
+  using ComputeAlignYaw = omx_interfaces::srv::ComputeAlignYaw;
 
   explicit MotionServer(const rclcpp::NodeOptions &options)
       : Node("motion_server", options), node_options_(options)
@@ -233,11 +236,18 @@ public:
         std::bind(&MotionServer::handle_gripper_accepted, this, std::placeholders::_1),
         rcl_action_server_get_default_options(), cb_group_);
 
-    // AlignGripperYaw 파라미터
-    declare_parameter<std::string>("align_world_frame", "world");
-    declare_parameter<double>("joint5_yaw_sign", 1.0);
-    declare_parameter<std::vector<std::string>>("arm_joint_names",
-        std::vector<std::string>{"joint1", "joint2", "joint3", "joint4", "joint5"});
+    // compute_align_yaw service 파라미터.
+    // main() 의 automatically_declare_parameters_from_overrides(true) 때문에
+    // yaml(--params-file)로 주입된 키는 이미 선언돼 있다. 중복 declare 시
+    // ParameterAlreadyDeclaredException 으로 죽으므로 workspace.* 와 동일하게
+    // has_parameter 로 가드한다.
+    if (!has_parameter("align_world_frame"))
+      declare_parameter<std::string>("align_world_frame", "world");
+    if (!has_parameter("joint5_yaw_sign"))
+      declare_parameter<double>("joint5_yaw_sign", 1.0);
+    if (!has_parameter("arm_joint_names"))
+      declare_parameter<std::vector<std::string>>("arm_joint_names",
+          std::vector<std::string>{"joint1", "joint2", "joint3", "joint4", "joint5"});
 
     // TF
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
@@ -252,13 +262,14 @@ public:
           latest_joint_state_ = msg;
         });
 
-    // AlignGripperYaw 액션 서버
-    align_gripper_yaw_server_ = rclcpp_action::create_server<AlignGripperYaw>(
-        this, "omx/align_gripper_yaw",
-        std::bind(&MotionServer::handle_align_goal, this, std::placeholders::_1, std::placeholders::_2),
-        std::bind(&MotionServer::handle_align_cancel, this, std::placeholders::_1),
-        std::bind(&MotionServer::handle_align_accepted, this, std::placeholders::_1),
-        rcl_action_server_get_default_options(), cb_group_);
+    // compute_align_yaw service 서버 (순수 계산 — 모션 없음).
+    // joint5 목표각만 계산해 반환하고, 실제 실행은 호출부가 omx/move_to_joints
+    // 액션으로 수행한다. 모션이 없으므로 cancel/feedback 이 불필요해 service 로 둔다.
+    compute_align_yaw_server_ = create_service<ComputeAlignYaw>(
+        "omx/compute_align_yaw",
+        std::bind(&MotionServer::handle_compute_align, this,
+                  std::placeholders::_1, std::placeholders::_2),
+        rclcpp::ServicesQoS(), cb_group_);
 
     RCLCPP_INFO(get_logger(), "MotionServer: action servers created, waiting for MoveIt...");
   }
@@ -478,8 +489,8 @@ private:
   double ws_z_max_{0.45};
   std::string ws_frame_{"world"};
 
-  // ── AlignGripperYaw 멤버 ──────────────────────────────────────────────
-  rclcpp_action::Server<AlignGripperYaw>::SharedPtr align_gripper_yaw_server_;
+  // ── compute_align_yaw 멤버 ────────────────────────────────────────────
+  rclcpp::Service<ComputeAlignYaw>::SharedPtr compute_align_yaw_server_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
@@ -1232,65 +1243,18 @@ private:
   }
 
   // ══════════════════════════════════════════════════════════════════════
-  // AlignGripperYaw  →  joint5 를 box yaw 에 정렬 (90° 대칭 적용)
+  // compute_align_yaw  →  joint5 목표각 계산 (90deg 대칭, 모션 없음)
   // ══════════════════════════════════════════════════════════════════════
-
-  rclcpp_action::GoalResponse handle_align_goal(
-      const rclcpp_action::GoalUUID &,
-      std::shared_ptr<const AlignGripperYaw::Goal> goal)
+  //
+  // box yaw 와 현재 jaw heading(TF) 으로 joint5 절대 목표각을 계산해 반환만
+  // 한다. 실제 실행은 호출부(skill_executor)가 omx/move_to_joints 액션으로
+  // 수행하고, 수렴 반복/허용오차/누적 보정 cap 같은 정렬 정책도 호출부가 쥔다.
+  // 모션이 없어 cancel/feedback 이 불필요하므로 action 이 아닌 service 로 둔다.
+  void handle_compute_align(
+      const std::shared_ptr<ComputeAlignYaw::Request> request,
+      std::shared_ptr<ComputeAlignYaw::Response> response)
   {
-    RCLCPP_INFO(get_logger(), "AlignGripperYaw: box_yaw=%.1f°", goal->box_yaw_deg);
-    bool expected = false;
-    if (!arm_busy_.compare_exchange_strong(
-            expected, true, std::memory_order_acquire, std::memory_order_relaxed))
-    {
-      RCLCPP_WARN(get_logger(), "AlignGripperYaw: arm is busy, rejecting goal");
-      return rclcpp_action::GoalResponse::REJECT;
-    }
-    return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
-  }
-
-  rclcpp_action::CancelResponse handle_align_cancel(
-      const std::shared_ptr<rclcpp_action::ServerGoalHandle<AlignGripperYaw>>)
-  {
-    RCLCPP_INFO(get_logger(), "AlignGripperYaw: cancel requested");
-    if (arm_group_)
-      arm_group_->stop();
-    return rclcpp_action::CancelResponse::ACCEPT;
-  }
-
-  void handle_align_accepted(
-      const std::shared_ptr<rclcpp_action::ServerGoalHandle<AlignGripperYaw>> goal_handle)
-  {
-    if (arm_thread_.joinable())
-      arm_thread_.join();
-    arm_thread_ = std::thread([this, goal_handle]()
-                              { execute_align(goal_handle); });
-  }
-
-  void execute_align(
-      const std::shared_ptr<rclcpp_action::ServerGoalHandle<AlignGripperYaw>> goal_handle)
-  {
-    BusyGuard busy_guard{arm_busy_};
-    VelScaleGuard vel_guard{arm_group_.get()};
-
-    auto result = std::make_shared<AlignGripperYaw::Result>();
-    auto feedback = std::make_shared<AlignGripperYaw::Feedback>();
-
-    if (!arm_group_)
-    {
-      result->success = false;
-      result->message = "MoveGroupInterface not initialized";
-      goal_handle->abort(result);
-      vel_guard.grp = nullptr;
-      return;
-    }
-
-    feedback->status = "computing";
-    feedback->progress = 0.0f;
-    goal_handle->publish_feedback(feedback);
-
-    // 1. joint_states 스냅샷
+    // 1. joint_states 스냅샷에서 joint5 현재각.
     sensor_msgs::msg::JointState::SharedPtr js;
     {
       std::lock_guard<std::mutex> lk(joint_state_mutex_);
@@ -1298,29 +1262,29 @@ private:
     }
     if (!js)
     {
-      result->success = false;
-      result->message = "joint_states not received";
-      goal_handle->abort(result);
+      response->valid = false;
+      response->message = "joint_states not received";
+      return;
+    }
+    double j5_cur = 0.0;
+    bool j5_found = false;
+    for (std::size_t i = 0; i < js->name.size() && i < js->position.size(); ++i)
+    {
+      if (js->name[i] == "joint5")
+      {
+        j5_cur = js->position[i];
+        j5_found = true;
+        break;
+      }
+    }
+    if (!j5_found)
+    {
+      response->valid = false;
+      response->message = "joint5 not in joint_states";
       return;
     }
 
-    std::map<std::string, double> joint_pos;
-    for (std::size_t i = 0; i < js->name.size() && i < js->position.size(); ++i)
-      joint_pos[js->name[i]] = js->position[i];
-
-    for (const auto & jn : arm_joint_names_)
-    {
-      if (joint_pos.find(jn) == joint_pos.end())
-      {
-        result->success = false;
-        result->message = "joint '" + jn + "' not in joint_states";
-        goal_handle->abort(result);
-        return;
-      }
-    }
-    double j5_before = joint_pos.at("joint5");
-
-    // 2. TF 로 jaw yaw 조회
+    // 2. TF 로 jaw heading 조회 (world <- arm_tip_link).
     geometry_msgs::msg::TransformStamped tf_stamped;
     try
     {
@@ -1331,91 +1295,33 @@ private:
     }
     catch (const tf2::TransformException & ex)
     {
-      result->success = false;
-      result->message = std::string("TF lookup failed: ") + ex.what();
-      goal_handle->abort(result);
+      response->valid = false;
+      response->message = std::string("TF lookup failed: ") + ex.what();
       return;
     }
-
     const auto & q = tf_stamped.transform.rotation;
-    double jaw_yaw = jaw_axis_yaw_from_quaternion(q.x, q.y, q.z, q.w);
+    const double jaw_yaw = jaw_axis_yaw_from_quaternion(q.x, q.y, q.z, q.w);
 
-    // 3. joint5 목표 계산
-    double box_yaw_rad = static_cast<double>(goal_handle->get_goal()->box_yaw_deg) * M_PI / 180.0;
-    double delta = wrap_to_pm45(box_yaw_rad - jaw_yaw);
-    double j5_target_val = j5_before + joint5_yaw_sign_ * delta;
+    // 3. 90deg 대칭 적용한 최단 잔차 + joint5 절대 목표각.
+    const double delta = wrap_to_pm45(request->box_yaw_rad - jaw_yaw);
+    const double j5_target = j5_cur + joint5_yaw_sign_ * delta;
+
+    response->valid = true;
+    response->message = "";
+    response->jaw_yaw_rad = jaw_yaw;
+    response->joint5_current_rad = j5_cur;
+    response->joint5_target_rad = j5_target;
+    response->delta_rad = delta;
 
     RCLCPP_INFO(get_logger(),
-        "align_gripper_yaw: box_yaw=%.1f° jaw_yaw=%.1f° delta=%.1f° joint5 %.1f°→%.1f°",
-        goal_handle->get_goal()->box_yaw_deg,
+        "compute_align_yaw: box_yaw=%.1f° jaw_yaw=%.1f° delta=%.1f° joint5 %.1f°→%.1f°",
+        request->box_yaw_rad * 180.0 / M_PI,
         jaw_yaw * 180.0 / M_PI,
         delta * 180.0 / M_PI,
-        j5_before * 180.0 / M_PI,
-        j5_target_val * 180.0 / M_PI);
-
-    // 4. arm 전체 joint target (joint5 만 변경, 나머지 현재 유지)
-    std::map<std::string, double> arm_target;
-    for (const auto & jn : arm_joint_names_)
-      arm_target[jn] = joint_pos.at(jn);
-    arm_target["joint5"] = j5_target_val;
-
-    feedback->status = "executing";
-    feedback->progress = 0.3f;
-    goal_handle->publish_feedback(feedback);
-
-    // 5. MoveIt plan + execute
-    arm_group_->setStartStateToCurrentState();
-    if (!arm_group_->setJointValueTarget(arm_target))
-    {
-      result->success = false;
-      result->message = "Joint target out of limits";
-      goal_handle->abort(result);
-      return;
-    }
-
-    moveit::planning_interface::MoveGroupInterface::Plan plan;
-    bool planned = (arm_group_->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
-    if (!planned)
-    {
-      result->success = false;
-      result->message = "Planning failed";
-      goal_handle->abort(result);
-      return;
-    }
-
-    const auto exec_code = arm_group_->execute(plan);
-    bool executed = (exec_code == moveit::core::MoveItErrorCode::SUCCESS);
-
-    if (goal_handle->is_canceling())
-    {
-      result->success = false;
-      result->message = "Cancelled";
-      goal_handle->canceled(result);
-      return;
-    }
-
-    result->success = executed;
-    result->message = executed
-        ? ""
-        : execute_failure_message("AlignGripperYaw execution failed", exec_code);
-    result->jaw_yaw_deg = static_cast<float>(jaw_yaw * 180.0 / M_PI);
-    result->joint5_before_deg = static_cast<float>(j5_before * 180.0 / M_PI);
-    result->joint5_after_deg = static_cast<float>(j5_target_val * 180.0 / M_PI);
-    result->wrapped_delta_deg = static_cast<float>(delta * 180.0 / M_PI);
-
-    if (executed)
-    {
-      feedback->progress = 1.0f;
-      goal_handle->publish_feedback(feedback);
-      goal_handle->succeed(result);
-      RCLCPP_INFO(get_logger(), "AlignGripperYaw: succeeded");
-    }
-    else
-    {
-      goal_handle->abort(result);
-      RCLCPP_WARN(get_logger(), "AlignGripperYaw: %s", result->message.c_str());
-    }
+        j5_cur * 180.0 / M_PI,
+        j5_target * 180.0 / M_PI);
   }
+
 };
 
 int main(int argc, char **argv)

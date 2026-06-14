@@ -17,7 +17,6 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/MoveToPose.action"
   "action/MoveToJoints.action"
   "action/GripperCommand.action"
-  "action/AlignGripperYaw.action"
   "action/PickPlace.action"
   "action/PickPlaceAll.action"
   "action/ExecuteCommand.action"
@@ -29,6 +28,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/GetKeypointDetections.srv"
   "srv/CheckGrasp.srv"
   "srv/RebootDxl.srv"
+  "srv/ComputeAlignYaw.srv"
   DEPENDENCIES std_msgs geometry_msgs action_msgs builtin_interfaces
 )
 
