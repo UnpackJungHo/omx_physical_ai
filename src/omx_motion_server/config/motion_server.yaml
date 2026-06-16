@@ -12,3 +12,19 @@
 /**:
   ros__parameters:
     joint5_yaw_sign: -1.0
+
+    # ── MoveIt 모션 튜닝 (코드 하드코딩에서 외부화) ──────────────────────
+    # 재컴파일 없이 속도/정밀도/계획시간을 조정한다. 미주입 시 C++ 기본값 사용.
+    default_vel_scale: 0.3   # arm/gripper 기본 velocity scaling
+    default_acc_scale: 0.1   # arm/gripper 기본 acceleration scaling
+    quat_norm_tol: 0.01      # MoveToPose quaternion 정규화 허용 오차
+
+    arm:
+      planning_time: 5.0          # plan() 최대 계획 시간 [s]
+      goal_position_tol: 0.001    # 1 mm
+      goal_orientation_tol: 0.01  # ~0.57° (position_only_ik 라 영향 작음)
+      goal_joint_tol: 0.001       # ~0.057° (encoder 1 step 보다 작음)
+
+    gripper:
+      planning_time: 3.0          # plan() 최대 계획 시간 [s]
+      goal_joint_tol: 0.001

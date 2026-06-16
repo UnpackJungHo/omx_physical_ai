@@ -38,6 +38,7 @@ venv/
 .claude/state/
 .claude/settings.local.json
 .claude/hooks/
+/.playwright-mcp/
 
 # User-local scratch files
 /1.mp4

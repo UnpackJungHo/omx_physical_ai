@@ -34,6 +34,15 @@ endif()
 list(REMOVE_DUPLICATES SYSTEM_RPATH_DIRS)
 string(JOIN ";" SYSTEM_RPATH ${SYSTEM_RPATH_DIRS})
 
+# ── motion_geometry ────────────────────────────────────────────────
+# yaw 정렬 순수 기하 함수. ROS/MoveIt 의존이 없어 단위 테스트 대상이 된다.
+# motion_server 에 정적 링크되며 별도 install 은 필요 없다.
+add_library(motion_geometry STATIC src/motion_geometry.cpp)
+target_include_directories(motion_geometry PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_compile_features(motion_geometry PUBLIC cxx_std_17)
+
 add_executable(motion_server src/motion_server.cpp)
 # miniconda 라이브러리가 런타임에 끼어들지 못하도록 시스템 경로를 RPATH 에 명시
 set_target_properties(motion_server PROPERTIES
@@ -54,6 +63,8 @@ ament_target_dependencies(motion_server
   sensor_msgs
   tf2
   tf2_ros)
+
+target_link_libraries(motion_server motion_geometry)
 
 # 시스템 curl/ssl 명시 링크 (miniconda 라이브러리 오염 방지)
 if(SYSTEM_CURL)
@@ -95,6 +106,11 @@ if(BUILD_TESTING)
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
+
+  # motion_geometry 순수 함수 단위 테스트 (로봇/MoveIt 불필요).
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_motion_geometry test/test_motion_geometry.cpp)
+  target_link_libraries(test_motion_geometry motion_geometry)
 endif()
 
 ament_package()

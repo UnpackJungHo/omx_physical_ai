@@ -1,29 +1,8 @@
-// omx_motion_server — motion_server.cpp
-//
-// Action servers:
-//   /omx/move_to_named   (omx_interfaces/action/MoveToNamed)
-//   /omx/move_to_pose    (omx_interfaces/action/MoveToPose)
-//   /omx/move_to_joints  (omx_interfaces/action/MoveToJoints)
-//   /omx/gripper_command (omx_interfaces/action/GripperCommand)
-//
-// 네 액션 모두 MoveGroupInterface 로 제어한다.
-//   arm     그룹: MoveToNamed, MoveToPose, MoveToJoints
-//   gripper 그룹: GripperCommand  ← GripperActionController 직접 호출 대신
-//                                    MoveIt trajectory 로 속도 제한 적용
-//
-// 동시성 정책:
-//   arm_busy_ (atomic<bool>) — MoveToNamed / MoveToPose / MoveToJoints 가 실행 중이면 true.
-//     handle_*_goal 에서 CAS 로 선점하고 execute_* 소멸 시 RAII 로 해제한다.
-//     결과적으로 arm_group_ 의 setNamedTarget / setPoseTarget /
-//     setMaxVelocityScalingFactor 호출이 직렬화된다.
-//   gripper_busy_ — GripperCommand 에 동일하게 적용.
-//   arm_thread_ / gripper_thread_ — detach 대신 명시적 join 으로 수명 관리.
-
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
-#include <cstdlib>
+#include <cstdio>
 #include <functional>
 #include <iomanip>
 #include <map>
@@ -37,41 +16,37 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
 
-#include <moveit/move_group_interface/move_group_interface.hpp>
-
-#include <builtin_interfaces/msg/duration.hpp>
-#include <moveit_msgs/msg/move_it_error_codes.hpp>
-#include <trajectory_msgs/msg/joint_trajectory.hpp>
 #include <omx_interfaces/action/move_to_named.hpp>
 #include <omx_interfaces/action/move_to_pose.hpp>
 #include <omx_interfaces/action/move_to_joints.hpp>
 #include <omx_interfaces/action/gripper_command.hpp>
 #include <omx_interfaces/srv/compute_align_yaw.hpp>
 
-#include <sensor_msgs/msg/joint_state.hpp>
-#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <rclcpp/logging.hpp> 
+#include <moveit/move_group_interface/move_group_interface.hpp>
+#include <moveit_msgs/msg/move_it_error_codes.hpp>
+
+#include "omx_motion_server/motion_geometry.hpp"
+
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2/exceptions.h>
+#include <sensor_msgs/msg/joint_state.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
 
-// ── 워크스페이스 한계 (workspace_guard 와 일치) ───────────────────────────
-static constexpr double WS_Z_MIN = 0.01;
-static constexpr double WS_Z_MAX = 0.48;
-static constexpr double WS_XY_RADIUS = 0.42;
 
 // ── 그리퍼 조인트 위치 범위 (SRDF: close=0, open=1) ──────────────────────
 static constexpr double GRIPPER_CLOSE_POS = 0.0;
 static constexpr double GRIPPER_OPEN_POS = 1.0;
 
-// ── 기본 velocity / acceleration scaling ─────────────────────────────────
-static constexpr double DEFAULT_VEL_SCALE = 0.3;
-static constexpr double DEFAULT_ACC_SCALE = 0.1;
+// MoveToNamed용 (srdf 에 정의된 이름, 변경될 이름)
+static const std::unordered_map<std::string, std::string> NAMED_POSE_MAP = {
+    {"home", "home"},
+    {"init", "init"},
+};
 
-// ── quaternion 정규화 허용 오차 ───────────────────────────────────────────
-static constexpr double QUAT_NORM_TOL = 0.01;
-
-// ── MoveItErrorCode → 사람이 읽을 수 있는 이름 ───────────────────────────
-// execute() 실패 원인을 action result message 에 담을 때 사용.
+// MoveItErrorCode → 사람이 읽을 수 있는 이름으로 변환
+// execute() 실패 원인을 action result message 에 담을 때 사용
 static std::string moveit_error_name(const moveit::core::MoveItErrorCode &code)
 {
   using C = moveit_msgs::msg::MoveItErrorCodes;
@@ -130,48 +105,18 @@ static std::string moveit_error_name(const moveit::core::MoveItErrorCode &code)
   }
 }
 
-static std::string execute_failure_message(
-    const std::string &prefix,
-    const moveit::core::MoveItErrorCode &code)
+// 실행 실패 메시지 출력 메서드
+static std::string execute_failure_message(const std::string &prefix, const moveit::core::MoveItErrorCode &code)
 {
   return prefix + " (code=" + moveit_error_name(code) + ", val=" + std::to_string(code.val) + ")";
 }
 
-// ── yaw 정렬 기하 헬퍼 (compute_align_yaw service 단일 소스) ──────────────
-// 과거 skill_executor(pick_place_geometry.py) 에 중복 구현돼 있던 jaw heading /
-// 90deg wrap 계산을 이 노드로 단일화했다. Python worker 는 omx/compute_align_yaw
-// service 로 위임한다.
+// motion_geometry 순수 함수를 짧은 이름으로 쓰기 위한 전역 using (클래스 밖이어야 함).
+using omx_motion_server::jaw_axis_yaw_from_quaternion;
+using omx_motion_server::position_in_workspace_box;
+using omx_motion_server::wrap_to_pm45;
 
-// end_effector_link +y 축의 world XY heading (rad). gimbal-lock 없음.
-static double jaw_axis_yaw_from_quaternion(double qx, double qy, double qz, double qw)
-{
-  const double axis_x = 2.0 * (qx * qy - qw * qz);
-  const double axis_y = 1.0 - 2.0 * (qx * qx + qz * qz);
-  return std::atan2(axis_y, axis_x);
-}
-
-// 박스 90° 대칭을 이용해 각도를 (-π/4, π/4] 범위로 접는다.
-static double wrap_to_pm45(double angle_rad)
-{
-  constexpr double quarter = M_PI / 2.0;
-  double wrapped = std::fmod(angle_rad, quarter);
-  if (wrapped > M_PI / 4.0)
-    wrapped -= quarter;
-  else if (wrapped <= -M_PI / 4.0)
-    wrapped += quarter;
-  return wrapped;
-}
-
-// ── named pose → SRDF group_state 매핑 ───────────────────────────────────
-// MoveToNamed 공개 허용값은 "home", "init" 두 개로 제한한다.
-// SRDF(omx_f.srdf)의 arm group_state로 직접 매핑한다.
-static const std::unordered_map<std::string, std::string> NAMED_POSE_MAP = {
-    {"home", "home"},
-    {"init", "init"},
-};
-
-class MotionServer : public rclcpp::Node
-{
+class MotionServer : public rclcpp::Node {
 public:
   using MoveToNamed = omx_interfaces::action::MoveToNamed;
   using MoveToPose = omx_interfaces::action::MoveToPose;
@@ -179,53 +124,40 @@ public:
   using GripperCmd = omx_interfaces::action::GripperCommand;
   using ComputeAlignYaw = omx_interfaces::srv::ComputeAlignYaw;
 
+  // 생성자: 파라미터 적재 + callback group 생성 + omx/move_to_named 액션 서버를 등록
   explicit MotionServer(const rclcpp::NodeOptions &options)
       : Node("motion_server", options), node_options_(options)
   {
-    declare_parameter<std::string>("arm_tip_link", "end_effector_link");
-    declare_parameter<bool>("moveit_ready", false);
-    // Workspace 사전 거부 한계 (world frame 기준).
-    // EE 가 x,y 방향으로 멀리 뻗으면 dxl12 (shoulder) 의 중력 모멘트가 급증해
-    // Overload Hardware Error 로 모터가 차단된다. 그 영역의 goal pose 를 사전에 거부한다.
-    //
-    // 같은 workspace 값은 omx_bringup 의 workspace_guard 와 공유한다.
-    // 단일 설정 소스: omx_bringup/config/omx_f/workspace.yaml.
-    //   - motion_server   : goal pose 사전 거부 (요청 단계)
-    //   - workspace_guard : Planning Scene 의 floor / ceiling 충돌 평면 (trajectory 보간 단계)
-    // 아래 default 는 yaml 미주입 시의 fallback 이며, 실제 운용 값은 yaml 에서 관리한다.
-    if (!has_parameter("workspace.x_abs_max"))
-      declare_parameter<double>("workspace.x_abs_max", 0.3);
-    if (!has_parameter("workspace.y_abs_max"))
-      declare_parameter<double>("workspace.y_abs_max", 0.3);
-    if (!has_parameter("workspace.z_min"))
-      declare_parameter<double>("workspace.z_min", 0.0);
-    if (!has_parameter("workspace.z_max"))
-      declare_parameter<double>("workspace.z_max", 0.45);
-    if (!has_parameter("workspace.frame"))
-      declare_parameter<std::string>("workspace.frame", "world");
-    // 액션 서버들은 Reentrant callback group 에 배치한다.
-    // arm_busy_ / gripper_busy_ 로 실제 직렬 실행을 보장하므로
-    // MoveGroupInterface 의 공유 상태 경쟁을 방지한다.
+    declare_and_load_params();
+        
     cb_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
 
     move_to_named_server_ = rclcpp_action::create_server<MoveToNamed>(
         this, "omx/move_to_named",
-        std::bind(&MotionServer::handle_named_goal, this, std::placeholders::_1, std::placeholders::_2),
-        std::bind(&MotionServer::handle_named_cancel, this, std::placeholders::_1),
-        std::bind(&MotionServer::handle_named_accepted, this, std::placeholders::_1),
+        std::bind(&MotionServer::handle_named_goal, this,
+                  std::placeholders::_1, std::placeholders::_2),
+        std::bind(&MotionServer::handle_arm_cancel<MoveToNamed>, this,
+                  "MoveToNamed", std::placeholders::_1),
+        std::bind(&MotionServer::handle_named_accepted,
+                  this, // goal이 ACCEPT_AND_EXECUTE로 수락되면 라이브러리가 이
+                        // 함수를 부름
+                  std::placeholders::_1),
         rcl_action_server_get_default_options(), cb_group_);
 
     move_to_pose_server_ = rclcpp_action::create_server<MoveToPose>(
         this, "omx/move_to_pose",
-        std::bind(&MotionServer::handle_pose_goal, this, std::placeholders::_1, std::placeholders::_2),
-        std::bind(&MotionServer::handle_pose_cancel, this, std::placeholders::_1),
-        std::bind(&MotionServer::handle_pose_accepted, this, std::placeholders::_1),
+        std::bind(&MotionServer::handle_pose_goal, this,
+                  std::placeholders::_1, std::placeholders::_2),
+        std::bind(&MotionServer::handle_arm_cancel<MoveToPose>, this,
+                  "MoveToPose", std::placeholders::_1),
+        std::bind(&MotionServer::handle_pose_accepted, this,
+                  std::placeholders::_1),
         rcl_action_server_get_default_options(), cb_group_);
-
+    
     move_to_joints_server_ = rclcpp_action::create_server<MoveToJoints>(
         this, "omx/move_to_joints",
         std::bind(&MotionServer::handle_joints_goal, this, std::placeholders::_1, std::placeholders::_2),
-        std::bind(&MotionServer::handle_joints_cancel, this, std::placeholders::_1),
+        std::bind(&MotionServer::handle_arm_cancel<MoveToJoints>, this, "MoveToJoints", std::placeholders::_1),
         std::bind(&MotionServer::handle_joints_accepted, this, std::placeholders::_1),
         rcl_action_server_get_default_options(), cb_group_);
 
@@ -236,88 +168,77 @@ public:
         std::bind(&MotionServer::handle_gripper_accepted, this, std::placeholders::_1),
         rcl_action_server_get_default_options(), cb_group_);
 
-    // compute_align_yaw service 파라미터.
-    // main() 의 automatically_declare_parameters_from_overrides(true) 때문에
-    // yaml(--params-file)로 주입된 키는 이미 선언돼 있다. 중복 declare 시
-    // ParameterAlreadyDeclaredException 으로 죽으므로 workspace.* 와 동일하게
-    // has_parameter 로 가드한다.
-    if (!has_parameter("align_world_frame"))
-      declare_parameter<std::string>("align_world_frame", "world");
-    if (!has_parameter("joint5_yaw_sign"))
-      declare_parameter<double>("joint5_yaw_sign", 1.0);
-    if (!has_parameter("arm_joint_names"))
-      declare_parameter<std::vector<std::string>>("arm_joint_names",
-          std::vector<std::string>{"joint1", "joint2", "joint3", "joint4", "joint5"});
-
     // TF
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
-    // Joint states 구독 (best_effort — 센서 스트림)
+    // Joint states 구독 (best_effort - 센서 스트림)
     joint_state_sub_ = create_subscription<sensor_msgs::msg::JointState>(
-        "joint_states",
-        rclcpp::SensorDataQoS(),
-        [this](sensor_msgs::msg::JointState::SharedPtr msg) {
+        "joint_states",               // 토픽 이름
+         rclcpp::SensorDataQoS(),     // QoS
+        [this](sensor_msgs::msg::JointState::SharedPtr msg) { // 메시지 도착 시 실행될 콜백(람다)
           std::lock_guard<std::mutex> lk(joint_state_mutex_);
           latest_joint_state_ = msg;
         });
 
-    // compute_align_yaw service 서버 (순수 계산 — 모션 없음).
-    // joint5 목표각만 계산해 반환하고, 실제 실행은 호출부가 omx/move_to_joints
-    // 액션으로 수행한다. 모션이 없으므로 cancel/feedback 이 불필요해 service 로 둔다.
     compute_align_yaw_server_ = create_service<ComputeAlignYaw>(
-        "omx/compute_align_yaw",
-        std::bind(&MotionServer::handle_compute_align, this,
-                  std::placeholders::_1, std::placeholders::_2),
-        rclcpp::ServicesQoS(), cb_group_);
+          "omx/compute_align_yaw",
+          std::bind(&MotionServer::handle_compute_align, this,
+                    std::placeholders::_1, std::placeholders::_2),
+          rclcpp::ServicesQoS(), cb_group_);
 
     RCLCPP_INFO(get_logger(), "MotionServer: action servers created, waiting for MoveIt...");
   }
 
+  // 소멸자: 실행 중이던 worker 스레드를 join 해 안전하게 정리 (detach 금지)
   ~MotionServer()
   {
-    // 노드 종료 시 실행 중인 스레드를 안전하게 join — detach 없음
+    // 노드 종료 시 실행 중인 스레드를 안전하게 join - detach 없음
     if (arm_thread_.joinable())
       arm_thread_.join();
     if (gripper_thread_.joinable())
       gripper_thread_.join();
   }
 
-  // MoveGroupInterface 는 executor 가 spin 을 시작한 뒤 초기화해야 한다.
-  void init_moveit()
-  {
+  // ────────────────────────────── MoveIt 설정 및 생성 관련 메서드──────────────────────────────────────────────────
+
+  // arm/gripper MoveGroupInterface 를 생성하고 속도·tolerance·planning time 을 적용 (executor spin 이후 호출).
+  void init_moveit() {
     if (!moveit_node_)
     {
       create_moveit_helper_node();
     }
 
     const std::string move_group_namespace = resolved_move_group_namespace();
-    const rclcpp::Duration wait_for_move_group = rclcpp::Duration::from_seconds(10.0);
+    const rclcpp::Duration wait_for_move_group =
+        rclcpp::Duration::from_seconds(10.0);
     moveit::planning_interface::MoveGroupInterface::Options arm_options(
         "arm",
         moveit::planning_interface::MoveGroupInterface::ROBOT_DESCRIPTION,
         move_group_namespace);
-    arm_group_ = std::make_shared<moveit::planning_interface::MoveGroupInterface>(
-        moveit_node_, arm_options, std::shared_ptr<tf2_ros::Buffer>(), wait_for_move_group);
-    arm_group_->setMaxVelocityScalingFactor(DEFAULT_VEL_SCALE);
-    arm_group_->setMaxAccelerationScalingFactor(DEFAULT_ACC_SCALE);
-    arm_group_->setPlanningTime(5.0);
-    // Goal tolerance: hardware encoder resolution(약 0.088°) + TRAC-IK Distance 해상도 고려.
-    // 1 mm / 1 mrad 수준으로 명시화해 default(보통 1cm) 의 느슨한 도착 판정을 차단.
-    arm_group_->setGoalPositionTolerance(0.001);   // 1 mm
-    arm_group_->setGoalOrientationTolerance(0.01); // ~0.57°, position_only_ik 라 큰 영향 없음
-    arm_group_->setGoalJointTolerance(0.001);      // ~0.057°, encoder 1 step 보다 작음
+    arm_group_ =
+        std::make_shared<moveit::planning_interface::MoveGroupInterface>(
+            moveit_node_, arm_options, std::shared_ptr<tf2_ros::Buffer>(),
+            wait_for_move_group);
+    
+    arm_group_->setMaxVelocityScalingFactor(default_vel_scale_);
+    arm_group_->setMaxAccelerationScalingFactor(default_acc_scale_);
+    arm_group_->setPlanningTime(arm_planning_time_);
+    arm_group_->setGoalPositionTolerance(arm_goal_position_tol_);
+    arm_group_->setGoalOrientationTolerance(arm_goal_orientation_tol_);
+    arm_group_->setGoalJointTolerance(arm_goal_joint_tol_);
 
     moveit::planning_interface::MoveGroupInterface::Options gripper_options(
         "gripper",
         moveit::planning_interface::MoveGroupInterface::ROBOT_DESCRIPTION,
         move_group_namespace);
+    
     gripper_group_ = std::make_shared<moveit::planning_interface::MoveGroupInterface>(
         moveit_node_, gripper_options, std::shared_ptr<tf2_ros::Buffer>(), wait_for_move_group);
-    gripper_group_->setMaxVelocityScalingFactor(DEFAULT_VEL_SCALE);
-    gripper_group_->setMaxAccelerationScalingFactor(DEFAULT_ACC_SCALE);
-    gripper_group_->setPlanningTime(3.0);
-    gripper_group_->setGoalJointTolerance(0.001);
+    gripper_group_->setMaxVelocityScalingFactor(default_vel_scale_);
+    gripper_group_->setMaxAccelerationScalingFactor(default_acc_scale_);
+    gripper_group_->setPlanningTime(gripper_planning_time_);
+    gripper_group_->setGoalJointTolerance(gripper_goal_joint_tol_);
 
     arm_tip_link_ = get_parameter("arm_tip_link").as_string();
     if (arm_tip_link_.empty())
@@ -325,18 +246,16 @@ public:
       arm_tip_link_ = "end_effector_link";
     }
 
-    ws_x_abs_max_ = get_parameter("workspace.x_abs_max").as_double();
-    ws_y_abs_max_ = get_parameter("workspace.y_abs_max").as_double();
-    ws_z_min_ = get_parameter("workspace.z_min").as_double();
-    ws_z_max_ = get_parameter("workspace.z_max").as_double();
-    ws_frame_ = get_parameter("workspace.frame").as_string();
     RCLCPP_INFO(
         get_logger(),
         "Workspace limit (frame='%s'): |x|<=%.3f, |y|<=%.3f, %.3f<=z<=%.3f",
         ws_frame_.c_str(), ws_x_abs_max_, ws_y_abs_max_, ws_z_min_, ws_z_max_);
 
+    // getPlanningFrame: 모션 플래닝이 수행되는 기준 프레임(보통 로봇 모델의 고정 루트, 예: world / base_link)
     const std::string arm_planning_frame = arm_group_->getPlanningFrame();
+    // getPoseReferenceFrame: setPoseTarget/setJointValueTarget(pose)로 넘긴 목표 pose를 어느 frame 기준으로 해석할지. 기본은 planning frame이지만 setPoseReferenceFrame()으로 바꿀 수 있음
     const std::string arm_pose_frame = arm_group_->getPoseReferenceFrame();
+    //pose 목표가 어느 링크를 그 위치로 보낼지, 즉 IK가 맞추는 tip 링크. SRDF group의 end effector에서 옴.
     const std::string arm_eef_link = arm_group_->getEndEffectorLink();
     const std::string gripper_planning_frame = gripper_group_->getPlanningFrame();
     const std::string gripper_pose_frame = gripper_group_->getPoseReferenceFrame();
@@ -358,32 +277,21 @@ public:
         get_logger(),
         "MotionServer arm tip link override: '%s'",
         arm_tip_link_.c_str());
-
-    align_world_frame_ = get_parameter("align_world_frame").as_string();
-    joint5_yaw_sign_ = get_parameter("joint5_yaw_sign").as_double();
-    arm_joint_names_ = get_parameter("arm_joint_names").as_string_array();
   }
 
-  std::string resolved_move_group_namespace() const
-  {
-    const std::string ns = this->get_namespace();
-    return ns == "/" ? std::string() : ns;
-  }
-
-  void create_moveit_helper_node()
-  {
+  // MoveGroupInterface 가 붙을 전용 helper 노드 생성(전역 인자 차단 + 필요한 파라미터만 주입).
+  void create_moveit_helper_node() {
     if (moveit_node_)
     {
       return;
     }
-
     auto helper_options = node_options_;
-    helper_options.use_global_arguments(false);
+    helper_options.use_global_arguments(false); // 전역 설정 인자를 모두 차단
     helper_options.arguments({});
     helper_options.automatically_declare_parameters_from_overrides(true);
 
-    const auto &overrides =
-        this->get_node_parameters_interface()->get_parameter_overrides();
+    //launch의 --params-file로 받은 파라미터 오버라이드 전체를 꺼내(get_parameter_overrides()), helper 노드 옵션에 하나씩 복사해 넣는 과정
+    const auto &overrides = this->get_node_parameters_interface()->get_parameter_overrides();
     for (const auto &[name, value] : overrides)
     {
       helper_options.append_parameter_override(rclcpp::Parameter(name, value));
@@ -391,103 +299,68 @@ public:
 
     moveit_node_ = std::make_shared<rclcpp::Node>(
         "motion_server_moveit", this->get_namespace(), helper_options);
-
+    
     RCLCPP_INFO(
-        get_logger(),
-        "Created dedicated MoveIt helper node: '%s'",
-        moveit_node_->get_fully_qualified_name());
+      get_logger(),
+      "Created dedicated MoveIt helper node: '%s'",
+      moveit_node_->get_fully_qualified_name());
   }
 
+  // main 이 executor 에 추가할 수 있도록 helper 노드 핸들을 반환
   rclcpp::Node::SharedPtr get_moveit_helper_node() const
   {
     return moveit_node_;
   }
 
-  // MoveGroupInterface 연결 완료 여부 — main 의 readiness 폴링에 사용
-  bool is_moveit_ready() const
-  {
-    return arm_group_ && !arm_group_->getPlanningFrame().empty() && gripper_group_ && !gripper_group_->getPlanningFrame().empty();
-  }
-
+  // moveit_ready 파라미터를 갱신해 MoveIt 준비 상태를 외부에 알림
   void publish_moveit_ready(bool ready)
   {
     set_parameter(rclcpp::Parameter("moveit_ready", ready));
   }
 
-  // execute 직전/직후 조인트 상태 스냅샷.
-  // plan 의 start state 와 controller current state 가 drift 하면 MoveIt 은
-  // CONTROL_FAILED 로 goal 을 abort 한다. 이 값을 로그에 남겨두면 원인 분석이
-  // 쉬워진다.
-  void log_current_arm_state(const std::string &tag) const
+   // MoveGroupInterface 연결 완료 여부 - main 의 readiness 폴링에 사용
+  bool is_moveit_ready() const
   {
-    if (!arm_group_)
-    {
-      return;
-    }
-    auto state = arm_group_->getCurrentState(0.5); // 0.5s wait
-    if (!state)
-    {
-      RCLCPP_WARN(get_logger(),
-                  "%s: getCurrentState() returned null — TF/joint_state 누락 가능",
-                  tag.c_str());
-      return;
-    }
-    std::vector<double> joints;
-    state->copyJointGroupPositions("arm", joints);
-    std::ostringstream oss;
-    oss << tag << ": joints=[";
-    for (std::size_t i = 0; i < joints.size(); ++i)
-    {
-      if (i > 0)
-        oss << ", ";
-      oss << std::fixed << std::setprecision(4) << joints[i];
-    }
-    oss << "]";
-
-    try
-    {
-      const auto pose = arm_tip_link_.empty()
-                            ? arm_group_->getCurrentPose()
-                            : arm_group_->getCurrentPose(arm_tip_link_);
-      const auto &p = pose.pose.position;
-      const auto &q = pose.pose.orientation;
-      oss << " pose=(" << std::fixed << std::setprecision(4)
-          << p.x << ", " << p.y << ", " << p.z << ")"
-          << " q=(" << q.x << ", " << q.y << ", " << q.z << ", " << q.w << ")";
-    }
-    catch (const std::exception &e)
-    {
-      oss << " pose=<err: " << e.what() << ">";
-    }
-    RCLCPP_INFO(get_logger(), "%s", oss.str().c_str());
+    return arm_group_ && !arm_group_->getPlanningFrame().empty() && gripper_group_ && !gripper_group_->getPlanningFrame().empty();
   }
 
 private:
-  // ── 멤버 ───────────────────────────────────────────────────────────────
-  rclcpp::CallbackGroup::SharedPtr cb_group_;
   rclcpp::NodeOptions node_options_;
+  rclcpp::CallbackGroup::SharedPtr cb_group_;
   rclcpp::Node::SharedPtr moveit_node_;
-  std::shared_ptr<moveit::planning_interface::MoveGroupInterface> arm_group_;
-  std::shared_ptr<moveit::planning_interface::MoveGroupInterface> gripper_group_;
+
   rclcpp_action::Server<MoveToNamed>::SharedPtr move_to_named_server_;
   rclcpp_action::Server<MoveToPose>::SharedPtr move_to_pose_server_;
   rclcpp_action::Server<MoveToJoints>::SharedPtr move_to_joints_server_;
   rclcpp_action::Server<GripperCmd>::SharedPtr gripper_server_;
 
-  // ── 동시성 제어 ────────────────────────────────────────────────────────
-  // busy 플래그는 handle_*_goal 에서 CAS 로 설정되고 execute_* 의
-  // BusyGuard 소멸자에서 해제된다 (모든 return 경로 포함).
+  std::shared_ptr<moveit::planning_interface::MoveGroupInterface> arm_group_;
+  std::shared_ptr<moveit::planning_interface::MoveGroupInterface> gripper_group_;
+
+  std::thread arm_thread_;
+  std::thread gripper_thread_;
   std::atomic<bool> arm_busy_{false};
   std::atomic<bool> gripper_busy_{false};
-  std::thread arm_thread_; // detach 대신 handle_*_accepted 에서 join 후 교체
-  std::thread gripper_thread_;
+
   std::string arm_tip_link_;
+
   // workspace 제한 (world frame 기준)
   double ws_x_abs_max_{0.28};
   double ws_y_abs_max_{0.28};
   double ws_z_min_{0.0};
   double ws_z_max_{0.45};
   std::string ws_frame_{"world"};
+
+  // ── MoveIt 모션 튜닝 (yaml 외부화, 생성자에서 적재) ───────────────────
+  double default_vel_scale_{0.3};
+  double default_acc_scale_{0.1};
+  double quat_norm_tol_{0.01};
+  double arm_planning_time_{5.0};
+  double arm_goal_position_tol_{0.001};
+  double arm_goal_orientation_tol_{0.01};
+  double arm_goal_joint_tol_{0.001};
+  double gripper_planning_time_{3.0};
+  double gripper_goal_joint_tol_{0.001};
 
   // ── compute_align_yaw 멤버 ────────────────────────────────────────────
   rclcpp::Service<ComputeAlignYaw>::SharedPtr compute_align_yaw_server_;
@@ -498,112 +371,65 @@ private:
   sensor_msgs::msg::JointState::SharedPtr latest_joint_state_;
   std::string align_world_frame_{"world"};
   double joint5_yaw_sign_{1.0};
-  std::vector<std::string> arm_joint_names_{"joint1", "joint2", "joint3", "joint4", "joint5"};
 
-  // ── RAII 헬퍼 ─────────────────────────────────────────────────────────
+  // ─────────────────────────────── RAII 헬퍼 ───────────────────────────────────────
 
-  // atomic 플래그를 스코프 종료 시 false 로 해제한다.
+  // atomic 플래그를 스코프 종료 시 false 로 해제
   struct BusyGuard
   {
     std::atomic<bool> &flag;
     ~BusyGuard() { flag.store(false, std::memory_order_release); }
   };
 
-  // velocity scaling 을 스코프 종료 시 기본값으로 복원한다.
-  // grp 가 nullptr 이면 복원을 건너뛴다.
+  // velocity scaling 을 스코프 종료 시 기본값(restore_scale)으로 복원
+  // grp 가 nullptr 이면 복원을 건너뜀. restore_scale 은 default_vel_scale_
+  // 파라미터를 호출부에서 주입(중첩 struct 라 바깥 멤버 직접 접근 불가)
   struct VelScaleGuard
   {
     moveit::planning_interface::MoveGroupInterface *grp;
+    double restore_scale;
     ~VelScaleGuard()
     {
       if (grp)
-        grp->setMaxVelocityScalingFactor(DEFAULT_VEL_SCALE);
+        grp->setMaxVelocityScalingFactor(restore_scale);
     }
   };
 
-  static builtin_interfaces::msg::Duration sec_to_duration(double seconds)
+  // ────────────────────────────── [omx/move_to_named 액션 관련 메서드들]──────────────────────────────────────
+
+  // goal 콜백: 이름 유효성 검사와 arm 점유(CAS) 후 수락/거부를 결정
+  rclcpp_action::GoalResponse handle_named_goal(const rclcpp_action::GoalUUID &,
+                                                std::shared_ptr<const MoveToNamed::Goal> goal)
   {
-    builtin_interfaces::msg::Duration duration;
-    if (seconds < 0.0)
-    {
-      seconds = 0.0;
-    }
-
-    duration.sec = static_cast<int32_t>(std::floor(seconds));
-    duration.nanosec = static_cast<uint32_t>(
-        std::llround((seconds - static_cast<double>(duration.sec)) * 1e9));
-
-    if (duration.nanosec >= 1000000000u)
-    {
-      duration.sec += 1;
-      duration.nanosec -= 1000000000u;
-    }
-    return duration;
-  }
-
-  // ══════════════════════════════════════════════════════════════════════
-  // MoveToNamed
-  // ══════════════════════════════════════════════════════════════════════
-
-  rclcpp_action::GoalResponse handle_named_goal(
-      const rclcpp_action::GoalUUID &,
-      std::shared_ptr<const MoveToNamed::Goal> goal)
-  {
-    RCLCPP_INFO(get_logger(), "MoveToNamed: requested '%s'", goal->name.c_str());
-
+    RCLCPP_INFO(get_logger(), "MovedToNamed : requested '%s'", goal->name.c_str());
+    
     if (NAMED_POSE_MAP.find(goal->name) == NAMED_POSE_MAP.end())
     {
       RCLCPP_WARN(get_logger(), "MoveToNamed: unknown name '%s'", goal->name.c_str());
       return rclcpp_action::GoalResponse::REJECT;
     }
 
-    // arm 동시 실행 차단: false → true CAS 실패 시 이미 실행 중
-    // arm_busy_ 가 false 면 → true 로 바꾸고 통과 (이 goal 이 arm 점유권 획득)
-    // arm_busy_ 가 true 면 → expected 와 다르니 false 반환 → REJECT
-    // "검사 + 점유" 가 하나의 원자 연산이라 두 goal 이 동시에 진입해도 한쪽만 통과한다.
-    bool expected = false;
-    if (!arm_busy_.compare_exchange_strong(
-            expected, true, std::memory_order_acquire, std::memory_order_relaxed))
-    {
-      RCLCPP_WARN(get_logger(), "MoveToNamed: arm is busy, rejecting goal");
+    if (!try_acquire_arm("MoveToNamed"))
       return rclcpp_action::GoalResponse::REJECT;
-    }
-    return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+    return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE; // handle_named_accepted 실행
   }
 
-  rclcpp_action::CancelResponse handle_named_cancel(
-      const std::shared_ptr<rclcpp_action::ServerGoalHandle<MoveToNamed>>)
-  {
-    RCLCPP_INFO(get_logger(), "MoveToNamed: cancel requested");
-    // stop() 은 execute() 와 동시 호출 가능하도록 MoveGroupInterface 내부에서 처리된다.
-    if (arm_group_)
-      arm_group_->stop();
-    return rclcpp_action::CancelResponse::ACCEPT;
+  // accepted 콜백: 실제 실행(execute_named)을 worker 스레드로 띄움
+  void handle_named_accepted( const std::shared_ptr<rclcpp_action::ServerGoalHandle<MoveToNamed>> goal_handle) {
+    launch_arm_execution(goal_handle, [this](auto gh) { execute_named(gh); });
   }
 
-  void handle_named_accepted(
-      const std::shared_ptr<rclcpp_action::ServerGoalHandle<MoveToNamed>> goal_handle)
+  // worker 스레드 본체: setNamedTarget -> plan -> execute 로 named pose 이동을 수행
+  void execute_named(const std::shared_ptr<rclcpp_action::ServerGoalHandle<MoveToNamed>> goal_handle)
   {
-    // arm_busy_ 로 직렬화되어 있으므로 join 은 거의 즉시 반환된다.
-    if (arm_thread_.joinable())
-      arm_thread_.join();
-    arm_thread_ = std::thread([this, goal_handle]()
-                              { execute_named(goal_handle); });
-  }
-
-  void execute_named(
-      const std::shared_ptr<rclcpp_action::ServerGoalHandle<MoveToNamed>> goal_handle)
-  {
-    BusyGuard busy_guard{arm_busy_}; // 모든 return 경로에서 arm_busy_ 해제
-
+    BusyGuard busy_guard{arm_busy_}; // 모든 return 경로에서 arm_busy_ 해제 -> execute_named 함수가 실행되는 순간에 가드를 추가하여 어느 return; 상황에서도 소멸자가 호출되어 arm_busy_가 해제되도록 하는 코드
     auto result = std::make_shared<MoveToNamed::Result>();
     auto feedback = std::make_shared<MoveToNamed::Feedback>();
 
     const std::string &requested = goal_handle->get_goal()->name;
     const std::string &srdf_name = NAMED_POSE_MAP.at(requested);
 
-    if (!arm_group_)
-    {
+    if (!arm_group_) {
       result->success = false;
       result->message = "MoveGroupInterface not initialized";
       goal_handle->abort(result);
@@ -613,15 +439,15 @@ private:
     feedback->status = "planning";
     goal_handle->publish_feedback(feedback);
 
-    // 현재 조인트 상태로 시작점 동기화 (stale 플랜 방지)
+    // 현재 조인트 상태로 시작점 동기화
     arm_group_->setStartStateToCurrentState();
     arm_group_->setNamedTarget(srdf_name);
 
     moveit::planning_interface::MoveGroupInterface::Plan plan;
-    bool planned = (arm_group_->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
+    bool planned =
+        (arm_group_->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
 
-    if (!planned)
-    {
+    if (!planned) {
       result->success = false;
       result->message = "Planning failed for '" + requested + "'";
       goal_handle->abort(result);
@@ -632,42 +458,269 @@ private:
     feedback->status = "executing";
     goal_handle->publish_feedback(feedback);
 
-    const auto exec_code = arm_group_->execute(plan);
-    bool executed = (exec_code == moveit::core::MoveItErrorCode::SUCCESS);
+    finish_arm_motion<MoveToNamed>(
+        goal_handle, plan, result,
+        "Moved to '" + requested + "'",
+        "MoveToNamed execution failed",
+        [this, result]()
+        { RCLCPP_INFO(get_logger(), "%s", result->message.c_str()); });
 
-    if (goal_handle->is_canceling())
+  }
+  
+  // ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  // ────────────────────────────── [omx/move_to_pose 액션 관련 메서드들]──────────────────────────────────────
+
+  // goal 콜백: quaternion 정규화 + workspace 박스 검사 후 arm 점유(CAS) 로 수락/거부를 결정
+  rclcpp_action::GoalResponse handle_pose_goal(
+      const rclcpp_action::GoalUUID &,
+      std::shared_ptr<const MoveToPose::Goal> goal)
+  {
+    const auto &ps = goal->target_pose;
+    const auto &pos = ps.pose.position;
+    const auto &ori = ps.pose.orientation;
+
+    RCLCPP_INFO(get_logger(),
+                "MoveToPose: target (%.3f, %.3f, %.3f) frame='%s' plan_only=%s",
+                pos.x, pos.y, pos.z, ps.header.frame_id.c_str(),
+                goal->plan_only ? "true" : "false");
+
+    // frame_id 누락 경고 (비어있어도 MoveIt 기본 planning frame 으로 처리하므로 reject 않음)
+    if (ps.header.frame_id.empty())
     {
-      result->success = false;
-      result->message = "Cancelled";
-      goal_handle->canceled(result);
-      return;
+      RCLCPP_WARN(get_logger(),
+                  "MoveToPose: frame_id is empty — MoveIt will use the default planning frame");
     }
 
-    result->success = executed;
-    result->message = executed
-                          ? "Moved to '" + requested + "'"
-                          : execute_failure_message("MoveToNamed execution failed", exec_code);
-    if (executed)
+    // quaternion 정규화 검사: 비정규 값은 IK/planning 오류를 유발한다
+    double qn = std::sqrt(
+        ori.x * ori.x + ori.y * ori.y + ori.z * ori.z + ori.w * ori.w);
+    if (std::abs(qn - 1.0) > quat_norm_tol_)
     {
-      goal_handle->succeed(result);
-      RCLCPP_INFO(get_logger(), "%s", result->message.c_str());
+      RCLCPP_WARN(get_logger(),
+                  "MoveToPose: quaternion not normalized (norm=%.6f), rejecting", qn);
+      return rclcpp_action::GoalResponse::REJECT;
     }
-    else
+
+    // 워크스페이스 박스 경계 사전 거부 (execute_pose 와 동일한 단일 소스 함수/값)
+    // pose frame 이 비어있거나 ws_frame_(기본 world) 일 때만 검사한다. 다른 frame 은
+    // 이 단계에서 TF 변환 없이 좌표를 신뢰할 수 없어 execute_pose 단계로 미룬다
+    const std::string &req_frame = ps.header.frame_id;
+    if ((req_frame.empty() || req_frame == ws_frame_) &&
+        !position_in_workspace_box(pos.x, pos.y, pos.z,
+                                   ws_x_abs_max_, ws_y_abs_max_, ws_z_min_, ws_z_max_))
     {
-      goal_handle->abort(result);
-      RCLCPP_WARN(get_logger(), "%s", result->message.c_str());
+      RCLCPP_WARN(get_logger(),
+                  "MoveToPose: target out of workspace box: p=(%.3f,%.3f,%.3f) "
+                  "limit |x|<=%.3f, |y|<=%.3f, %.3f<=z<=%.3f",
+                  pos.x, pos.y, pos.z,
+                  ws_x_abs_max_, ws_y_abs_max_, ws_z_min_, ws_z_max_);
+      return rclcpp_action::GoalResponse::REJECT;
     }
+
+    // arm 동시 실행 차단
+    if (!try_acquire_arm("MoveToPose"))
+      return rclcpp_action::GoalResponse::REJECT;
+    return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
   }
 
-  // ══════════════════════════════════════════════════════════════════════
-  // MoveToJoints
-  //   - joint_names[] 이 비어 있으면 arm 그룹의 active joints 를 기본 사용
-  //   - setJointValueTarget(std::map<std::string,double>) 로 joint-space 목표 지정
-  //   - MoveIt 이 joint_limits.yaml 기반으로 범위 검증 → 실패 시 IK/goal invalid
-  //   - plan / execute 는 MoveToNamed 와 동일하게 직렬 실행
-  // ══════════════════════════════════════════════════════════════════════
+    // accepted 콜백: 실제 실행(execute_pose)을 worker 스레드로 띄움
+    void handle_pose_accepted(
+      const std::shared_ptr<rclcpp_action::ServerGoalHandle<MoveToPose>> goal_handle)
+    {
+      launch_arm_execution(goal_handle, [this](auto gh)
+                          { execute_pose(gh); });
+    }
 
-  rclcpp_action::GoalResponse handle_joints_goal(
+    // worker 스레드 본체: workspace 재검증 -> IK(setJointValueTarget, 실패 시 근사) -> plan -> execute 로 pose 이동을 수행
+    void execute_pose(const std::shared_ptr<rclcpp_action::ServerGoalHandle<MoveToPose>> goal_handle)
+    {
+      BusyGuard busy_guard{arm_busy_};           // arm_busy_ 해제
+      VelScaleGuard vel_guard{arm_group_.get(), default_vel_scale_}; // velocity scaling 기본값 복원
+
+      auto result = std::make_shared<MoveToPose::Result>();
+      auto feedback = std::make_shared<MoveToPose::Feedback>();
+      const auto &goal = goal_handle->get_goal();
+
+      if (!arm_group_)
+      {
+        result->success = false;
+        result->message = "MoveGroupInterface not initialized";
+        goal_handle->abort(result);
+        vel_guard.grp = nullptr; // 복원 불필요
+        return;
+      }
+
+      // velocity_scale 적용 (0.01~1.0): VelScaleGuard 가 종료 시 default_vel_scale_ 로 복원
+      // arm_busy_ 로 직렬화되어 있어 다른 arm goal 과 겹치지 않는다.
+      double v_scale = std::clamp(static_cast<double>(goal->velocity_scale), 0.01, 1.0);
+      arm_group_->setMaxVelocityScalingFactor(v_scale);
+
+      const std::string target_link = arm_tip_link_;
+      const std::string planning_frame = arm_group_->getPlanningFrame();
+      const std::string pose_frame = arm_group_->getPoseReferenceFrame();
+      const auto &target_pose = goal->target_pose.pose;
+
+      RCLCPP_INFO(get_logger(),
+                  "MoveToPose: planning_frame='%s' pose_reference_frame='%s' "
+                  "target_link='%s'",
+                  planning_frame.c_str(), pose_frame.c_str(),
+                  target_link.empty() ? "<empty>" : target_link.c_str());
+
+      RCLCPP_INFO(get_logger(),
+                  "MoveToPose: target pose p=(%.3f, %.3f, %.3f) q=(%.3f, %.3f, "
+                  "%.3f, %.3f)",
+                  target_pose.position.x, target_pose.position.y,
+                  target_pose.position.z, target_pose.orientation.x,
+                  target_pose.orientation.y, target_pose.orientation.z,
+                  target_pose.orientation.w);
+      
+      // ── Workspace 안전 제한 ─────────────────────────────────────────────
+      // EE 가 멀리 뻗으면 shoulder(dxl12) 가 Overload 로 차단되어 로봇이 정지한다.
+      // pose frame 이 ws_frame_ 과 일치할 때만 검증 (다른 frame 은 TF 변환 비용 회피).
+      const std::string &req_frame = goal->target_pose.header.frame_id;
+      
+      if (req_frame.empty() || req_frame == ws_frame_ || req_frame == planning_frame)
+      {
+        if (!position_in_workspace_box(
+                target_pose.position.x, target_pose.position.y, target_pose.position.z,
+                ws_x_abs_max_, ws_y_abs_max_, ws_z_min_, ws_z_max_))
+        {
+          char msg[256];
+          std::snprintf(
+              msg, sizeof(msg),
+              "Target out of workspace: p=(%.3f,%.3f,%.3f) limit |x|<=%.3f, |y|<=%.3f, %.3f<=z<=%.3f",
+              target_pose.position.x, target_pose.position.y, target_pose.position.z,
+              ws_x_abs_max_, ws_y_abs_max_, ws_z_min_, ws_z_max_);
+          result->success = false;
+          result->message = msg;
+          goal_handle->abort(result);
+          RCLCPP_WARN(get_logger(), "MoveToPose: %s", msg);
+          return;
+        }
+      }
+      else
+      {
+        RCLCPP_WARN(
+            get_logger(),
+            "MoveToPose: target frame_id='%s' differs from workspace frame='%s' / planning_frame='%s'; "
+            "skipping workspace check",
+            req_frame.c_str(), ws_frame_.c_str(), planning_frame.c_str());
+      }
+      
+      const auto current_pose = target_link.empty()
+                                    ? arm_group_->getCurrentPose()
+                                    : arm_group_->getCurrentPose(target_link);
+      const auto &current = current_pose.pose;
+      RCLCPP_INFO(
+          get_logger(),
+          "MoveToPose: current pose p=(%.3f, %.3f, %.3f) q=(%.3f, %.3f, %.3f, %.3f)",
+          current.position.x,
+          current.position.y,
+          current.position.z,
+          current.orientation.x,
+          current.orientation.y,
+          current.orientation.z,
+          current.orientation.w);
+
+      feedback->progress = 0.0f;
+      feedback->status = "planning";
+      goal_handle->publish_feedback(feedback);
+
+      // 현재 조인트 상태로 시작점 동기화
+      arm_group_->setStartStateToCurrentState();
+
+      // 5-DOF OMX 에서는 setPoseTarget + RRTConnect 조합이 불안정하다.
+      // RRTConnect 의 goal sampler 가 매 sample 마다 KDL IK 를 호출하는데
+      // under-actuated arm 이라 6-DOF IK 가 수렴 실패 → GOAL_STATE_INVALID.
+      // setJointValueTarget(pose, link) 는 IK 를 한 번만 호출해 joint 값을 구하고
+      // joint-space goal 로 설정한다. RRTConnect 는 joint RRT 로 안정적으로 풀린다.
+      // IK 가 완전해를 찾지 못하면 setApproximateJointValueTarget 로 fallback 한다.
+      bool ik_ok = target_link.empty()
+                      ? arm_group_->setJointValueTarget(goal->target_pose)
+                      : arm_group_->setJointValueTarget(goal->target_pose, target_link);
+
+      if (!ik_ok)
+      {
+        RCLCPP_WARN(
+            get_logger(),
+            "MoveToPose: exact IK failed, trying approximate IK for target_link='%s'",
+            target_link.empty() ? "<empty>" : target_link.c_str());
+        ik_ok = target_link.empty()
+                    ? arm_group_->setApproximateJointValueTarget(goal->target_pose)
+                    : arm_group_->setApproximateJointValueTarget(goal->target_pose, target_link);
+      }
+
+      if (!ik_ok)
+      {
+        result->success = false;
+        result->message = "IK failed for target pose (out of reach or invalid orientation)";
+        goal_handle->abort(result);
+        RCLCPP_WARN(
+            get_logger(),
+            "MoveToPose: IK (exact + approximate) failed for p=(%.3f,%.3f,%.3f)",
+            target_pose.position.x, target_pose.position.y, target_pose.position.z);
+        return;
+      }
+
+      moveit::planning_interface::MoveGroupInterface::Plan plan;
+      bool planned = (arm_group_->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
+
+      if (!planned)
+      {
+        result->success = false;
+        result->message = "Planning failed";
+        goal_handle->abort(result);
+        RCLCPP_WARN(
+            get_logger(),
+            "MoveToPose: planning failed for target_link='%s' in planning_frame='%s'",
+            target_link.empty() ? "<empty>" : target_link.c_str(),
+            planning_frame.c_str());
+        return; // guard 들이 velocity 복원 + busy 해제
+      }
+
+      feedback->progress = 0.5f;
+      feedback->status = "planned";
+      goal_handle->publish_feedback(feedback);
+
+      if (goal->plan_only)
+      {
+        result->success = true;
+        result->message = "Plan valid";
+        feedback->progress = 1.0f;
+        feedback->status = "validated";
+        goal_handle->publish_feedback(feedback);
+        goal_handle->succeed(result);
+        RCLCPP_INFO(get_logger(), "MoveToPose: plan-only validation succeeded");
+        return;
+      }
+
+      feedback->status = "executing";
+      goal_handle->publish_feedback(feedback);
+
+      // 디버깅 도움: execute 직전 current joint / pose 상태를 남겨 plan 의 start state 와
+      // controller current state 사이의 drift 여부를 추적할 수 있게 한다.
+      log_current_arm_state("MoveToPose pre-execute");
+
+      finish_arm_motion<MoveToPose>(
+          goal_handle, plan, result,
+          "Pose reached",
+          "MoveToPose execution failed",
+          [this, feedback, goal_handle]()
+          {
+            feedback->progress = 1.0f;
+            feedback->status = "done";
+            goal_handle->publish_feedback(feedback);
+            RCLCPP_INFO(get_logger(), "MoveToPose: succeeded");
+          },
+          [this]()
+          { log_current_arm_state("MoveToPose post-execute (failed)"); });
+    }
+
+  // ────────────────────────────── [omx/move_to_joints 액션 관련 메서드들]──────────────────────────────────────
+
+    // goal 콜백: positions/joint_names 크기 정합성 검사 후 arm 점유(CAS) 로 수락/거부를 결정
+    rclcpp_action::GoalResponse handle_joints_goal(
       const rclcpp_action::GoalUUID &,
       std::shared_ptr<const MoveToJoints::Goal> goal)
   {
@@ -689,39 +742,25 @@ private:
                 "MoveToJoints: %zu joints, velocity_scale=%.3f",
                 goal->positions.size(), goal->velocity_scale);
 
-    bool expected = false;
-    if (!arm_busy_.compare_exchange_strong(
-            expected, true, std::memory_order_acquire, std::memory_order_relaxed))
-    {
-      RCLCPP_WARN(get_logger(), "MoveToJoints: arm is busy, rejecting goal");
+    if (!try_acquire_arm("MoveToJoints"))
       return rclcpp_action::GoalResponse::REJECT;
-    }
     return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
   }
 
-  rclcpp_action::CancelResponse handle_joints_cancel(
-      const std::shared_ptr<rclcpp_action::ServerGoalHandle<MoveToJoints>>)
-  {
-    RCLCPP_INFO(get_logger(), "MoveToJoints: cancel requested");
-    if (arm_group_)
-      arm_group_->stop();
-    return rclcpp_action::CancelResponse::ACCEPT;
-  }
-
+  // accepted 콜백: 실제 실행(execute_joints)을 worker 스레드로 띄움
   void handle_joints_accepted(
       const std::shared_ptr<rclcpp_action::ServerGoalHandle<MoveToJoints>> goal_handle)
   {
-    if (arm_thread_.joinable())
-      arm_thread_.join();
-    arm_thread_ = std::thread([this, goal_handle]()
-                              { execute_joints(goal_handle); });
+    launch_arm_execution(goal_handle, [this](auto gh)
+                         { execute_joints(gh); });
   }
 
+  // worker 스레드 본체: joint_names/positions 를 target map 으로 묶어 setJointValueTarget -> plan -> execute 로 joint 이동을 수행
   void execute_joints(
       const std::shared_ptr<rclcpp_action::ServerGoalHandle<MoveToJoints>> goal_handle)
   {
     BusyGuard busy_guard{arm_busy_};
-    VelScaleGuard vel_guard{arm_group_.get()};
+    VelScaleGuard vel_guard{arm_group_.get(), default_vel_scale_};
 
     auto result = std::make_shared<MoveToJoints::Result>();
     auto feedback = std::make_shared<MoveToJoints::Feedback>();
@@ -795,337 +834,26 @@ private:
     feedback->status = "executing";
     goal_handle->publish_feedback(feedback);
 
-    const auto exec_code = arm_group_->execute(plan);
-    bool executed = (exec_code == moveit::core::MoveItErrorCode::SUCCESS);
-
-    if (goal_handle->is_canceling())
-    {
-      result->success = false;
-      result->message = "Cancelled";
-      goal_handle->canceled(result);
-      return;
-    }
-
-    result->success = executed;
-    result->message = executed
-                          ? "Moved to joint target"
-                          : execute_failure_message("MoveToJoints execution failed", exec_code);
-
-    if (executed)
-    {
-      feedback->progress = 1.0f;
-      feedback->status = "done";
-      goal_handle->publish_feedback(feedback);
-      goal_handle->succeed(result);
-      RCLCPP_INFO(get_logger(), "MoveToJoints: succeeded");
-    }
-    else
-    {
-      goal_handle->abort(result);
-      RCLCPP_WARN(get_logger(), "%s", result->message.c_str());
-    }
-  }
-
-  // ══════════════════════════════════════════════════════════════════════
-  // MoveToPose
-  // ══════════════════════════════════════════════════════════════════════
-
-  rclcpp_action::GoalResponse handle_pose_goal(
-      const rclcpp_action::GoalUUID &,
-      std::shared_ptr<const MoveToPose::Goal> goal)
-  {
-    const auto &ps = goal->target_pose;
-    const auto &pos = ps.pose.position;
-    const auto &ori = ps.pose.orientation;
-
-    RCLCPP_INFO(get_logger(),
-                "MoveToPose: target (%.3f, %.3f, %.3f) frame='%s' plan_only=%s",
-                pos.x, pos.y, pos.z, ps.header.frame_id.c_str(),
-                goal->plan_only ? "true" : "false");
-
-    // frame_id 누락 경고 (비어있어도 MoveIt 기본 planning frame 으로 처리하므로 reject 않음)
-    if (ps.header.frame_id.empty())
-    {
-      RCLCPP_WARN(get_logger(),
-                  "MoveToPose: frame_id is empty — MoveIt will use the default planning frame");
-    }
-
-    // quaternion 정규화 검사: 비정규 값은 IK/planning 오류를 유발한다
-    double qn = std::sqrt(
-        ori.x * ori.x + ori.y * ori.y + ori.z * ori.z + ori.w * ori.w);
-    if (std::abs(qn - 1.0) > QUAT_NORM_TOL)
-    {
-      RCLCPP_WARN(get_logger(),
-                  "MoveToPose: quaternion not normalized (norm=%.6f), rejecting", qn);
-      return rclcpp_action::GoalResponse::REJECT;
-    }
-
-    // 워크스페이스 경계 사전 검사
-    double xy_dist = std::sqrt(pos.x * pos.x + pos.y * pos.y);
-    if (pos.z < WS_Z_MIN || pos.z > WS_Z_MAX || xy_dist > WS_XY_RADIUS)
-    {
-      RCLCPP_WARN(get_logger(),
-                  "MoveToPose: pose out of workspace (z=%.3f, xy_dist=%.3f)", pos.z, xy_dist);
-      return rclcpp_action::GoalResponse::REJECT;
-    }
-
-    // arm 동시 실행 차단
-    bool expected = false;
-    if (!arm_busy_.compare_exchange_strong(
-            expected, true, std::memory_order_acquire, std::memory_order_relaxed))
-    {
-      RCLCPP_WARN(get_logger(), "MoveToPose: arm is busy, rejecting goal");
-      return rclcpp_action::GoalResponse::REJECT;
-    }
-    return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
-  }
-
-  rclcpp_action::CancelResponse handle_pose_cancel(
-      const std::shared_ptr<rclcpp_action::ServerGoalHandle<MoveToPose>>)
-  {
-    RCLCPP_INFO(get_logger(), "MoveToPose: cancel requested");
-    if (arm_group_)
-      arm_group_->stop();
-    return rclcpp_action::CancelResponse::ACCEPT;
-  }
-
-  void handle_pose_accepted(
-      const std::shared_ptr<rclcpp_action::ServerGoalHandle<MoveToPose>> goal_handle)
-  {
-    if (arm_thread_.joinable())
-      arm_thread_.join();
-    arm_thread_ = std::thread([this, goal_handle]()
-                              { execute_pose(goal_handle); });
-  }
-
-  void execute_pose(
-      const std::shared_ptr<rclcpp_action::ServerGoalHandle<MoveToPose>> goal_handle)
-  {
-    BusyGuard busy_guard{arm_busy_};           // arm_busy_ 해제
-    VelScaleGuard vel_guard{arm_group_.get()}; // velocity scaling 기본값 복원
-
-    auto result = std::make_shared<MoveToPose::Result>();
-    auto feedback = std::make_shared<MoveToPose::Feedback>();
-    const auto &goal = goal_handle->get_goal();
-
-    if (!arm_group_)
-    {
-      result->success = false;
-      result->message = "MoveGroupInterface not initialized";
-      goal_handle->abort(result);
-      vel_guard.grp = nullptr; // 복원 불필요
-      return;
-    }
-
-    // velocity_scale 적용 (0.01~1.0): VelScaleGuard 가 종료 시 DEFAULT_VEL_SCALE 로 복원
-    // arm_busy_ 로 직렬화되어 있어 다른 arm goal 과 겹치지 않는다.
-    double v_scale = std::clamp(static_cast<double>(goal->velocity_scale), 0.01, 1.0);
-    arm_group_->setMaxVelocityScalingFactor(v_scale);
-
-    const std::string target_link = arm_tip_link_;
-    const std::string planning_frame = arm_group_->getPlanningFrame();
-    const std::string pose_frame = arm_group_->getPoseReferenceFrame();
-    const auto &target_pose = goal->target_pose.pose;
-
-    RCLCPP_INFO(
-        get_logger(),
-        "MoveToPose: planning_frame='%s' pose_reference_frame='%s' target_link='%s'",
-        planning_frame.c_str(),
-        pose_frame.c_str(),
-        target_link.empty() ? "<empty>" : target_link.c_str());
-    RCLCPP_INFO(
-        get_logger(),
-        "MoveToPose: target pose p=(%.3f, %.3f, %.3f) q=(%.3f, %.3f, %.3f, %.3f)",
-        target_pose.position.x,
-        target_pose.position.y,
-        target_pose.position.z,
-        target_pose.orientation.x,
-        target_pose.orientation.y,
-        target_pose.orientation.z,
-        target_pose.orientation.w);
-
-    // ── Workspace 안전 제한 ─────────────────────────────────────────────
-    // EE 가 멀리 뻗으면 shoulder(dxl12) 가 Overload 로 차단되어 로봇이 정지한다.
-    // pose frame 이 ws_frame_ 과 일치할 때만 검증 (다른 frame 은 TF 변환 비용 회피).
-    {
-      const std::string &req_frame = goal->target_pose.header.frame_id;
-      if (req_frame.empty() || req_frame == ws_frame_ || req_frame == planning_frame)
-      {
-        const double ax = std::abs(target_pose.position.x);
-        const double ay = std::abs(target_pose.position.y);
-        const double z = target_pose.position.z;
-        const bool out_of_range =
-            (ax > ws_x_abs_max_) ||
-            (ay > ws_y_abs_max_) ||
-            (z < ws_z_min_) ||
-            (z > ws_z_max_);
-        if (out_of_range)
+    finish_arm_motion<MoveToJoints>(
+        goal_handle, plan, result,
+        "Moved to joint target",
+        "MoveToJoints execution failed",
+        [this, feedback, goal_handle]()
         {
-          char msg[256];
-          std::snprintf(
-              msg, sizeof(msg),
-              "Target out of workspace: p=(%.3f,%.3f,%.3f) limit |x|<=%.3f, |y|<=%.3f, %.3f<=z<=%.3f",
-              target_pose.position.x, target_pose.position.y, target_pose.position.z,
-              ws_x_abs_max_, ws_y_abs_max_, ws_z_min_, ws_z_max_);
-          result->success = false;
-          result->message = msg;
-          goal_handle->abort(result);
-          RCLCPP_WARN(get_logger(), "MoveToPose: %s", msg);
-          return;
-        }
-      }
-      else
-      {
-        RCLCPP_WARN(
-            get_logger(),
-            "MoveToPose: target frame_id='%s' differs from workspace frame='%s' / planning_frame='%s'; "
-            "skipping workspace check",
-            req_frame.c_str(), ws_frame_.c_str(), planning_frame.c_str());
-      }
-    }
-
-    const auto current_pose = target_link.empty()
-                                  ? arm_group_->getCurrentPose()
-                                  : arm_group_->getCurrentPose(target_link);
-    const auto &current = current_pose.pose;
-    RCLCPP_INFO(
-        get_logger(),
-        "MoveToPose: current pose p=(%.3f, %.3f, %.3f) q=(%.3f, %.3f, %.3f, %.3f)",
-        current.position.x,
-        current.position.y,
-        current.position.z,
-        current.orientation.x,
-        current.orientation.y,
-        current.orientation.z,
-        current.orientation.w);
-
-    feedback->progress = 0.0f;
-    feedback->status = "planning";
-    goal_handle->publish_feedback(feedback);
-
-    // 현재 조인트 상태로 시작점 동기화
-    arm_group_->setStartStateToCurrentState();
-
-    // 5-DOF OMX 에서는 setPoseTarget + RRTConnect 조합이 불안정하다.
-    // RRTConnect 의 goal sampler 가 매 sample 마다 KDL IK 를 호출하는데
-    // under-actuated arm 이라 6-DOF IK 가 수렴 실패 → GOAL_STATE_INVALID.
-    // setJointValueTarget(pose, link) 는 IK 를 한 번만 호출해 joint 값을 구하고
-    // joint-space goal 로 설정한다. RRTConnect 는 joint RRT 로 안정적으로 풀린다.
-    // IK 가 완전해를 찾지 못하면 setApproximateJointValueTarget 로 fallback 한다.
-    bool ik_ok = target_link.empty()
-                     ? arm_group_->setJointValueTarget(goal->target_pose)
-                     : arm_group_->setJointValueTarget(goal->target_pose, target_link);
-
-    if (!ik_ok)
-    {
-      RCLCPP_WARN(
-          get_logger(),
-          "MoveToPose: exact IK failed, trying approximate IK for target_link='%s'",
-          target_link.empty() ? "<empty>" : target_link.c_str());
-      ik_ok = target_link.empty()
-                  ? arm_group_->setApproximateJointValueTarget(goal->target_pose)
-                  : arm_group_->setApproximateJointValueTarget(goal->target_pose, target_link);
-    }
-
-    if (!ik_ok)
-    {
-      result->success = false;
-      result->message = "IK failed for target pose (out of reach or invalid orientation)";
-      goal_handle->abort(result);
-      RCLCPP_WARN(
-          get_logger(),
-          "MoveToPose: IK (exact + approximate) failed for p=(%.3f,%.3f,%.3f)",
-          target_pose.position.x, target_pose.position.y, target_pose.position.z);
-      return;
-    }
-
-    moveit::planning_interface::MoveGroupInterface::Plan plan;
-    bool planned = (arm_group_->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
-
-    if (!planned)
-    {
-      result->success = false;
-      result->message = "Planning failed";
-      goal_handle->abort(result);
-      RCLCPP_WARN(
-          get_logger(),
-          "MoveToPose: planning failed for target_link='%s' in planning_frame='%s'",
-          target_link.empty() ? "<empty>" : target_link.c_str(),
-          planning_frame.c_str());
-      return; // guard 들이 velocity 복원 + busy 해제
-    }
-
-    feedback->progress = 0.5f;
-    feedback->status = "planned";
-    goal_handle->publish_feedback(feedback);
-
-    if (goal->plan_only)
-    {
-      result->success = true;
-      result->message = "Plan valid";
-      feedback->progress = 1.0f;
-      feedback->status = "validated";
-      goal_handle->publish_feedback(feedback);
-      goal_handle->succeed(result);
-      RCLCPP_INFO(get_logger(), "MoveToPose: plan-only validation succeeded");
-      return;
-    }
-
-    feedback->status = "executing";
-    goal_handle->publish_feedback(feedback);
-
-    // 디버깅 도움: execute 직전 current joint / pose 상태를 남겨 plan 의 start state 와
-    // controller current state 사이의 drift 여부를 추적할 수 있게 한다.
-    log_current_arm_state("MoveToPose pre-execute");
-
-    const auto exec_code = arm_group_->execute(plan);
-    bool executed = (exec_code == moveit::core::MoveItErrorCode::SUCCESS);
-
-    if (goal_handle->is_canceling())
-    {
-      result->success = false;
-      result->message = "Cancelled";
-      goal_handle->canceled(result);
-      return;
-    }
-
-    result->success = executed;
-    result->message = executed
-                          ? "Pose reached"
-                          : execute_failure_message("MoveToPose execution failed", exec_code);
-
-    if (!executed)
-    {
-      log_current_arm_state("MoveToPose post-execute (failed)");
-    }
-
-    if (executed)
-    {
-      feedback->progress = 1.0f;
-      feedback->status = "done";
-      goal_handle->publish_feedback(feedback);
-      goal_handle->succeed(result);
-      RCLCPP_INFO(get_logger(), "MoveToPose: succeeded");
-    }
-    else
-    {
-      goal_handle->abort(result);
-      RCLCPP_WARN(get_logger(), "%s", result->message.c_str());
-    }
+          feedback->progress = 1.0f;
+          feedback->status = "done";
+          goal_handle->publish_feedback(feedback);
+          RCLCPP_INFO(get_logger(), "MoveToJoints: succeeded");
+        });
   }
+  // ────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-  // ══════════════════════════════════════════════════════════════════════
-  // GripperCommand  →  MoveGroupInterface("gripper") 로 trajectory 실행
-  //
-  // GripperActionController 를 직접 호출하면 velocity profile 없이
-  // 순간 이동하여 모터에 무리가 간다.
-  // MoveIt gripper 그룹을 사용하면 joint_limits.yaml 의 velocity/acceleration
-  // scaling 이 적용되어 부드럽게 움직인다.
-  // ══════════════════════════════════════════════════════════════════════
+  // ────────────────────────────── [omx/gripper_command 액션 관련 메서드들]──────────────────────────────────────
 
+  // goal 콜백: gripper 점유(CAS) 로 동시 실행을 차단하고 수락/거부를 결정
   rclcpp_action::GoalResponse handle_gripper_goal(
-      const rclcpp_action::GoalUUID &,
-      std::shared_ptr<const GripperCmd::Goal> goal)
+        const rclcpp_action::GoalUUID &,
+        std::shared_ptr<const GripperCmd::Goal> goal)
   {
     RCLCPP_INFO(get_logger(),
                 "GripperCommand: position=%.3f, max_effort=%.1f",
@@ -1141,6 +869,7 @@ private:
     return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
   }
 
+  // cancel 콜백: 진행 중인 gripper MoveGroupInterface 실행을 stop() 으로 중단 요청
   rclcpp_action::CancelResponse handle_gripper_cancel(
       const std::shared_ptr<rclcpp_action::ServerGoalHandle<GripperCmd>>)
   {
@@ -1149,6 +878,7 @@ private:
     return rclcpp_action::CancelResponse::ACCEPT;
   }
 
+  // accepted 콜백: 이전 gripper 스레드를 정리하고 실제 실행(execute_gripper)을 worker 스레드로 띄움
   void handle_gripper_accepted(
       const std::shared_ptr<rclcpp_action::ServerGoalHandle<GripperCmd>> goal_handle)
   {
@@ -1158,6 +888,7 @@ private:
                                   { execute_gripper(goal_handle); });
   }
 
+  // worker 스레드 본체: position 을 open/close 범위로 clamp 후 setJointValueTarget -> plan -> execute 로 그리퍼를 구동
   void execute_gripper(
       const std::shared_ptr<rclcpp_action::ServerGoalHandle<GripperCmd>> goal_handle)
   {
@@ -1241,15 +972,11 @@ private:
       RCLCPP_WARN(get_logger(), "GripperCommand: %s", result->message.c_str());
     }
   }
+  // ────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-  // ══════════════════════════════════════════════════════════════════════
-  // compute_align_yaw  →  joint5 목표각 계산 (90deg 대칭, 모션 없음)
-  // ══════════════════════════════════════════════════════════════════════
-  //
-  // box yaw 와 현재 jaw heading(TF) 으로 joint5 절대 목표각을 계산해 반환만
-  // 한다. 실제 실행은 호출부(skill_executor)가 omx/move_to_joints 액션으로
-  // 수행하고, 수렴 반복/허용오차/누적 보정 cap 같은 정렬 정책도 호출부가 쥔다.
-  // 모션이 없어 cancel/feedback 이 불필요하므로 action 이 아닌 service 로 둔다.
+  // ────────────────────────────── [omx/compute_align_yaw 서비스 관련 메서드들]──────────────────────────────────────
+
+  // service 콜백: joint5 현재각 + TF jaw heading 으로 box_yaw 정렬에 필요한 joint5 목표각을 계산해 반환(모션 없음)
   void handle_compute_align(
       const std::shared_ptr<ComputeAlignYaw::Request> request,
       std::shared_ptr<ComputeAlignYaw::Response> response)
@@ -1322,53 +1049,212 @@ private:
         j5_target * 180.0 / M_PI);
   }
 
+  // ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  // ────────────────────────────── [arm cancel/execute/finish template 구현체] ──────────────────────────────
+
+  // cancel 콜백: 진행 중인 MoveGroupInterface 실행을 stop() 으로 중단 요청
+  template <typename ActionT>
+  rclcpp_action::CancelResponse handle_arm_cancel(const char *action_name, const std::shared_ptr<rclcpp_action::ServerGoalHandle<ActionT>>)
+  {
+    RCLCPP_INFO(get_logger(), "%s: cancel requested", action_name);
+    if (arm_group_)
+      arm_group_->stop();
+    return rclcpp_action::CancelResponse::ACCEPT;
+  }
+
+  // 이전 worker 스레드를 정리하고 새 스레드에서 exec 함수(execute_*)를 실행
+  template <typename ActionT, typename ExecFn>
+  void launch_arm_execution(const std::shared_ptr<rclcpp_action::ServerGoalHandle<ActionT>> &goal_handle, ExecFn exec_fn)
+  {
+    if (arm_thread_.joinable())
+      arm_thread_.join();
+    arm_thread_ = std::thread([ goal_handle, exec_fn ]()
+                              { exec_fn(goal_handle); });
+  }
+
+  // plan 실행 후 공통 마무리: execute -> cancel 확인 -> succeed/abort (성공/실패 후처리는 콜백으로 주입).
+  template <typename ActionT>
+  void finish_arm_motion(
+      const std::shared_ptr<rclcpp_action::ServerGoalHandle<ActionT>>
+          &goal_handle,
+      moveit::planning_interface::MoveGroupInterface::Plan &plan,
+      const std::shared_ptr<typename ActionT::Result> &result,
+      const std::string &success_msg, const std::string &fail_prefix,
+      const std::function<void()> &on_success = {},
+      const std::function<void()> &on_failure = {})
+  {
+    const auto exec_code = arm_group_->execute(plan);
+    const bool executed = (exec_code == moveit::core::MoveItErrorCode::SUCCESS);
+    if (goal_handle->is_canceling())
+    {
+      result->success = false;
+      result->message = "Cancelled";
+      goal_handle->canceled(result);
+      return;
+    }
+
+    result->success = executed;
+    if (executed)
+    {
+      result->message = success_msg;
+      if (on_success)
+        on_success();
+      goal_handle->succeed(result);
+    }
+    else
+    {
+      result->message = execute_failure_message(fail_prefix, exec_code);
+      if (on_failure)
+        on_failure();
+      goal_handle->abort(result);
+      RCLCPP_WARN(get_logger(), "%s", result->message.c_str());
+    }
+  }
+  // ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  // ────────────────────────────── 헬퍼 함수들 ───────────────────────────────────────────────────────────────
+
+  // action 실행 시 arm_busy 점유되어 있는지 판단 메서드 
+  bool try_acquire_arm(const char *action_name)
+  {
+    bool expected = false;
+    // arm_busy 가 false 이면, expected 와 동일 -> arm_busy를 true로 변경하고 true 반환 -> 따라서 최종 false 
+    // arm_busy 가 true 이면, expected 와 다름 -> expected를 true로 변경하고 false 반환 -> 따라서 최종 true 
+    if (!arm_busy_.compare_exchange_strong(
+            expected, true, std::memory_order_acquire, std::memory_order_relaxed))
+    {
+      RCLCPP_WARN(get_logger(), "%s: arm is busy, rejecting goal", action_name);
+      return false;
+    }
+    return true;
+  }
+
+  // 현재 네임스페이스를 MoveGroupInterface 가 기대하는 형식(루트면 빈 문자열)으로 변환
+  std::string resolved_move_group_namespace() const
+  {
+    const std::string ns = this->get_namespace();
+    return ns == "/" ? std::string() : ns;
+  }
+
+  // 파라미터 선언(중복 가드) + 값 조회를 한 번에 처리
+  // automatically_declare_parameters_from_overrides(true) 로 yaml/-p 로 이미
+  // 선언된 키는 declare 를 건너뛰어 ParameterAlreadyDeclaredException 피함
+  template <typename T>
+  T declare_and_get(const std::string &name, const T &default_value)
+  {
+    if (!has_parameter(name))
+      declare_parameter<T>(name, default_value);
+    return get_parameter(name).get_value<T>();
+  }
+
+  // 노드 파라미터 선언 + 멤버 적재를 한 곳에 모은다. 생성자에서 1회 호출.
+  void declare_and_load_params()
+  {
+    declare_parameter<std::string>("arm_tip_link", "end_effector_link");
+    declare_parameter<bool>("moveit_ready", false);
+
+    // Workspace 사전 거부 한계 (world frame 기준).
+    // EE 가 x,y 방향으로 멀리 뻗으면 dxl12 (shoulder) 의 중력 모멘트가 급증해
+    // Overload Hardware Error 로 모터가 차단된다. 그 영역의 goal pose 를 사전에 거부한다.
+    // 같은 workspace 값은 omx_bringup 의 workspace_guard 와 공유한다.
+    // 단일 설정 소스: omx_bringup/config/omx_f/workspace.yaml.
+    // goal 사전 거부(handle_pose_goal)와 execute 직전 검사(execute_pose)가 같은 값을 쓴다.
+    ws_x_abs_max_ = declare_and_get<double>("workspace.x_abs_max", 0.3);
+    ws_y_abs_max_ = declare_and_get<double>("workspace.y_abs_max", 0.3);
+    ws_z_min_ = declare_and_get<double>("workspace.z_min", 0.0);
+    ws_z_max_ = declare_and_get<double>("workspace.z_max", 0.45);
+    ws_frame_ = declare_and_get<std::string>("workspace.frame", "world");
+
+    // MoveIt 모션 튜닝: velocity/acceleration scaling, quaternion 허용 오차,
+    // planning time, goal tolerance. init_moveit() 에서 MoveGroupInterface 에
+    // 적용하고 VelScaleGuard 복원값으로도 쓴다.
+    default_vel_scale_ = declare_and_get<double>("default_vel_scale", 0.3);
+    default_acc_scale_ = declare_and_get<double>("default_acc_scale", 0.1);
+    quat_norm_tol_ = declare_and_get<double>("quat_norm_tol", 0.01);
+    arm_planning_time_ = declare_and_get<double>("arm.planning_time", 5.0);
+    arm_goal_position_tol_ = declare_and_get<double>("arm.goal_position_tol", 0.001);
+    arm_goal_orientation_tol_ = declare_and_get<double>("arm.goal_orientation_tol", 0.01);
+    arm_goal_joint_tol_ = declare_and_get<double>("arm.goal_joint_tol", 0.001);
+    gripper_planning_time_ = declare_and_get<double>("gripper.planning_time", 3.0);
+    gripper_goal_joint_tol_ = declare_and_get<double>("gripper.goal_joint_tol", 0.001);
+
+    // compute_align_yaw service 파라미터. service 는 생성자에서 즉시 살아나므로
+    // (init_moveit 완료를 기다리지 않음) 여기서 적재해야 이른 호출에도 yaml 값을
+    // 쓴다. init_moveit 에서 늦게 적재하면 그 사이 호출은 멤버 기본값(부호 1.0)을
+    // 써서 정렬 방향이 뒤집힐 수 있다.
+    align_world_frame_ = declare_and_get<std::string>("align_world_frame", "world");
+    joint5_yaw_sign_ = declare_and_get<double>("joint5_yaw_sign", 1.0);
+  }
+
+    // execute 직전/직후 조인트 상태 스냅샷.
+  // plan 의 start state 와 controller current state 가 drift 하면 MoveIt 은
+  // CONTROL_FAILED 로 goal 을 abort 한다. 이 값을 로그에 남겨두면 원인 분석이 쉬워진다.
+  void log_current_arm_state(const std::string &tag) const
+  {
+    if (!arm_group_)
+    {
+      return;
+    }
+    auto state = arm_group_->getCurrentState(0.5); // 0.5s wait
+    if (!state)
+    {
+      RCLCPP_WARN(get_logger(),
+                  "%s: getCurrentState() returned null - TF/joint_state 누락 가능",
+                  tag.c_str());
+      return;
+    }
+    std::vector<double> joints;
+    state->copyJointGroupPositions("arm", joints);
+    std::ostringstream oss;
+    oss << tag << ": joints=[";
+    for (std::size_t i = 0; i < joints.size(); ++i)
+    {
+      if (i > 0)
+        oss << ", ";
+      oss << std::fixed << std::setprecision(4) << joints[i];
+    }
+    oss << "]";
+
+    try
+    {
+      const auto pose = arm_tip_link_.empty()
+                            ? arm_group_->getCurrentPose()
+                            : arm_group_->getCurrentPose(arm_tip_link_);
+      const auto &p = pose.pose.position;
+      const auto &q = pose.pose.orientation;
+      oss << " pose=(" << std::fixed << std::setprecision(4)
+          << p.x << ", " << p.y << ", " << p.z << ")"
+          << " q=(" << q.x << ", " << q.y << ", " << q.z << ", " << q.w << ")";
+    }
+    catch (const std::exception &e)
+    {
+      oss << " pose=<err: " << e.what() << ">";
+    }
+    RCLCPP_INFO(get_logger(), "%s", oss.str().c_str());
+  }
+  // ────────────────────────────────────────────────────────────────────────────────────────────────────────
 };
 
-int main(int argc, char **argv)
-{
-  rclcpp::init(argc, argv);
+// executor.spin() 콜백 처리 루프를 도는 spin 스레드 진입점.
+void run_spin(rclcpp::executors::MultiThreadedExecutor *exec) { exec->spin(); }
 
-  rclcpp::NodeOptions options;
-  options.automatically_declare_parameters_from_overrides(true);
-  auto node = std::make_shared<MotionServer>(options);
-  node->create_moveit_helper_node();
-
-  // MultiThreadedExecutor: MoveGroupInterface 와 action server callback 이
-  // 서로 블로킹하지 않도록 별도 스레드에서 spin 한다.
-  rclcpp::executors::MultiThreadedExecutor executor;
-  executor.add_node(node);
-  executor.add_node(node->get_moveit_helper_node());
-
-  // executor.spin() 을 먼저 돌린다.
-  //   - 액션 서버는 생성자에서 이미 등록됐으므로, 이 시점부터 `ros2 action info`
-  //     로 즉시 발견된다.
-  //   - MoveGroupInterface 초기화가 지연/실패해도 프로세스는 종료하지 않는다.
-  //     이전 구조는 15s 타임아웃 시 return 1 → 액션 서버까지 사라져 DDS 그래프에
-  //     zombie 노드가 누적됐고, `ros2 action info` 에서 0 server 로 보였다.
-  std::thread spin_thread([&executor](){ executor.spin(); });
-
-  // MoveIt 초기화는 백그라운드에서 재시도. 연결되면 루프 종료.
-  //   - MoveGroupInterface 생성은 move_group 과 service handshake 가 필요해
-  //     순간적으로 실패할 수 있다 (move_group 준비 중일 때).
-  //   - 실패해도 node 는 계속 살아있고 액션 goal 은 arm_group_ 체크로 abort 된다.
-  std::thread init_thread([node]()
-                          {
-    constexpr auto kPollInterval = std::chrono::milliseconds(200);
-    constexpr auto kPollAttempts = 50;                 // 약 10초
-    constexpr auto kRetryInterval = std::chrono::seconds(2);
-    while (rclcpp::ok()) {
-      node->publish_moveit_ready(false);
-      try {
-        node->init_moveit();
-      } catch (const std::exception & e) {
-        RCLCPP_WARN(node->get_logger(),
-          "init_moveit threw: %s — retrying in 2s", e.what());
-        std::this_thread::sleep_for(kRetryInterval);
-        continue;
-      }
-      // init_moveit 가 예외 없이 반환해도 planning_frame 이 채워지는 데
-      // 잠깐 시간이 걸릴 수 있으므로 짧게 폴링한다.
-      for (int i = 0; i < kPollAttempts && rclcpp::ok(); ++i) {
+// MoveGroupInterface 가 연결될 때까지 init_moveit 을 재시도하는 init 스레드 진입점.
+void init_moveit_loop(std::shared_ptr<MotionServer> node) {
+  constexpr auto kPollInterval = std::chrono::milliseconds(200);
+  constexpr auto kPollAttempts = 50;                 // 약 10초
+  constexpr auto kRetryInterval = std::chrono::seconds(2);
+  while (rclcpp::ok()) {
+    node->publish_moveit_ready(false);
+    try {
+      node->init_moveit();
+    } catch (const std::exception &e) {
+      RCLCPP_WARN(node->get_logger(), "init_moveit threw: %s — retrying in 2s",
+                  e.what());
+      std::this_thread::sleep_for(kRetryInterval);
+      continue;
+    }
+    for (int i = 0; i < kPollAttempts && rclcpp::ok(); ++i) {
         if (node->is_moveit_ready()) {
           node->publish_moveit_ready(true);
           RCLCPP_INFO(node->get_logger(),
@@ -1380,11 +1266,27 @@ int main(int argc, char **argv)
       RCLCPP_WARN(node->get_logger(),
         "MoveGroupInterface not ready after 10s — rebuilding in 2s");
       std::this_thread::sleep_for(kRetryInterval);
-    } });
+  }
+}
 
-  spin_thread.join();
-  if (init_thread.joinable())
-    init_thread.join();
+// 노드/executor 구성 후 spin 과 MoveIt 초기화를 각각 스레드로 돌리고 종료까지 대기
+int main(int argc, char **argv) {
+
+  rclcpp::init(argc, argv);
+  rclcpp::NodeOptions options;
+  options.automatically_declare_parameters_from_overrides(true);
+  auto node = std::make_shared<MotionServer>(options);
+  node->create_moveit_helper_node();
+
+  rclcpp::executors::MultiThreadedExecutor executor;
+  executor.add_node(node);
+  executor.add_node(node->get_moveit_helper_node());
+
+  std::thread spin_thread(run_spin, &executor);
+  std::thread init_thread(init_moveit_loop, node);
+  
+  if(spin_thread.joinable())spin_thread.join();
+  if(init_thread.joinable())init_thread.join();
   rclcpp::shutdown();
   return 0;
 }
